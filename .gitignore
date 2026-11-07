@@ -1,0 +1,8 @@
+/target/
+dist/plugin.wasm.sources
+web-src/node_modules/
+web/
+web.sources
+*.oiplugin
+*.key
+.DS_Store
