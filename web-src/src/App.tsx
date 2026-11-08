@@ -1315,24 +1315,29 @@ export function App() {
     });
   }
 
-  function openPodShellInTerminalTab(res: ClusterResource, containerName: string, debug = false) {
+  function openPodShellInTerminalTab(res: ClusterResource, containerName: string, debugImage?: string) {
     const ns = res.namespace || snapshot.current_namespace || "default";
     const ctx = snapshot.current_context;
     sendToBackend({
-      op: debug ? "debug-shell" : "exec-shell",
+      op: debugImage ? "debug-shell" : "exec-shell",
       context: ctx,
       namespace: ns,
       name: res.name,
       container: containerName || null,
+      image: debugImage || null,
     });
   }
 
-  function openNodeShellInTerminalTab(res: ClusterResource) {
+  function openNodeShellInTerminalTab(
+    res: ClusterResource,
+    mode: "host" | "busybox" | "dengliu/k8sdebugger:3cfd912" = "host",
+  ) {
     const ctx = snapshot.current_context;
     sendToBackend({
       op: "node-shell",
       context: ctx,
       name: res.name,
+      mode,
     });
   }
 
@@ -1351,10 +1356,10 @@ export function App() {
     }
     if (mode === "shell") {
       if (res.kind === "Node") {
-        openNodeShellInTerminalTab(res);
+        openNodeShellInTerminalTab(res, "host");
       } else {
         const firstContainer = (res.containers && res.containers[0]) || "";
-        openPodShellInTerminalTab(res, firstContainer, false);
+        openPodShellInTerminalTab(res, firstContainer);
       }
       return;
     }
@@ -2396,31 +2401,74 @@ export function App() {
                 )}
                 {selectedResource.kind === "Node" && (
                   <>
-                    <button
-                      className="fl-drawer-act-btn"
-                      title="Open Node Shell in Terminal Tab"
-                      onClick={() => openNodeShellInTerminalTab(selectedResource)}
-                    >
-                      <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                        <rect x="2.5" y="2.5" width="15" height="15" rx="2.5" fill="#ffffff" />
-                        <path
-                          d="M6 7.4L9.2 10L6 12.6"
-                          stroke="var(--fl-teal)"
-                          strokeWidth="1.8"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        />
-                        <line
-                          x1="10.2"
-                          y1="12.8"
-                          x2="14"
-                          y2="12.8"
-                          stroke="var(--fl-teal)"
-                          strokeWidth="1.8"
-                          strokeLinecap="round"
-                        />
-                      </svg>
-                    </button>
+                    <div className="fl-drawer-act-wrap" onClick={(e) => e.stopPropagation()}>
+                      <button
+                        className={`fl-drawer-act-btn ${shellContainerMenuOpen ? "active" : ""}`}
+                        title="Open Node Shell in Terminal Tab"
+                        onClick={() => {
+                          setLogContainerMenuOpen(false);
+                          setShellContainerMenuOpen((v) => !v);
+                        }}
+                      >
+                        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                          <rect x="2.5" y="2.5" width="15" height="15" rx="2.5" fill="#ffffff" />
+                          <path
+                            d="M6 7.4L9.2 10L6 12.6"
+                            stroke="var(--fl-teal)"
+                            strokeWidth="1.8"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                          <line
+                            x1="10.2"
+                            y1="12.8"
+                            x2="14"
+                            y2="12.8"
+                            stroke="var(--fl-teal)"
+                            strokeWidth="1.8"
+                            strokeLinecap="round"
+                          />
+                        </svg>
+                      </button>
+                      {shellContainerMenuOpen && (
+                        <div className="fl-container-menu" style={{ minWidth: 250 }}>
+                          <div
+                            className="fl-container-menu-item"
+                            title="Enter Node's native OS shell via nsenter / chroot /host"
+                            onClick={() => {
+                              setShellContainerMenuOpen(false);
+                              openNodeShellInTerminalTab(selectedResource, "host");
+                            }}
+                          >
+                            <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
+                            <span>Node Host Shell (nsenter /host)</span>
+                          </div>
+                          <div style={{ borderTop: "1px solid var(--fl-border)", margin: "4px 0" }} />
+                          <div
+                            className="fl-container-menu-item"
+                            title="Open BusyBox debug shell with Node root filesystem mounted at /host"
+                            onClick={() => {
+                              setShellContainerMenuOpen(false);
+                              openNodeShellInTerminalTab(selectedResource, "busybox");
+                            }}
+                          >
+                            <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
+                            <span>Debug Shell (busybox:latest)</span>
+                          </div>
+                          <div
+                            className="fl-container-menu-item"
+                            title="Open dengliu/k8sdebugger:3cfd912 debug shell with Node root filesystem mounted at /host"
+                            onClick={() => {
+                              setShellContainerMenuOpen(false);
+                              openNodeShellInTerminalTab(selectedResource, "dengliu/k8sdebugger:3cfd912");
+                            }}
+                          >
+                            <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
+                            <span>Debug Shell (dengliu/k8sdebugger:3cfd912)</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
                     {(() => {
                       const isCordoned =
                         selectedResource.status.includes("SchedulingDisabled") ||
@@ -2511,15 +2559,16 @@ export function App() {
                         </svg>
                       </button>
                       {shellContainerMenuOpen && (
-                        <div className="fl-container-menu">
+                        <div className="fl-container-menu" style={{ minWidth: 250 }}>
                           {getPodContainerItems(selectedResource, drawerJson).map((c) => (
                             <div
                               key={c.name}
                               className="fl-container-menu-item"
+                              title={`Open shell in container ${c.name} (kubectl exec -it)`}
                               onClick={() => {
                                 setShellContainerMenuOpen(false);
                                 setLogContainer(c.name);
-                                openPodShellInTerminalTab(selectedResource, c.name, false);
+                                openPodShellInTerminalTab(selectedResource, c.name);
                               }}
                             >
                               <span className={`fl-csq ${c.cls}`} />
@@ -2529,16 +2578,33 @@ export function App() {
                           <div style={{ borderTop: "1px solid var(--fl-border)", margin: "4px 0" }} />
                           <div
                             className="fl-container-menu-item"
-                            title="Attach an ephemeral busybox:latest debug container (for distroless images without /bin/sh)"
+                            title="Attach an ephemeral busybox:latest debug container (kubectl debug --image=busybox:latest)"
                             onClick={() => {
                               setShellContainerMenuOpen(false);
                               const items = getPodContainerItems(selectedResource, drawerJson);
                               const targetContainer = logContainer || items[0]?.name || "";
-                              openPodShellInTerminalTab(selectedResource, targetContainer, true);
+                              openPodShellInTerminalTab(selectedResource, targetContainer, "busybox:latest");
                             }}
                           >
                             <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
-                            <span>Debug Shell (busybox)</span>
+                            <span>Debug Shell (busybox:latest)</span>
+                          </div>
+                          <div
+                            className="fl-container-menu-item"
+                            title="Attach an ephemeral dengliu/k8sdebugger:3cfd912 debug container (kubectl debug --image=dengliu/k8sdebugger:3cfd912)"
+                            onClick={() => {
+                              setShellContainerMenuOpen(false);
+                              const items = getPodContainerItems(selectedResource, drawerJson);
+                              const targetContainer = logContainer || items[0]?.name || "";
+                              openPodShellInTerminalTab(
+                                selectedResource,
+                                targetContainer,
+                                "dengliu/k8sdebugger:3cfd912",
+                              );
+                            }}
+                          >
+                            <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
+                            <span>Debug Shell (dengliu/k8sdebugger:3cfd912)</span>
                           </div>
                         </div>
                       )}

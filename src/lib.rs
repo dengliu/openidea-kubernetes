@@ -600,7 +600,8 @@ impl KubernetesPlugin {
                 let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let container = v.get("container").and_then(Value::as_str);
-                open_debug_terminal(&cfg, ns, name, container)?;
+                let image = v.get("image").and_then(Value::as_str);
+                open_debug_terminal(&cfg, ns, name, container, image)?;
             }
             "node-shell" => {
                 let mut cfg = KubeConfigState::load();
@@ -608,8 +609,9 @@ impl KubernetesPlugin {
                     cfg.context = c.to_owned();
                 }
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+                let mode = v.get("mode").and_then(Value::as_str);
                 let project = resolve_project(ctx).ok();
-                open_node_shell_terminal(project.as_ref(), &cfg, name)?;
+                open_node_shell_terminal(project.as_ref(), &cfg, name, mode)?;
             }
             "pod-exec" => {
                 let project = resolve_project(ctx)?;

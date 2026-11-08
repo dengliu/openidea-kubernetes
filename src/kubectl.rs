@@ -2615,7 +2615,7 @@ pub fn open_exec_or_debug_terminal(
                 || msg.contains("oci runtime exec failed")
                 || msg.contains("stat /bin/sh")
             {
-                open_debug_terminal(cfg, namespace, pod, container)?;
+                open_debug_terminal(cfg, namespace, pod, container, None)?;
                 return Ok((true, ()));
             }
         }
@@ -2624,15 +2624,17 @@ pub fn open_exec_or_debug_terminal(
     Ok((false, ()))
 }
 
-/// Opens an ephemeral debug container (`kubectl debug -it --image=busybox:latest`) for distroless Pods.
+/// Opens an ephemeral debug container (`kubectl debug -it --image=<image>`) for Pods.
 pub fn open_debug_terminal(
     cfg: &KubeConfigState,
     namespace: &str,
     pod: &str,
     container: Option<&str>,
+    image: Option<&str>,
 ) -> Result<(), Error> {
+    let debug_image = image.filter(|s| !s.is_empty()).unwrap_or("busybox:latest");
     let mut args = cfg.target_args(Some(namespace));
-    args.extend(["debug".into(), "-it".into(), pod.to_owned(), "--image=busybox:latest".into()]);
+    args.extend(["debug".into(), "-it".into(), pod.to_owned(), format!("--image={debug_image}")]);
     if let Some(c) = container.filter(|c| !c.is_empty()) {
         args.push(format!("--target={c}"));
     }
@@ -2640,7 +2642,7 @@ pub fn open_debug_terminal(
         "--".into(),
         "/bin/sh".into(),
         "-c".into(),
-        "export TERM=xterm-256color; if [ -x /bin/ash ]; then exec /bin/ash; else exec /bin/sh; fi".into(),
+        "export TERM=xterm-256color; if [ -x /bin/bash ]; then exec /bin/bash; elif [ -x /bin/ash ]; then exec /bin/ash; else exec /bin/sh; fi".into(),
     ]);
     let title = match container.filter(|c| !c.is_empty()) {
         Some(c) => format!("Debug: {pod} ({c})"),
@@ -2649,14 +2651,22 @@ pub fn open_debug_terminal(
     host::open_terminal(&title, "kubectl", &args)
 }
 
-/// Opens a root host shell on a Kubernetes Node (`kubectl exec -it node-debugger-<node>`)
-/// whose container entrypoint automatically exits as soon as the `kubectl exec` session disconnects
-/// (including when the user closes the Terminal tab with `Terminate` / `SIGHUP`).
+/// Opens a shell on a Kubernetes Node (`kubectl exec -it node-debugger-<node>`)
+/// supporting 3 modes:
+/// - `"host"` (default): enters the Node's own OS and `/bin/bash` via `nsenter -t 1 -m -u -i -n -p` (with `chroot /host` fallback)
+/// - `"busybox"`: uses `busybox:latest` shell with the Node's root filesystem mounted at `/host`
+/// - `"dengliu/k8sdebugger:3cfd912"` (or any custom image): uses that debugger image with the Node's root filesystem mounted at `/host`
 pub fn open_node_shell_terminal(
     project: Option<&Project>,
     cfg: &KubeConfigState,
     node: &str,
+    mode: Option<&str>,
 ) -> Result<(), Error> {
+    let shell_mode = mode.filter(|s| !s.is_empty()).unwrap_or("host");
+    let image = match shell_mode {
+        "host" | "busybox" | "busybox:latest" => "busybox:latest",
+        custom => custom,
+    };
     let sanitized: String = node
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
@@ -2724,7 +2734,7 @@ pub fn open_node_shell_terminal(
                 "containers": [
                     {
                         "name": "debugger",
-                        "image": "busybox:latest",
+                        "image": image,
                         "securityContext": {
                             "privileged": true
                         },
@@ -2760,10 +2770,22 @@ pub fn open_node_shell_terminal(
             "wait".into(),
             "--for=condition=Ready".into(),
             format!("pod/{pod_name}"),
-            "--timeout=20s".into(),
+            "--timeout=30s".into(),
         ]);
         let _ = run_kubectl(proj, &wait_args, None);
     }
+
+    let exec_cmd = if shell_mode == "host" {
+        "trap 'kill -USR1 1 2>/dev/null' EXIT HUP INT TERM; export TERM=xterm-256color; if command -v nsenter >/dev/null 2>&1 && [ -d /proc/1/ns ]; then nsenter -t 1 -m -u -i -n -p -- /bin/sh -c 'if [ -x /bin/bash ]; then exec /bin/bash; else exec /bin/sh; fi'; elif [ -d /host ]; then chroot /host /bin/sh -c 'if [ -x /bin/bash ]; then exec /bin/bash; else exec /bin/sh; fi'; else /bin/sh; fi"
+    } else {
+        "trap 'kill -USR1 1 2>/dev/null' EXIT HUP INT TERM; export TERM=xterm-256color; if [ -d /host ]; then cd /host; fi; if [ -x /bin/bash ]; then /bin/bash; elif [ -x /bin/ash ]; then /bin/ash; else /bin/sh; fi"
+    };
+
+    let title = match shell_mode {
+        "host" => format!("Node: {node}"),
+        "busybox" | "busybox:latest" => format!("Node (busybox): {node}"),
+        _ => format!("Node (k8sdebugger): {node}"),
+    };
 
     let mut args = cfg.target_args(Some("default"));
     args.extend([
@@ -2773,9 +2795,9 @@ pub fn open_node_shell_terminal(
         "--".into(),
         "/bin/sh".into(),
         "-c".into(),
-        "trap 'kill -USR1 1 2>/dev/null' EXIT HUP INT TERM; export TERM=xterm-256color; if [ -d /host ]; then chroot /host /bin/sh -c 'if [ -x /bin/bash ]; then exec /bin/bash; else exec /bin/sh; fi'; else /bin/sh; fi".into(),
+        exec_cmd.into(),
     ]);
-    host::open_terminal(&format!("Node: {node}"), "kubectl", &args)
+    host::open_terminal(&title, "kubectl", &args)
 }
 
 /// Runs a shell command inside a Pod container (`kubectl exec`) and returns structured output + updated working directory.
