@@ -313,9 +313,9 @@ impl KubernetesPlugin {
     }
 
     fn handle_page_message(&mut self, raw: &str, ctx: &Invocation) -> Result<(), Error> {
-        let _task = host::begin_task("Kubernetes", false);
         let v: Value = serde_json::from_str(raw).map_err(|e| Error::Invalid(e.to_string()))?;
         let op = v.get("op").and_then(Value::as_str).unwrap_or("");
+        let _task = (op != "poll-category").then(|| host::begin_task("Kubernetes", false));
         match op {
             "init" => {
                 let project = resolve_project(ctx).ok();
@@ -445,7 +445,7 @@ impl KubernetesPlugin {
                 }
                 self.post_snapshot(false);
             }
-            "load-category" => {
+            "load-category" | "poll-category" => {
                 let project = resolve_project(ctx)?;
                 let mut cfg = KubeConfigState::load();
                 self.ensure_catalog_loaded(&project, &mut cfg);
@@ -453,6 +453,9 @@ impl KubernetesPlugin {
                     if cat == "Workspace" {
                         self.index.ensure(Some(&project), None);
                         self.post_state(ctx);
+                        return Ok(());
+                    }
+                    if cat == "ClusterCatalog" {
                         return Ok(());
                     }
                     if let Some(ref mut snap) = self.snapshot {

@@ -861,8 +861,30 @@ export function App() {
   // Searchable Namespace Picker state
   const [nsMenuOpen, setNsMenuOpen] = useState<boolean>(false);
   const [nsSearch, setNsSearch] = useState<string>("");
+  const [, setAgeTick] = useState<number>(0);
 
   const loadedLazyRef = useRef<Record<string, boolean>>({});
+
+  // Live 1-second Age ticker so relative ages ("12s", "1m", "2m") update continuously
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        setAgeTick((t) => (t + 1) % 1_000_000);
+      }
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // Live 5-second background category poll so resource status, metrics, and deleted pods stay fresh
+  useEffect(() => {
+    if (!snapshot.connected || activeKind === "ClusterCatalog" || activeKind === "Workspace") return;
+    const id = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        sendToBackend({ op: "poll-category", category: activeKind });
+      }
+    }, 5000);
+    return () => window.clearInterval(id);
+  }, [snapshot.connected, snapshot.current_context, snapshot.current_namespace, snapshot.all_namespaces, activeKind]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !window.openidea) return;

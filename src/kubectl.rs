@@ -2649,7 +2649,9 @@ pub fn open_debug_terminal(
     host::open_terminal(&title, "kubectl", &args)
 }
 
-/// Opens a root host shell on a Kubernetes Node (`kubectl run node-debugger-<node> --rm -it`) with automatic pod cleanup.
+/// Opens a root host shell on a Kubernetes Node (`kubectl exec -it node-debugger-<node>`)
+/// whose container entrypoint automatically exits as soon as the `kubectl exec` session disconnects
+/// (including when the user closes the Terminal tab with `Terminate` / `SIGHUP`).
 pub fn open_node_shell_terminal(
     project: Option<&Project>,
     cfg: &KubeConfigState,
@@ -2675,68 +2677,103 @@ pub fn open_node_shell_terminal(
             "--ignore-not-found=true".into(),
         ]);
         let _ = run_kubectl(proj, &del_args, None);
-    }
 
-    let overrides = json!({
-        "apiVersion": "v1",
-        "metadata": {
-            "labels": {
-                "app.kubernetes.io/managed-by": "openidea-node-shell",
-                "openidea.io/node": suffix,
-            }
-        },
-        "spec": {
-            "nodeName": node,
-            "hostPID": true,
-            "hostNetwork": true,
-            "hostIPC": true,
-            "terminationGracePeriodSeconds": 0,
-            "tolerations": [
-                { "operator": "Exists" }
-            ],
-            "containers": [
-                {
-                    "name": "debugger",
-                    "image": "busybox:latest",
-                    "stdin": true,
-                    "stdinOnce": true,
-                    "tty": true,
-                    "securityContext": {
-                        "privileged": true
-                    },
-                    "command": [
-                        "/bin/sh",
-                        "-c",
-                        "export TERM=xterm-256color; if [ -d /host ]; then exec chroot /host /bin/sh -c 'if [ -x /bin/bash ]; then exec /bin/bash; else exec /bin/sh; fi'; else exec /bin/sh; fi"
-                    ],
-                    "volumeMounts": [
-                        {
-                            "name": "host-root",
-                            "mountPath": "/host"
-                        }
-                    ]
+        let entrypoint = concat!(
+            "CID=$(ls -l /proc/$PPID/fd 2>/dev/null | grep -- '-stdin$' | head -n1 | sed 's|.*/containers/||;s|/io/.*||'); ",
+            "CPID=$(pidof containerd 2>/dev/null | awk '{print $1}'); ",
+            "if [ -n \"$CID\" ] && [ -n \"$CPID\" ]; then ",
+            "  BASE=$(ls -l /proc/$CPID/fd 2>/dev/null | grep -F \"$CID\" | grep -c -- '-stdout$'); ",
+            "  i=0; ATTACHED=0; ",
+            "  while true; do ",
+            "    CUR=$(ls -l /proc/$CPID/fd 2>/dev/null | grep -F \"$CID\" | grep -c -- '-stdout$'); ",
+            "    if [ \"$CUR\" -gt \"$BASE\" ]; then ATTACHED=1; ",
+            "    elif [ \"$ATTACHED\" -eq 1 ]; then ",
+            "      if [ -f /host/etc/kubernetes/admin.conf ]; then ",
+            "        chroot /host kubectl --kubeconfig=/etc/kubernetes/admin.conf delete pod \"$HOSTNAME\" -n default --force --grace-period=0 >/dev/null 2>&1 || true; ",
+            "      fi; ",
+            "      exit 0; ",
+            "    else i=$((i+1)); if [ $i -ge 30 ]; then exit 0; fi; fi; ",
+            "    sleep 1; ",
+            "  done; ",
+            "else ",
+            "  trap 'exit 0' TERM INT HUP USR1; sleep 3600; ",
+            "fi"
+        );
+
+        let manifest = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": pod_name,
+                "namespace": "default",
+                "labels": {
+                    "app.kubernetes.io/managed-by": "openidea-node-shell",
+                    "openidea.io/node": suffix,
                 }
-            ],
-            "volumes": [
-                {
-                    "name": "host-root",
-                    "hostPath": {
-                        "path": "/"
+            },
+            "spec": {
+                "nodeName": node,
+                "hostPID": true,
+                "hostNetwork": true,
+                "hostIPC": true,
+                "restartPolicy": "Never",
+                "terminationGracePeriodSeconds": 0,
+                "tolerations": [
+                    { "operator": "Exists" }
+                ],
+                "containers": [
+                    {
+                        "name": "debugger",
+                        "image": "busybox:latest",
+                        "securityContext": {
+                            "privileged": true
+                        },
+                        "command": ["/bin/sh", "-c", entrypoint],
+                        "volumeMounts": [
+                            {
+                                "name": "host-root",
+                                "mountPath": "/host"
+                            }
+                        ]
                     }
-                }
-            ]
+                ],
+                "volumes": [
+                    {
+                        "name": "host-root",
+                        "hostPath": {
+                            "path": "/"
+                        }
+                    }
+                ]
+            }
+        });
+
+        let mut apply_args = cfg.target_args(Some("default"));
+        apply_args.extend(["apply".into(), "-f".into(), "-".into()]);
+        let out = run_kubectl(proj, &apply_args, Some(&manifest.to_string()))?;
+        if out.status != Some(0) {
+            return Err(Error::Failed(first_line_or(&out.stderr, "failed to create node-debugger pod")));
         }
-    });
+
+        let mut wait_args = cfg.target_args(Some("default"));
+        wait_args.extend([
+            "wait".into(),
+            "--for=condition=Ready".into(),
+            format!("pod/{pod_name}"),
+            "--timeout=20s".into(),
+        ]);
+        let _ = run_kubectl(proj, &wait_args, None);
+    }
 
     let mut args = cfg.target_args(Some("default"));
     args.extend([
-        "run".into(),
-        pod_name,
-        "--rm".into(),
+        "exec".into(),
         "-it".into(),
-        "--restart=Never".into(),
-        "--image=busybox:latest".into(),
-        format!("--overrides={overrides}"),
+        pod_name,
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        "trap 'kill -USR1 1 2>/dev/null' EXIT HUP INT TERM; export TERM=xterm-256color; if [ -d /host ]; then chroot /host /bin/sh -c 'if [ -x /bin/bash ]; then exec /bin/bash; else exec /bin/sh; fi'; else /bin/sh; fi".into(),
     ]);
     host::open_terminal(&format!("Node: {node}"), "kubectl", &args)
 }
