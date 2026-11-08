@@ -37,6 +37,12 @@
       "enum": ["/bin/sh", "/bin/bash", "sh", "bash"],
       "default": "/bin/sh"
     },
+    "debuggerImage": {
+      "type": "string",
+      "title": "Custom debugger container image",
+      "description": "Container image (image:tag) used for the custom Debug Shell option on Pods and Nodes.",
+      "default": "dengliu/k8sdebugger:3cfd912"
+    },
     "portForwardLocalPort": {
       "type": "integer",
       "title": "Default local port for Port Forward",

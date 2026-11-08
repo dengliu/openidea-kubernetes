@@ -863,6 +863,7 @@ export function App() {
   // Searchable Namespace Picker state
   const [nsMenuOpen, setNsMenuOpen] = useState<boolean>(false);
   const [nsSearch, setNsSearch] = useState<string>("");
+  const [debuggerImage, setDebuggerImage] = useState<string>("dengliu/k8sdebugger:3cfd912");
   const [, setAgeTick] = useState<number>(0);
 
   const loadedLazyRef = useRef<Record<string, boolean>>({});
@@ -920,6 +921,9 @@ export function App() {
           return;
         }
         if (m.op === "state") {
+          if (typeof m.debuggerImage === "string" && m.debuggerImage.trim()) {
+            setDebuggerImage(m.debuggerImage.trim());
+          }
           setSnapshot((prev) => {
             const next: ClusterSnapshot = m.snapshot || prev;
             if ((!next.cluster_catalog || next.cluster_catalog.length === 0) && prev.cluster_catalog.length > 0) {
@@ -1330,10 +1334,7 @@ export function App() {
     });
   }
 
-  function openNodeShellInTerminalTab(
-    res: ClusterResource,
-    mode: "host" | "busybox" | "dengliu/k8sdebugger:3cfd912" = "host",
-  ) {
+  function openNodeShellInTerminalTab(res: ClusterResource, mode: string = "host") {
     const ctx = snapshot.current_context;
     sendToBackend({
       op: "node-shell",
@@ -2459,14 +2460,14 @@ export function App() {
                           </div>
                           <div
                             className="fl-container-menu-item"
-                            title="Open dengliu/k8sdebugger:3cfd912 debug shell with Node root filesystem mounted at /host"
+                            title={`Open ${debuggerImage} debug shell with Node root filesystem mounted at /host`}
                             onClick={() => {
                               setShellContainerMenuOpen(false);
-                              openNodeShellInTerminalTab(selectedResource, "dengliu/k8sdebugger:3cfd912");
+                              openNodeShellInTerminalTab(selectedResource, "custom");
                             }}
                           >
                             <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
-                            <span>Debug Shell (dengliu/k8sdebugger:3cfd912)</span>
+                            <span>{`Debug Shell (${debuggerImage})`}</span>
                           </div>
                         </div>
                       )}
@@ -2593,20 +2594,16 @@ export function App() {
                           </div>
                           <div
                             className="fl-container-menu-item"
-                            title="Attach an ephemeral dengliu/k8sdebugger:3cfd912 debug container (kubectl debug --image=dengliu/k8sdebugger:3cfd912)"
+                            title={`Attach an ephemeral ${debuggerImage} debug container (kubectl debug --image=${debuggerImage})`}
                             onClick={() => {
                               setShellContainerMenuOpen(false);
                               const items = getPodContainerItems(selectedResource, drawerJson);
                               const targetContainer = logContainer || items[0]?.name || "";
-                              openPodShellInTerminalTab(
-                                selectedResource,
-                                targetContainer,
-                                "dengliu/k8sdebugger:3cfd912",
-                              );
+                              openPodShellInTerminalTab(selectedResource, targetContainer, "custom");
                             }}
                           >
                             <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
-                            <span>Debug Shell (dengliu/k8sdebugger:3cfd912)</span>
+                            <span>{`Debug Shell (${debuggerImage})`}</span>
                           </div>
                         </div>
                       )}

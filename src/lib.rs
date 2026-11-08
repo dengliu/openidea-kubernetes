@@ -211,10 +211,12 @@ impl KubernetesPlugin {
             self.refresh_cluster(p);
         }
         let ws = workspace_manifests_json(&self.index.files, &root);
+        let cfg = KubeConfigState::load();
         json!({
             "op": "state",
             "snapshot": self.snapshot.clone().unwrap_or_default(),
             "workspace": ws,
+            "debuggerImage": cfg.debugger_image,
         })
     }
 
@@ -226,13 +228,14 @@ impl KubernetesPlugin {
     }
 
     fn post_snapshot(&mut self, needs_bg_sync: bool) {
+        let cfg = KubeConfigState::load();
         let payload = json!({
             "op": "state",
             "snapshot": self.snapshot.clone().unwrap_or_default(),
             "needsBackgroundSync": needs_bg_sync,
+            "debuggerImage": cfg.debugger_image,
         });
         let _ = host::post_view_message(VIEW_ID, &payload.to_string());
-        let cfg = KubeConfigState::load();
         self.update_status_bar(&cfg);
     }
 
@@ -334,6 +337,7 @@ impl KubernetesPlugin {
                     "snapshot": snap,
                     "workspace": ws,
                     "needsClusterFetch": false,
+                    "debuggerImage": cfg.debugger_image,
                 });
                 let _ = host::post_view_message(VIEW_ID, &payload.to_string());
                 if needs_fetch

@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+pub const DEFAULT_DEBUGGER_IMAGE: &str = "dengliu/k8sdebugger:3cfd912";
+
 /// Active Kubernetes connection configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KubeConfigState {
@@ -16,6 +18,7 @@ pub struct KubeConfigState {
     pub all_namespaces: bool,
     pub tail_lines: u32,
     pub shell: String,
+    pub debugger_image: String,
     pub port_forward_local_port: u32,
 }
 
@@ -41,10 +44,23 @@ impl KubeConfigState {
             .unwrap_or_else(|| host::setting_bool("allNamespaces").unwrap_or(false));
         let tail_lines = host::setting_number("tailLines").map(|n| (n as u32).clamp(10, 10_000)).unwrap_or(200);
         let shell = host::setting_string("shell").filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
+        let debugger_image = host::setting_string("debuggerImage")
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_DEBUGGER_IMAGE.into());
         let port_forward_local_port =
             host::setting_number("portForwardLocalPort").map(|n| n.max(0.0) as u32).unwrap_or(0);
 
-        Self { kubeconfig, context, namespace, all_namespaces, tail_lines, shell, port_forward_local_port }
+        Self {
+            kubeconfig,
+            context,
+            namespace,
+            all_namespaces,
+            tail_lines,
+            shell,
+            debugger_image,
+            port_forward_local_port,
+        }
     }
 
     pub fn base_args(&self, include_namespace: bool) -> Vec<String> {
@@ -2632,7 +2648,16 @@ pub fn open_debug_terminal(
     container: Option<&str>,
     image: Option<&str>,
 ) -> Result<(), Error> {
-    let debug_image = image.filter(|s| !s.is_empty()).unwrap_or("busybox:latest");
+    let custom_default = if cfg.debugger_image.trim().is_empty() {
+        DEFAULT_DEBUGGER_IMAGE
+    } else {
+        cfg.debugger_image.trim()
+    };
+    let debug_image = match image.map(str::trim).filter(|s| !s.is_empty()) {
+        Some("custom") => custom_default,
+        Some(explicit) => explicit,
+        None => "busybox:latest",
+    };
     let mut args = cfg.target_args(Some(namespace));
     args.extend(["debug".into(), "-it".into(), pod.to_owned(), format!("--image={debug_image}")]);
     if let Some(c) = container.filter(|c| !c.is_empty()) {
@@ -2655,16 +2680,22 @@ pub fn open_debug_terminal(
 /// supporting 3 modes:
 /// - `"host"` (default): enters the Node's own OS and `/bin/bash` via `nsenter -t 1 -m -u -i -n -p` (with `chroot /host` fallback)
 /// - `"busybox"`: uses `busybox:latest` shell with the Node's root filesystem mounted at `/host`
-/// - `"dengliu/k8sdebugger:3cfd912"` (or any custom image): uses that debugger image with the Node's root filesystem mounted at `/host`
+/// - `"custom"` (or any custom `image:tag`): uses the configured `debuggerImage` (`cfg.debugger_image`) with the Node's root filesystem mounted at `/host`
 pub fn open_node_shell_terminal(
     project: Option<&Project>,
     cfg: &KubeConfigState,
     node: &str,
     mode: Option<&str>,
 ) -> Result<(), Error> {
-    let shell_mode = mode.filter(|s| !s.is_empty()).unwrap_or("host");
+    let custom_default = if cfg.debugger_image.trim().is_empty() {
+        DEFAULT_DEBUGGER_IMAGE
+    } else {
+        cfg.debugger_image.trim()
+    };
+    let shell_mode = mode.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("host");
     let image = match shell_mode {
         "host" | "busybox" | "busybox:latest" => "busybox:latest",
+        "custom" => custom_default,
         custom => custom,
     };
     let sanitized: String = node
