@@ -2688,26 +2688,31 @@ pub fn open_node_shell_terminal(
         ]);
         let _ = run_kubectl(proj, &del_args, None);
 
-        let entrypoint = concat!(
-            "CID=$(ls -l /proc/$PPID/fd 2>/dev/null | grep -- '-stdin$' | head -n1 | sed 's|.*/containers/||;s|/io/.*||'); ",
-            "CPID=$(pidof containerd 2>/dev/null | awk '{print $1}'); ",
-            "if [ -n \"$CID\" ] && [ -n \"$CPID\" ]; then ",
-            "  BASE=$(ls -l /proc/$CPID/fd 2>/dev/null | grep -F \"$CID\" | grep -c -- '-stdout$'); ",
-            "  i=0; ATTACHED=0; ",
-            "  while true; do ",
-            "    CUR=$(ls -l /proc/$CPID/fd 2>/dev/null | grep -F \"$CID\" | grep -c -- '-stdout$'); ",
-            "    if [ \"$CUR\" -gt \"$BASE\" ]; then ATTACHED=1; ",
-            "    elif [ \"$ATTACHED\" -eq 1 ]; then ",
-            "      if [ -f /host/etc/kubernetes/admin.conf ]; then ",
-            "        chroot /host kubectl --kubeconfig=/etc/kubernetes/admin.conf delete pod \"$HOSTNAME\" -n default --force --grace-period=0 >/dev/null 2>&1 || true; ",
-            "      fi; ",
-            "      exit 0; ",
-            "    else i=$((i+1)); if [ $i -ge 30 ]; then exit 0; fi; fi; ",
-            "    sleep 1; ",
-            "  done; ",
-            "else ",
-            "  trap 'exit 0' TERM INT HUP USR1; sleep 3600; ",
-            "fi"
+        let entrypoint = format!(
+            concat!(
+                "CID=$(ls -l /proc/$PPID/fd 2>/dev/null | grep -- '-stdout$' | head -n1 | sed 's|.*/containers/||;s|/io/.*||'); ",
+                "CPID=$(pidof containerd 2>/dev/null | awk '{{print $1}}'); ",
+                "if [ -n \"$CID\" ] && [ -n \"$CPID\" ]; then ",
+                "  BASE=$(ls -l /proc/$CPID/fd 2>/dev/null | grep -F \"$CID\" | grep -c -- '-stdout$'); ",
+                "  i=0; ATTACHED=0; ",
+                "  while true; do ",
+                "    CUR=$(ls -l /proc/$CPID/fd 2>/dev/null | grep -F \"$CID\" | grep -c -- '-stdout$'); ",
+                "    if [ \"$CUR\" -gt \"$BASE\" ]; then ATTACHED=1; ",
+                "    elif [ \"$ATTACHED\" -eq 1 ]; then ",
+                "      for kc in /etc/kubernetes/admin.conf /etc/kubernetes/kubelet.conf /var/lib/kubelet/kubeconfig; do ",
+                "        if [ -f \"/host$kc\" ]; then ",
+                "          chroot /host kubectl --kubeconfig=\"$kc\" delete pod {} -n default --force --grace-period=0 >/dev/null 2>&1 && break; ",
+                "        fi; ",
+                "      done; ",
+                "      exit 0; ",
+                "    else i=$((i+1)); if [ $i -ge 30 ]; then exit 0; fi; fi; ",
+                "    sleep 1; ",
+                "  done; ",
+                "else ",
+                "  trap 'exit 0' TERM INT HUP USR1; sleep 3600; ",
+                "fi"
+            ),
+            pod_name
         );
 
         let manifest = json!({

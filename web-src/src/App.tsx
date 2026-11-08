@@ -53,10 +53,12 @@ function formatCompactAge(raw?: string): string {
   const days = Math.floor(diffSec / 86400);
   const hours = Math.floor((diffSec % 86400) / 3600);
   const mins = Math.floor((diffSec % 3600) / 60);
+  const secs = diffSec % 60;
   if (days >= 10) return `${days}d`;
   if (days >= 1) return hours > 0 ? `${days}d${hours}h` : `${days}d`;
   if (hours >= 1) return mins > 0 && hours < 10 ? `${hours}h${mins}m` : `${hours}h`;
-  if (mins >= 1) return `${mins}m`;
+  if (mins >= 10) return `${mins}m`;
+  if (mins >= 1) return `${mins}m${secs}s`;
   return `${diffSec}s`;
 }
 
