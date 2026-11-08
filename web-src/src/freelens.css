@@ -289,7 +289,7 @@ body,
   display: flex;
   align-items: center;
   gap: 20px;
-  padding: 0 72px 0 20px;
+  padding: 0 calc(var(--openidea-corner-inset-width, 64px) + 12px) 0 20px;
   height: 40px;
   flex-shrink: 0;
   border-bottom: 1px solid var(--fl-border);
@@ -635,7 +635,7 @@ body,
 
 /* Slide-over Right Detail Drawer (Screenshot 2) */
 .fl-main > .fl-subheader:first-child {
-  padding-right: 72px;
+  padding-right: calc(var(--openidea-corner-inset-width, 64px) + 12px);
 }
 
 .fl-drawer {

@@ -133,7 +133,7 @@
   <text x="60" y="683" class="code-text">  init, set-context, load-category,</text>
   <text x="60" y="699" class="code-text">  inspect-json, cordon-node,</text>
   <text x="60" y="715" class="code-text">  drain-node, trigger-cronjob</text>
-  <text x="60" y="732" class="box-text">• Commands: live-yaml-get/diff/apply</text>
+  <text x="60" y="732" class="box-text">• Content Tabs: open-content-tab / content-tab-action</text>
 
   <rect x="339" y="612" width="285" height="148" rx="8" fill="#ffffff" stroke="#f59f00" stroke-width="1.5" />
   <text x="353" y="632" class="box-title">YAML &amp; Helm Parser (manifest.rs)</text>

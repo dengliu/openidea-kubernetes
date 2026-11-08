@@ -68,13 +68,37 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ContentTabTarget {
+    pub context: String,
+    pub namespace: String,
+    pub kind: String,
+    pub name: String,
+}
+
 #[derive(Default)]
 pub struct KubernetesPlugin {
     pub index: ProjectIndex,
     pub snapshot: Option<ClusterSnapshot>,
+    pub content_tabs: std::collections::HashMap<String, ContentTabTarget>,
 }
 
 impl KubernetesPlugin {
+    fn resolve_content_tab_target(&self, key: &str) -> Option<ContentTabTarget> {
+        if let Some(t) = self.content_tabs.get(key) {
+            return Some(t.clone());
+        }
+        let rest = key.strip_prefix("k8s-yaml:")?;
+        let mut parts = rest.splitn(4, '|');
+        let context = parts.next()?.to_owned();
+        let namespace = parts.next()?.to_owned();
+        let kind = parts.next()?.to_owned();
+        let name = parts.next()?.to_owned();
+        if kind.is_empty() || name.is_empty() {
+            return None;
+        }
+        Some(ContentTabTarget { context, namespace, kind, name })
+    }
     fn update_status_bar(&self, cfg: &KubeConfigState) {
         let ctx_name = if let Some(ref snap) = self.snapshot
             && !snap.current_context.is_empty()
@@ -808,6 +832,176 @@ impl KubernetesPlugin {
                 Ok(out) => Self::post_detail(out, Some("Rendered Helm chart templates".into()), false),
                 Err(e) => Self::post_detail(e.to_string(), Some(e.to_string()), true),
             },
+            "open-resource-yaml" => {
+                let project = resolve_project(ctx)?;
+                let mut cfg = KubeConfigState::load();
+                let req_ctx = v.get("context").and_then(Value::as_str).unwrap_or("");
+                if !req_ctx.is_empty() {
+                    cfg.context = req_ctx.to_owned();
+                }
+                let kind = v.get("kind").and_then(Value::as_str).unwrap_or("Pod");
+                let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("");
+                let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+                let title = v
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("{kind}: {name}.yaml"));
+                let key = v
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("k8s-yaml:{}|{ns}|{kind}|{name}", cfg.context));
+                match inspect_cluster_resource(&project, &cfg, kind, ns, name, true) {
+                    Ok(yaml) => {
+                        self.content_tabs.insert(
+                            key.clone(),
+                            ContentTabTarget {
+                                context: cfg.context.clone(),
+                                namespace: ns.to_owned(),
+                                kind: kind.to_owned(),
+                                name: name.to_owned(),
+                            },
+                        );
+                        let msg = json!({
+                            "op": "resource-yaml-ready",
+                            "key": key,
+                            "title": title,
+                            "fileName": format!("{name}.yaml"),
+                            "content": yaml,
+                        });
+                        let _ = host::post_view_message(VIEW_ID, &msg.to_string());
+                    }
+                    Err(e) => Self::post_detail(e.to_string(), Some(e.to_string()), true),
+                }
+            }
+            "content-tab-action" => {
+                let request_id = v.get("requestId").and_then(Value::as_str).unwrap_or("").to_owned();
+                let key = v.get("key").and_then(Value::as_str).unwrap_or("");
+                let action = v.get("action").and_then(Value::as_str).unwrap_or("");
+                let content = v.get("content").and_then(Value::as_str).unwrap_or("");
+                let reply = match (resolve_project(ctx), self.resolve_content_tab_target(key)) {
+                    (Ok(project), Some(target)) => {
+                        let mut cfg = KubeConfigState::load();
+                        if !target.context.is_empty() {
+                            cfg.context = target.context.clone();
+                        }
+                        if !target.namespace.is_empty() {
+                            cfg.namespace = target.namespace.clone();
+                        }
+                        match action {
+                            "reload" => match inspect_cluster_resource(
+                                &project,
+                                &cfg,
+                                &target.kind,
+                                &target.namespace,
+                                &target.name,
+                                true,
+                            ) {
+                                Ok(yaml) => json!({
+                                    "op": "content-tab-reply",
+                                    "requestId": request_id,
+                                    "content": yaml,
+                                    "saved": true,
+                                    "status": format!("Reloaded {}/{} from cluster", target.kind, target.name),
+                                }),
+                                Err(e) => json!({
+                                    "op": "content-tab-reply",
+                                    "requestId": request_id,
+                                    "error": e.to_string(),
+                                }),
+                            },
+                            "diff" => match inspect_cluster_resource(
+                                &project,
+                                &cfg,
+                                &target.kind,
+                                &target.namespace,
+                                &target.name,
+                                true,
+                            ) {
+                                Ok(live_yaml) => {
+                                    let identical = live_yaml.trim() == content.trim();
+                                    let ctx_label = if cfg.context.is_empty() { "current" } else { cfg.context.as_str() };
+                                    json!({
+                                        "op": "content-tab-reply",
+                                        "requestId": request_id,
+                                        "diff": {
+                                            "left": live_yaml,
+                                            "right": content,
+                                            "leftLabel": format!("Cluster ({ctx_label})"),
+                                            "rightLabel": "Edited",
+                                            "title": format!("Diff: {}/{}", target.kind, target.name),
+                                        },
+                                        "status": if identical {
+                                            "No differences against live cluster resource".to_string()
+                                        } else {
+                                            format!("Opened diff for {}/{}", target.kind, target.name)
+                                        },
+                                    })
+                                }
+                                Err(e) => json!({
+                                    "op": "content-tab-reply",
+                                    "requestId": request_id,
+                                    "error": e.to_string(),
+                                }),
+                            },
+                            "save" | "apply" => match apply_or_diff_manifest(&project, &cfg, content, "apply") {
+                                Ok(out) => {
+                                    if let Some(ref mut snap) = self.snapshot {
+                                        fetch_category_into_snapshot(&project, &cfg, snap, &target.kind);
+                                        self.post_snapshot(false);
+                                    }
+                                    let refreshed = inspect_cluster_resource(
+                                        &project,
+                                        &cfg,
+                                        &target.kind,
+                                        &target.namespace,
+                                        &target.name,
+                                        true,
+                                    )
+                                    .ok();
+                                    let preview = out.lines().next().unwrap_or("Applied").to_string();
+                                    host::notify(NotificationLevel::Info, "Kubernetes Apply", &preview);
+                                    let mut rep = json!({
+                                        "op": "content-tab-reply",
+                                        "requestId": request_id,
+                                        "saved": true,
+                                        "status": format!("Applied {}/{}: {preview}", target.kind, target.name),
+                                    });
+                                    if let Some(updated_yaml) = refreshed {
+                                        rep["content"] = Value::String(updated_yaml);
+                                    }
+                                    rep
+                                }
+                                Err(e) => json!({
+                                    "op": "content-tab-reply",
+                                    "requestId": request_id,
+                                    "saved": false,
+                                    "error": e.to_string(),
+                                }),
+                            },
+                            other => json!({
+                                "op": "content-tab-reply",
+                                "requestId": request_id,
+                                "error": format!("Unknown content tab action: {other}"),
+                            }),
+                        }
+                    }
+                    (Err(e), _) => json!({
+                        "op": "content-tab-reply",
+                        "requestId": request_id,
+                        "saved": false,
+                        "error": e.to_string(),
+                    }),
+                    (_, None) => json!({
+                        "op": "content-tab-reply",
+                        "requestId": request_id,
+                        "saved": false,
+                        "error": format!("Unknown Kubernetes resource tab key: {key}"),
+                    }),
+                };
+                let _ = host::post_view_message(VIEW_ID, &reply.to_string());
+            }
             _ => {}
         }
         Ok(())
@@ -944,52 +1138,8 @@ impl Plugin for KubernetesPlugin {
                 );
                 Ok(Some(next))
             }
-            "apply" => {
-                if let Some(raw) = arg.filter(|s| s.trim_start().starts_with('{'))
-                    && let Ok(v) = serde_json::from_str::<Value>(raw)
-                    && v.get("op").and_then(Value::as_str) == Some("live-yaml-apply")
-                {
-                    let _task = host::begin_task("Kubernetes: Applying resource YAML", false);
-                    let project = resolve_project(ctx)?;
-                    let mut cfg = KubeConfigState::load();
-                    if let Some(c) = v.get("context").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                        cfg.context = c.to_owned();
-                    }
-                    if let Some(ns) = v.get("namespace").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                        cfg.namespace = ns.to_owned();
-                    }
-                    let yaml_text = v.get("yaml").and_then(Value::as_str).unwrap_or("");
-                    let out = apply_or_diff_manifest(&project, &cfg, yaml_text, "apply")?;
-                    if let Some(kind) = v.get("kind").and_then(Value::as_str)
-                        && let Some(ref mut snap) = self.snapshot
-                    {
-                        fetch_category_into_snapshot(&project, &cfg, snap, kind);
-                        self.post_snapshot(false);
-                    }
-                    return Ok(Some(out));
-                }
-                self.run_manifest_command("apply", ctx).map(Some)
-            }
-            "diff" => {
-                if let Some(raw) = arg.filter(|s| s.trim_start().starts_with('{'))
-                    && let Ok(v) = serde_json::from_str::<Value>(raw)
-                    && v.get("op").and_then(Value::as_str) == Some("live-yaml-diff")
-                {
-                    let _task = host::begin_task("Kubernetes: Diffing resource YAML", false);
-                    let project = resolve_project(ctx)?;
-                    let mut cfg = KubeConfigState::load();
-                    if let Some(c) = v.get("context").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                        cfg.context = c.to_owned();
-                    }
-                    if let Some(ns) = v.get("namespace").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                        cfg.namespace = ns.to_owned();
-                    }
-                    let yaml_text = v.get("yaml").and_then(Value::as_str).unwrap_or("");
-                    let out = apply_or_diff_manifest(&project, &cfg, yaml_text, "diff")?;
-                    return Ok(Some(out));
-                }
-                self.run_manifest_command("diff", ctx).map(Some)
-            }
+            "apply" => self.run_manifest_command("apply", ctx).map(Some),
+            "diff" => self.run_manifest_command("diff", ctx).map(Some),
             "delete-manifest" => self.run_manifest_command("delete", ctx).map(Some),
             "dry-run" => {
                 if let Some(editor) = ctx.editor() {
@@ -998,22 +1148,6 @@ impl Plugin for KubernetesPlugin {
                 self.run_manifest_command("dry-run", ctx).map(Some)
             }
             "inspect" => {
-                if let Some(raw) = arg.filter(|s| s.trim_start().starts_with('{'))
-                    && let Ok(v) = serde_json::from_str::<Value>(raw)
-                    && v.get("op").and_then(Value::as_str) == Some("live-yaml-get")
-                {
-                    let _task = host::begin_task("Kubernetes: Loading resource YAML", false);
-                    let project = resolve_project(ctx)?;
-                    let mut cfg = KubeConfigState::load();
-                    if let Some(c) = v.get("context").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                        cfg.context = c.to_owned();
-                    }
-                    let kind = v.get("kind").and_then(Value::as_str).unwrap_or("Pod");
-                    let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("");
-                    let name = v.get("name").and_then(Value::as_str).unwrap_or("");
-                    let yaml = inspect_cluster_resource(&project, &cfg, kind, ns, name, true)?;
-                    return Ok(Some(yaml));
-                }
                 let editor = ctx.editor().ok_or_else(|| Error::Invalid("focus a YAML file first".into()))?;
                 let path = editor.path();
                 let count = self.check_and_publish(&path, false)?;
@@ -1790,6 +1924,51 @@ spec:
             )
             .unwrap();
         assert!(host.view_messages().iter().any(|(v, m)| v == VIEW_ID && m.contains("Applied to cluster")));
+
+        // Content editor tab round-trip (`open-resource-yaml` -> `content-tab-action` reload/diff/save)
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"open-resource-yaml","key":"k8s-yaml:dev-local|production|Pod|web-api-7f8b9-abc","title":"Pod: web-api-7f8b9-abc.yaml","context":"dev-local","namespace":"production","kind":"Pod","name":"web-api-7f8b9-abc"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        assert!(host.view_messages().iter().any(|(v, m)| v == VIEW_ID && m.contains("resource-yaml-ready")));
+
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"content-tab-action","requestId":"ct-1","key":"k8s-yaml:dev-local|production|Pod|web-api-7f8b9-abc","action":"diff","content":"apiVersion: v1\nkind: Pod\nmetadata:\n  name: web-api-7f8b9-abc\n"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        assert!(
+            host.view_messages()
+                .iter()
+                .any(|(v, m)| v == VIEW_ID && m.contains(r#""op":"content-tab-reply""#) && m.contains(r#""requestId":"ct-1""#))
+        );
+
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"content-tab-action","requestId":"ct-2","key":"k8s-yaml:dev-local|production|Pod|web-api-7f8b9-abc","action":"save","content":"apiVersion: v1\nkind: Pod\nmetadata:\n  name: web-api-7f8b9-abc\n"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        assert!(
+            host.view_messages()
+                .iter()
+                .any(|(v, m)| v == VIEW_ID && m.contains(r#""requestId":"ct-2""#) && m.contains(r#""saved":true"#))
+        );
     }
 
     #[test]

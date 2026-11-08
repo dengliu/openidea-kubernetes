@@ -869,8 +869,30 @@ export function App() {
     window.openidea.onMessage((raw: string) => {
       try {
         const m = JSON.parse(raw);
-        if (m.op === "pty-data" || m.op === "pty-exit") {
+        if (m.op === "pty-data" || m.op === "pty-exit" || m.op === "pty-error") {
           dispatchPtyEvent(m);
+          return;
+        }
+        if (m.op === "log-error" || m.op === "content-tab-error") {
+          setBanner({ text: String(m.error || "Editor tab error"), isError: true });
+          return;
+        }
+        if (m.op === "resource-yaml-ready") {
+          setBanner(null);
+          sendToBackend({
+            op: "open-content-tab",
+            key: m.key,
+            title: m.title,
+            fileName: m.fileName || "resource.yaml",
+            language: "yaml",
+            content: typeof m.content === "string" ? m.content : "",
+            readOnly: false,
+            actions: [
+              { id: "reload", label: "Reload", icon: "rerun" },
+              { id: "diff", label: "Diff", icon: "diff" },
+              { id: "save", label: "Save & Apply", icon: "green-checkmark", primary: true, save: true },
+            ],
+          });
           return;
         }
         if (m.op === "state") {
@@ -1237,7 +1259,8 @@ export function App() {
     baseArgs.push("logs", "-f", "--tail=500", res.name);
     if (containerName) baseArgs.push("-c", containerName);
     const title = containerName ? `Logs: ${res.name} (${containerName})` : `Logs: ${res.name}`;
-    const key = `pluginLog:dengliu.kubernetes:${ctx}:${ns}:${res.name}:${containerName}`;
+    const rawKey = `k8s-log:${ctx}|${ns}|${res.name}|${containerName}`;
+    const key = rawKey.length <= 128 ? rawKey : rawKey.slice(0, 128);
     sendToBackend({
       op: "open-log-tab",
       key,
@@ -1256,9 +1279,11 @@ export function App() {
     const ns = res.namespace || "";
     const displayKind = res.kind.startsWith("CR:") ? res.controlled_by_kind || res.kind.slice(3) : res.kind;
     const title = `${displayKind}: ${res.name}.yaml`;
-    const key = `pluginResourceYaml:dengliu.kubernetes:${ctx}:${ns}:${res.kind}:${res.name}`;
+    const rawKey = `k8s-yaml:${ctx}|${ns}|${res.kind}|${res.name}`;
+    const key = rawKey.length <= 128 ? rawKey : rawKey.slice(0, 128);
+    setBanner({ text: `Loading ${displayKind}/${res.name} YAML…`, isError: false });
     sendToBackend({
-      op: "open-yaml-tab",
+      op: "open-resource-yaml",
       key,
       title,
       context: ctx,
@@ -2774,28 +2799,7 @@ export function App() {
                     title="Open live streaming Pod logs (kubectl logs -f) in a regular Editor tab"
                     onClick={() => {
                       const container = logContainer || selectedResource.containers?.[0] || "";
-                      const ns = selectedResource.namespace || snapshot.current_namespace || "default";
-                      const ctx = snapshot.current_context;
-                      const baseArgs: string[] = [];
-                      if (ctx) baseArgs.push(`--context=${ctx}`);
-                      if (ns) baseArgs.push("-n", ns);
-                      baseArgs.push("logs", "-f", "--tail=500", selectedResource.name);
-                      if (container) baseArgs.push("-c", container);
-                      const title = container
-                        ? `Logs: ${selectedResource.name} (${container})`
-                        : `Logs: ${selectedResource.name}`;
-                      const key = `pluginLog:dengliu.kubernetes:${ctx}:${ns}:${selectedResource.name}:${container}`;
-                      sendToBackend({
-                        op: "open-log-tab",
-                        key,
-                        title,
-                        program: "kubectl",
-                        baseArgs,
-                        toggles: [
-                          { id: "timestamps", label: "Timestamps", args: ["--timestamps=true"] },
-                          { id: "previous", label: "Previous", args: ["--previous"] },
-                        ],
-                      });
+                      openPodLogsInEditorTab(selectedResource, container);
                     }}
                   >
                     Follow in Editor Tab

@@ -11,9 +11,18 @@ export interface PodTerminalProps {
   kind?: "Pod" | "Node";
 }
 
-const ptyListeners = new Map<string, (msg: { op: string; data?: string; exitCode?: number | null }) => void>();
+export interface PtyEventMessage {
+  op: string;
+  sessionId?: string;
+  data?: string;
+  sequence?: number;
+  exitCode?: number | null;
+  error?: string;
+}
 
-export function dispatchPtyEvent(msg: { op: string; sessionId?: string; data?: string; exitCode?: number | null }) {
+const ptyListeners = new Map<string, (msg: PtyEventMessage) => void>();
+
+export function dispatchPtyEvent(msg: PtyEventMessage) {
   if (!msg.sessionId) return;
   ptyListeners.get(msg.sessionId)?.(msg);
 }
@@ -100,21 +109,24 @@ export function PodTerminal({ context, namespace, pod, container, kind = "Pod" }
       );
     }
 
+    let exited = false;
     ptyListeners.set(sessionId, (msg) => {
       if (msg.op === "pty-data" && typeof msg.data === "string") {
-        term.write(msg.data);
+        const seq = msg.sequence;
+        term.write(msg.data, () => {
+          if (typeof seq === "number") {
+            sendPtyMessage({ op: "pty-ack", sessionId, sequence: seq });
+          }
+        });
+      } else if (msg.op === "pty-error" && typeof msg.error === "string") {
+        exited = true;
+        term.writeln(`\r\n\x1b[31m[PTY error: ${msg.error}]\x1b[0m`);
       } else if (msg.op === "pty-exit") {
+        exited = true;
         term.writeln(
           `\r\n\x1b[33m[Session ended${typeof msg.exitCode === "number" ? ` (exit code ${msg.exitCode})` : ""} — press Enter to reconnect]\x1b[0m`,
         );
       }
-    });
-
-    let exited = false;
-    const origListener = ptyListeners.get(sessionId)!;
-    ptyListeners.set(sessionId, (msg) => {
-      if (msg.op === "pty-exit") exited = true;
-      origListener(msg);
     });
 
     const spawnPty = () => {

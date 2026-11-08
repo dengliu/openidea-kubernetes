@@ -1,13 +1,13 @@
 id = "dengliu.kubernetes"
 name = "Kubernetes"
-version = "0.1.0"
+version = "0.2.0"
 description = "Manage Kubernetes clusters, Helm releases and Kustomize overlays: cluster explorer with live Pod logs, shell and port-forward, YAML completion, cross-resource navigation, gutter markers and manifest inspections."
 authors = ["Deng Liu"]
 homepage = "https://github.com/dengliu/openidea-kubernetes"
 license = "Apache-2.0"
-change-notes = "0.1.0 — first release: Kubernetes cluster explorer (contexts, namespaces, workloads, network, config & storage, events, Helm releases, workspace manifests), kubectl actions (apply, diff, delete, describe, logs, exec, port-forward, scale, rollout restart), YAML completion & live templates, cross-resource Go to Definition & gutter markers, manifest inspections & quick fixes, status bar context switcher, file icons and templates."
+change-notes = "0.2.0 — adopt OpenIDEA plugin API 1.3: header = \"none\" full-bleed tool-window header with corner inset, PTY flow-control acknowledgements (pty-ack), and generic content editor tabs (open-content-tab / content-tab-action) with Reload, native Diff viewer, and Save & Apply."
 categories = ["tools", "frameworks"]
-engines.openidea = "^1.2"
+engines.openidea = "^1.3"
 wasm = "dist/plugin.wasm"
 activation = [
     "on-view:kubernetes",
@@ -35,6 +35,7 @@ title = "Kubernetes"
 icon = "icons/kubernetes.svg"
 location = "bottom"
 web = "web/index.html"
+header = "none"
 
 [[contributes.statusBar]]
 id = "context"
