@@ -1253,11 +1253,11 @@ export function App() {
   function openPodLogsInEditorTab(res: ClusterResource, containerName: string) {
     const ns = res.namespace || snapshot.current_namespace || "default";
     const ctx = snapshot.current_context;
-    const baseArgs: string[] = [];
-    if (ctx) baseArgs.push(`--context=${ctx}`);
-    if (ns) baseArgs.push("-n", ns);
-    baseArgs.push("logs", "-f", "--tail=500", res.name);
-    if (containerName) baseArgs.push("-c", containerName);
+    const args: string[] = [];
+    if (ctx) args.push(`--context=${ctx}`);
+    if (ns) args.push("-n", ns);
+    args.push("logs", "-f", "--tail=500", res.name);
+    if (containerName) args.push("-c", containerName);
     const title = containerName ? `Logs: ${res.name} (${containerName})` : `Logs: ${res.name}`;
     const rawKey = `k8s-log:${ctx}|${ns}|${res.name}|${containerName}`;
     const key = rawKey.length <= 128 ? rawKey : rawKey.slice(0, 128);
@@ -1266,7 +1266,7 @@ export function App() {
       key,
       title,
       program: "kubectl",
-      baseArgs,
+      args,
       toggles: [
         { id: "timestamps", label: "Timestamps", args: ["--timestamps=true"] },
         { id: "previous", label: "Previous", args: ["--previous"] },
