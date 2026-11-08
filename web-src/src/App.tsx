@@ -895,6 +895,8 @@ export function App() {
   const [nsMenuOpen, setNsMenuOpen] = useState<boolean>(false);
   const [nsSearch, setNsSearch] = useState<string>("");
   const [debuggerImage, setDebuggerImage] = useState<string>("dengliu/k8sdebugger:3cfd912");
+  const [customHotbar, setCustomHotbar] = useState<string[] | null>(null);
+  const [hotbarContextMenu, setHotbarContextMenu] = useState<{ name: string; x: number; y: number } | null>(null);
   const [, setAgeTick] = useState<number>(0);
 
   const loadedLazyRef = useRef<Record<string, boolean>>({});
@@ -954,6 +956,9 @@ export function App() {
         if (m.op === "state") {
           if (typeof m.debuggerImage === "string" && m.debuggerImage.trim()) {
             setDebuggerImage(m.debuggerImage.trim());
+          }
+          if (Array.isArray(m.hotbarItems)) {
+            setCustomHotbar((prev) => (prev === null ? m.hotbarItems : prev));
           }
           setSnapshot((prev) => {
             const next: ClusterSnapshot = m.snapshot || prev;
@@ -1033,13 +1038,47 @@ export function App() {
     }));
   }, [snapshot.cluster_catalog, snapshot.contexts]);
 
-  const hotbarItems: ClusterContextInfo[] = useMemo(() => {
+  const defaultHotbarNames: string[] = useMemo(() => {
     const pinned = catalogList
       .filter((c) => c.hotbar_pinned)
       .slice()
       .sort((a, b) => (a.hotbar_order ?? 999) - (b.hotbar_order ?? 999));
-    return pinned.length > 0 ? pinned : catalogList.slice(0, 6);
+    return (pinned.length > 0 ? pinned : catalogList.slice(0, 6)).map((c) => c.name);
   }, [catalogList]);
+
+  const activeHotbarNames: string[] = useMemo(() => {
+    return customHotbar !== null ? customHotbar : defaultHotbarNames;
+  }, [customHotbar, defaultHotbarNames]);
+
+  const hotbarItems: ClusterContextInfo[] = useMemo(() => {
+    const byName = new Map(catalogList.map((c) => [c.name, c]));
+    return activeHotbarNames
+      .map((name) => byName.get(name))
+      .filter((c): c is ClusterContextInfo => Boolean(c));
+  }, [catalogList, activeHotbarNames]);
+
+  function updateHotbarNames(nextNames: string[]) {
+    const deduped = Array.from(new Set(nextNames));
+    setCustomHotbar(deduped);
+    sendToBackend({ op: "set-hotbar", items: deduped });
+  }
+
+  function addClusterToHotbar(name: string) {
+    if (activeHotbarNames.includes(name)) return;
+    updateHotbarNames([...activeHotbarNames, name]);
+  }
+
+  function removeClusterFromHotbar(name: string) {
+    updateHotbarNames(activeHotbarNames.filter((n) => n !== name));
+  }
+
+  function toggleClusterOnHotbar(name: string) {
+    if (activeHotbarNames.includes(name)) {
+      removeClusterFromHotbar(name);
+    } else {
+      addClusterToHotbar(name);
+    }
+  }
 
   const activeClusterInfo = useMemo(() => {
     return (
@@ -1793,6 +1832,7 @@ export function App() {
         setColMenuOpen(false);
         setClusterMenuOpen(false);
         setNsMenuOpen(false);
+        setHotbarContextMenu(null);
       }}
     >
       {/* Far-left Freelens Hotbar rail */}
@@ -1812,14 +1852,61 @@ export function App() {
               key={c.name}
               className={`fl-hb-item ${isCur ? "active" : ""}`}
               style={{ background: avatarColor(c.name) }}
-              title={`${c.name} (${c.namespace || "default"})`}
+              title={`${c.name} (${c.namespace || "default"}) — Right-click for options`}
               onClick={() => handleSwitchContext(c.name, activeKind === "ClusterCatalog" ? "Pod" : activeKind)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setHotbarContextMenu({
+                  name: c.name,
+                  x: e.clientX,
+                  y: e.clientY,
+                });
+              }}
             >
-              {shortBadge(c)}
+              {isCur && <span className="fl-hb-online-dot" />}
+              <span>{shortBadge(c)}</span>
+              <span className="fl-hb-k8s-wheel" aria-hidden="true">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="m22.1 14.3c-.1 0-.1 0 0 0-.1 0-.1 0-.2 0s-.3 0-.4 0-.1 0-.2 0c-.4 0-.8-.1-1.1-.2-.1-.1-.2-.1-.2-.2l-.3-.1c.1-.9.1-1.9-.1-2.8-.3-1.1-.6-2-1.2-2.8l.2-.2c0-.1 0-.2.1-.3.3-.3.6-.4.9-.7.1 0 .1-.1.2-.1.1-.1.2-.1.3-.2 0 0 .1 0 .1-.1.3-.2.3-.6.1-.9-.1-.1-.3-.2-.5-.2s-.3.1-.4.2-.1.1-.1.1c-.1.1-.2.2-.3.3 0 0-.1.1-.1.1-.3.3-.5.5-.8.7 0 .1 0 .1-.1.1h-.1l-.2.2c-.3-.3-.5-.5-.8-.8-1.2-.9-2.7-1.5-4.2-1.7v-.3c-.1-.1-.1-.1-.2-.3 0-.3 0-.7.1-1.1 0-.1 0-.1 0-.2s0-.2.1-.4v-.1c0-.4-.3-.7-.6-.7-.2 0-.3.1-.4.2s-.2.3-.2.5v.1c0 .1 0 .3.1.4v.2c0 .4.1.8.1 1.1 0 .1-.1.2-.2.3v.3c-.4 0-.7.1-1.1.2-1.8.3-3.1 1.1-4.2 2.2l-.2-.2h-.1c-.1 0-.1 0-.2-.1-.3-.1-.6-.3-.8-.6s-.1-.1-.1-.1c-.2-.2-.2-.3-.3-.4 0 0-.1 0-.1-.1-.2-.1-.4-.1-.5-.1-.2 0-.4.1-.5.2-.2.2-.1.6.2.9s.1.1.1.1c.1.1.2.1.3.2.1 0 .1.1.2.1.4.2.7.4.9.6.1.1.1.2.1.3l.2.2c0 .1-.1.1-.1.2-1 1.6-1.4 3.5-1.1 5.3l-.3.1c0 .1-.1.2-.2.2-.3.1-.7.2-1.1.2-.1 0-.1 0-.2 0s-.2 0-.4 0h-.1s0 0-.1 0c-.4.1-.6.4-.5.7s.3.5.6.5h.2.1c.1 0 .2-.1.4-.1.1 0 .1-.1.2-.1.4-.1.7-.3 1-.3.1 0 .2.1.3.1h.3c.5 1.5 1.4 2.8 2.6 3.8.3.2.6.4.9.6l-.1.3c0 .1.1.2 0 .3-.1.3-.3.6-.5.9 0 .1-.1.1-.1.2-.1.1-.1.2-.2.3 0 0 0 .1-.1.1-.2.3 0 .7.3.9.1 0 .2.1.2.1.2 0 .5-.2.6-.4s0-.1.1-.1c.1-.1.1-.2.1-.4 0-.1 0-.1.1-.2.1-.4.2-.7.4-1 .2-.1.3-.1.3-.2l.1-.3c.9.3 1.8.5 2.8.5.6 0 1.2-.1 1.7-.2.4-.1.7-.2 1-.3l.1.2c.1 0 .2.1.3.2.2.3.3.6.4 1 0 .1 0 .1.1.2 0 .1.1.2.1.4 0 0 0 .1.1.1.1.2.4.4.6.4.1 0 .2 0 .2-.1.1-.1.3-.2.3-.4s0-.3 0-.5 0-.1-.1-.1c-.1-.1-.1-.2-.2-.3 0-.1-.1-.1-.1-.2-.2-.3-.4-.6-.5-.9 0-.1 0-.2 0-.3l.1-.2c1.1-.6 2-1.5 2.6-2.6.4-.6.6-1.2.8-1.8h.2c.1 0 .1-.1.3-.1.3 0 .7.2 1 .3.1 0 .1.1.2.1.1.1.2.1.4.1h.1.1.2c.3 0 .6-.2.6-.5.1-.1-.1-.4-.4-.5zm-9.3-1-.9.4-.9-.4-.2-.9.6-.8h1l.6.8zm5.2-2.1c.2.7.2 1.4.1 2l-3.1-.9c-.3-.1-.4-.4-.4-.6 0-.1.1-.2.1-.2l2.4-2.2c.5.6.7 1.2.9 1.9zm-1.7-3.1-2.6 1.9c-.2.1-.5.1-.7-.1-.1-.1-.1-.1-.1-.2l-.2-3.3c1.4.1 2.6.7 3.6 1.7zm-5.8-1.7c.2 0 .4-.1.6-.1l-.2 3.2c0 .3-.2.5-.5.5-.1 0-.2 0-.2-.1l-2.7-1.8c.8-.8 1.8-1.4 3-1.7zm-4 2.9 2.4 2.1c.2.2.2.5.1.7-.1.1-.1.1-.2.2l-3.1.9c-.2-1.3.1-2.7.8-3.9zm-.5 5.4 3.2-.5c.3 0 .5.2.6.4v.3l-1.2 2.9c-1.2-.6-2.1-1.8-2.6-3.1zm7.3 4c-.5.1-.9.2-1.4.2-.7 0-1.4-.1-2-.3l1.6-2.9c.2-.2.4-.3.6-.1.1.1.2.1.2.2l1.5 2.8c-.1 0-.3.1-.5.1zm3.9-2.8c-.5.8-1.2 1.4-1.9 1.9l-1.3-3c-.1-.2 0-.5.3-.6.1 0 .2-.1.3-.1l3.2.5c-.1.5-.3.9-.6 1.3z" />
+                </svg>
+              </span>
             </div>
           );
         })}
       </div>
+
+      {hotbarContextMenu && (
+        <div
+          className="fl-hb-context-menu"
+          style={{
+            top: Math.min(window.innerHeight - 130, Math.max(8, hotbarContextMenu.y)),
+            left: Math.max(54, hotbarContextMenu.x),
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div
+            className="fl-hb-context-item"
+            onClick={() => {
+              removeClusterFromHotbar(hotbarContextMenu.name);
+              setHotbarContextMenu(null);
+            }}
+          >
+            Remove from Hotbar
+          </div>
+          {hotbarContextMenu.name === snapshot.current_context && (
+            <div
+              className="fl-hb-context-item"
+              onClick={() => {
+                setHotbarContextMenu(null);
+                handleSelectKind("ClusterCatalog");
+              }}
+            >
+              Disconnect
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Left Collapsible Sidebar */}
       <div className="fl-sidebar" style={{ width: sidebarWidth }}>
@@ -2164,29 +2251,52 @@ export function App() {
                   )
                   .map((c) => {
                     const isCur = c.name === snapshot.current_context;
+                    const isPinned = activeHotbarNames.includes(c.name);
                     return (
                       <tr
                         key={c.name}
-                        className={isCur ? "selected" : ""}
+                        className={`fl-catalog-row ${isCur ? "selected" : ""}`}
                         onClick={() => handleSwitchContext(c.name, "Pod")}
                       >
                         {visibleCols.map((col) => {
                           if (col.id === "name") {
                             return (
                               <td key={col.id}>
-                                <span
-                                  className="fl-cluster-badge"
-                                  style={{
-                                    width: 22,
-                                    height: 22,
-                                    fontSize: 9,
-                                    marginRight: 8,
-                                    background: avatarColor(c.name),
-                                  }}
-                                >
-                                  {shortBadge(c)}
-                                </span>
-                                <strong>{c.name}</strong>
+                                <div className="fl-catalog-name-cell">
+                                  <span
+                                    className="fl-cluster-badge"
+                                    style={{
+                                      width: 24,
+                                      height: 24,
+                                      fontSize: 9.5,
+                                      background: avatarColor(c.name),
+                                    }}
+                                  >
+                                    {shortBadge(c)}
+                                  </span>
+                                  <strong className="fl-catalog-name-text">{c.name}</strong>
+                                  <button
+                                    type="button"
+                                    className={`fl-catalog-pin-btn ${isPinned ? "pinned" : ""}`}
+                                    title={isPinned ? "Remove from Hotbar" : "Add to Hotbar"}
+                                    aria-label={isPinned ? "Remove from Hotbar" : "Add to Hotbar"}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      toggleClusterOnHotbar(c.name);
+                                    }}
+                                  >
+                                    <svg
+                                      width="14"
+                                      height="14"
+                                      viewBox="0 0 24 24"
+                                      fill="currentColor"
+                                      style={{ transform: "rotate(45deg)" }}
+                                      aria-hidden="true"
+                                    >
+                                      <path d="M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z" />
+                                    </svg>
+                                  </button>
+                                </div>
                               </td>
                             );
                           }

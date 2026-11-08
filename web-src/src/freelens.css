@@ -48,34 +48,36 @@ body,
 
 /* Far-left Hotbar rail */
 .fl-hotbar {
-  width: 50px;
+  --fl-hotbar-bg: color-mix(in srgb, var(--fl-bg-sidebar) 90%, #000 10%);
+  width: 54px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 10px 0;
-  gap: 8px;
-  background: color-mix(in srgb, var(--fl-bg-sidebar) 90%, #000 10%);
+  padding: 12px 0;
+  gap: 12px;
+  background: var(--fl-hotbar-bg);
   border-right: 1px solid var(--fl-border);
   overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .fl-hb-item {
-  width: 36px;
-  height: 36px;
+  width: 38px;
+  height: 38px;
   border-radius: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-weight: 700;
-  font-size: 11px;
+  font-weight: 600;
+  font-size: 11.5px;
+  letter-spacing: 0.2px;
   color: #fff;
   cursor: pointer;
   position: relative;
-  border: 2px solid transparent;
   transition:
     transform 0.1s ease,
-    border-color 0.12s ease;
+    box-shadow 0.12s ease;
   flex-shrink: 0;
 }
 
@@ -84,8 +86,100 @@ body,
 }
 
 .fl-hb-item.active {
-  border-color: var(--fl-teal);
-  box-shadow: 0 0 0 2px var(--fl-teal-tint);
+  box-shadow:
+    0 0 0 2.5px var(--fl-hotbar-bg),
+    0 0 0 5px var(--fl-fg);
+}
+
+.fl-hb-online-dot {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #00b8a9;
+  border: 1.5px solid #ffffff;
+  box-shadow: 0 0 5px rgba(255, 255, 255, 0.95);
+  pointer-events: none;
+}
+
+.fl-hb-k8s-wheel {
+  position: absolute;
+  bottom: -4px;
+  right: -5px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: var(--fl-hotbar-bg);
+  color: var(--fl-fg);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.fl-hb-context-menu {
+  position: fixed;
+  min-width: 176px;
+  background: var(--fl-bg);
+  color: var(--fl-fg);
+  border: 1px solid var(--fl-border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+  padding: 5px;
+  z-index: 600;
+}
+
+.fl-hb-context-item {
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.fl-hb-context-item:hover {
+  background: var(--fl-teal);
+  color: #ffffff;
+}
+
+.fl-catalog-name-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fl-catalog-pin-btn {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 5px;
+  background: var(--fl-chip-bg);
+  color: var(--fl-fg);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition:
+    opacity 0.12s ease,
+    background 0.12s ease,
+    color 0.12s ease;
+}
+
+.fl-catalog-row:hover .fl-catalog-pin-btn,
+.fl-catalog-pin-btn.pinned {
+  opacity: 1;
+}
+
+.fl-catalog-pin-btn.pinned {
+  color: var(--fl-teal);
+}
+
+.fl-catalog-pin-btn:hover {
+  background: var(--fl-teal);
+  color: #ffffff;
 }
 
 /* Left collapsible category sidebar */

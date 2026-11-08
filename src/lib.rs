@@ -201,6 +201,11 @@ impl KubernetesPlugin {
         snap
     }
 
+    fn stored_hotbar_items() -> Option<Vec<String>> {
+        let raw = storage::get("hotbarItems").ok().flatten()?;
+        serde_json::from_str::<Vec<String>>(&raw).ok()
+    }
+
     fn state_payload(&mut self, ctx: &Invocation) -> Value {
         let project = resolve_project(ctx).ok();
         let root = project.as_ref().and_then(|p| p.root().ok()).unwrap_or_default();
@@ -217,6 +222,7 @@ impl KubernetesPlugin {
             "snapshot": self.snapshot.clone().unwrap_or_default(),
             "workspace": ws,
             "debuggerImage": cfg.debugger_image,
+            "hotbarItems": Self::stored_hotbar_items(),
         })
     }
 
@@ -234,6 +240,7 @@ impl KubernetesPlugin {
             "snapshot": self.snapshot.clone().unwrap_or_default(),
             "needsBackgroundSync": needs_bg_sync,
             "debuggerImage": cfg.debugger_image,
+            "hotbarItems": Self::stored_hotbar_items(),
         });
         let _ = host::post_view_message(VIEW_ID, &payload.to_string());
         self.update_status_bar(&cfg);
@@ -338,6 +345,7 @@ impl KubernetesPlugin {
                     "workspace": ws,
                     "needsClusterFetch": false,
                     "debuggerImage": cfg.debugger_image,
+                    "hotbarItems": Self::stored_hotbar_items(),
                 });
                 let _ = host::post_view_message(VIEW_ID, &payload.to_string());
                 if needs_fetch
@@ -371,6 +379,14 @@ impl KubernetesPlugin {
                     self.index.built_at = None;
                     self.refresh_cluster(&project);
                     self.post_state(ctx);
+                }
+            }
+            "set-hotbar" => {
+                if let Some(items) = v.get("items").and_then(Value::as_array) {
+                    let names: Vec<String> = items.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+                    if let Ok(serialized) = serde_json::to_string(&names) {
+                        let _ = storage::set("hotbarItems", &serialized);
+                    }
                 }
             }
             "set-context" => {
