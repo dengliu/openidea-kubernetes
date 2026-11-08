@@ -883,6 +883,13 @@ export function App() {
   const [logPrevious, setLogPrevious] = useState<boolean>(false);
   const [logContainerMenuOpen, setLogContainerMenuOpen] = useState<boolean>(false);
   const [shellContainerMenuOpen, setShellContainerMenuOpen] = useState<boolean>(false);
+  const [rowActionMenu, setRowActionMenu] = useState<{
+    res: ClusterResource;
+    x: number;
+    y: number;
+    openUpward: boolean;
+    submenu: "shell" | "logs" | null;
+  } | null>(null);
   const [pfModal, setPfModal] = useState<{
     kind: string;
     namespace: string;
@@ -2076,6 +2083,7 @@ export function App() {
         setClusterMenuOpen(false);
         setNsMenuOpen(false);
         setHotbarContextMenu(null);
+        setRowActionMenu(null);
         if (!drawerResizeJustEndedRef.current) {
           setDrawerOpen(false);
         }
@@ -2726,6 +2734,7 @@ export function App() {
                           setClusterMenuOpen(false);
                           setNsMenuOpen(false);
                           setHotbarContextMenu(null);
+                          setRowActionMenu(null);
                           if (isSel) {
                             setDrawerOpen(false);
                           } else {
@@ -2748,17 +2757,56 @@ export function App() {
                             {renderPodCell(res, col.id)}
                           </td>
                         ))}
-                        <td style={{ textAlign: "right", paddingRight: 14 }} onClick={(e) => e.stopPropagation()}>
+                        <td
+                          style={{ textAlign: "right", paddingRight: 10, whiteSpace: "nowrap" }}
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {res.kind === "Pod" && (
+                            <button
+                              type="button"
+                              className="fl-row-icon-btn"
+                              title="Pod Logs"
+                              aria-label="Pod Logs"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setRowActionMenu(null);
+                                const items = getPodContainerItems(res, null, true);
+                                openPodLogsInEditorTab(res, items[0]?.name || "");
+                              }}
+                            >
+                              <svg width="16" height="16" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                                <rect x="2.5" y="4" width="15" height="2.2" rx="0.8" fill="currentColor" />
+                                <rect x="2.5" y="7.8" width="15" height="2.2" rx="0.8" fill="currentColor" />
+                                <rect x="2.5" y="11.6" width="15" height="2.2" rx="0.8" fill="currentColor" />
+                                <rect x="2.5" y="15.4" width="10" height="2.2" rx="0.8" fill="currentColor" />
+                              </svg>
+                            </button>
+                          )}
                           <button
-                            style={{
-                              border: "none",
-                              background: "transparent",
-                              color: "var(--fl-fg-muted)",
-                              cursor: "pointer",
-                              fontSize: 15,
+                            type="button"
+                            className="fl-row-icon-btn"
+                            title="Resource Actions"
+                            aria-label="Resource Actions"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const r = e.currentTarget.getBoundingClientRect();
+                              const estHeight = res.kind === "Pod" ? 215 : 150;
+                              const openUpward = r.bottom + estHeight > window.innerHeight - 16;
+                              setRowActionMenu((prev) =>
+                                prev &&
+                                prev.res.kind === res.kind &&
+                                prev.res.namespace === res.namespace &&
+                                prev.res.name === res.name
+                                  ? null
+                                  : {
+                                      res,
+                                      x: Math.max(12, Math.min(window.innerWidth - 188, r.right - 176)),
+                                      y: openUpward ? r.top - 6 : r.bottom + 4,
+                                      openUpward,
+                                      submenu: null,
+                                    },
+                              );
                             }}
-                            title="Edit Live YAML"
-                            onClick={() => openResourceDrawer(res, "yaml")}
                           >
                             ⋮
                           </button>
@@ -2867,6 +2915,330 @@ export function App() {
                 </button>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* Floating Row Three-Dots Action Menu (Freelens style: Shell >, Logs >, Edit, Delete, Force Delete) */}
+        {rowActionMenu && (
+          <div
+            className={`fl-row-action-menu ${rowActionMenu.openUpward ? "upward" : ""}`}
+            style={{
+              left: rowActionMenu.x,
+              top: rowActionMenu.openUpward ? undefined : rowActionMenu.y,
+              bottom: rowActionMenu.openUpward ? window.innerHeight - rowActionMenu.y : undefined,
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {rowActionMenu.res.kind === "Pod" && (
+              <>
+                <div
+                  className="fl-row-action-item"
+                  onMouseEnter={() => setRowActionMenu((m) => (m ? { ...m, submenu: "shell" } : null))}
+                  onClick={() => {
+                    const items = getPodContainerItems(rowActionMenu.res, null, false);
+                    const target = rowActionMenu.res;
+                    setRowActionMenu(null);
+                    openPodShellInTerminalTab(target, items[0]?.name || "");
+                  }}
+                >
+                  <svg className="fl-row-action-icon" width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                    <path
+                      fillRule="evenodd"
+                      clipRule="evenodd"
+                      d="M2.5 4.5A2 2 0 0 1 4.5 2.5h11a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2v-11zm3.07 2.27a.85.85 0 0 1 1.2-.04l3.2 2.9a.85.85 0 0 1 0 1.26l-3.2 2.9a.85.85 0 1 1-1.14-1.26L8.14 10.26 5.63 7.97a.85.85 0 0 1-.06-1.2zm4.68 5.48a.85.85 0 0 0 0 1.7h4a.85.85 0 0 0 0-1.7h-4z"
+                      fill="currentColor"
+                    />
+                  </svg>
+                  <span className="fl-row-action-label">Shell</span>
+                  <svg className="fl-row-action-chevron" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M6 3.5L10.5 8L6 12.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  {rowActionMenu.submenu === "shell" && (
+                    <div className="fl-row-action-submenu" onClick={(e) => e.stopPropagation()}>
+                      {getPodContainerItems(rowActionMenu.res, null, false).map((c) => (
+                        <div
+                          key={c.name}
+                          className="fl-container-menu-item"
+                          onClick={() => {
+                            const target = rowActionMenu.res;
+                            setRowActionMenu(null);
+                            openPodShellInTerminalTab(target, c.name);
+                          }}
+                        >
+                          <span className={`fl-csq ${c.cls}`} />
+                          <span style={{ flex: 1 }}>{c.name}</span>
+                          {c.tag && (
+                            <span style={{ fontSize: 10.5, color: "var(--fl-fg-muted)", marginLeft: 6 }}>
+                              {c.tag}
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                      <div style={{ borderTop: "1px solid var(--fl-border)", margin: "4px 0" }} />
+                      <div
+                        className="fl-container-menu-item"
+                        title="Attach an ephemeral busybox:latest debug container"
+                        onClick={() => {
+                          const target = rowActionMenu.res;
+                          const items = getPodContainerItems(target, null, false);
+                          setRowActionMenu(null);
+                          openPodShellInTerminalTab(target, items[0]?.name || "", "busybox:latest");
+                        }}
+                      >
+                        <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
+                        <span>Debug Shell (busybox:latest)</span>
+                      </div>
+                      <div
+                        className="fl-container-menu-item"
+                        title={`Attach an ephemeral ${debuggerImage} debug container`}
+                        onClick={() => {
+                          const target = rowActionMenu.res;
+                          const items = getPodContainerItems(target, null, false);
+                          setRowActionMenu(null);
+                          openPodShellInTerminalTab(target, items[0]?.name || "", "custom");
+                        }}
+                      >
+                        <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
+                        <span>{`Debug Shell (${debuggerImage})`}</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div
+                  className="fl-row-action-item"
+                  onMouseEnter={() => setRowActionMenu((m) => (m ? { ...m, submenu: "logs" } : null))}
+                  onClick={() => {
+                    const target = rowActionMenu.res;
+                    const items = getPodContainerItems(target, null, true);
+                    setRowActionMenu(null);
+                    openPodLogsInEditorTab(target, items[0]?.name || "");
+                  }}
+                >
+                  <svg className="fl-row-action-icon" width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                    <rect x="2.5" y="4" width="15" height="2.2" rx="0.8" fill="currentColor" />
+                    <rect x="2.5" y="7.8" width="15" height="2.2" rx="0.8" fill="currentColor" />
+                    <rect x="2.5" y="11.6" width="15" height="2.2" rx="0.8" fill="currentColor" />
+                    <rect x="2.5" y="15.4" width="10" height="2.2" rx="0.8" fill="currentColor" />
+                  </svg>
+                  <span className="fl-row-action-label">Logs</span>
+                  <svg className="fl-row-action-chevron" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M6 3.5L10.5 8L6 12.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  {rowActionMenu.submenu === "logs" && (
+                    <div className="fl-row-action-submenu" onClick={(e) => e.stopPropagation()}>
+                      {getPodContainerItems(rowActionMenu.res, null, true).map((c) => (
+                        <div
+                          key={c.name}
+                          className="fl-container-menu-item"
+                          onClick={() => {
+                            const target = rowActionMenu.res;
+                            setRowActionMenu(null);
+                            openPodLogsInEditorTab(target, c.name);
+                          }}
+                        >
+                          <span className={`fl-csq ${c.cls}`} />
+                          <span style={{ flex: 1 }}>{c.name}</span>
+                          {c.tag && (
+                            <span style={{ fontSize: 10.5, color: "var(--fl-fg-muted)", marginLeft: 6 }}>
+                              {c.tag}
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+
+            {rowActionMenu.res.kind === "Node" && (
+              <div
+                className="fl-row-action-item"
+                onMouseEnter={() => setRowActionMenu((m) => (m ? { ...m, submenu: "shell" } : null))}
+                onClick={() => {
+                  const target = rowActionMenu.res;
+                  setRowActionMenu(null);
+                  openNodeShellInTerminalTab(target, "host");
+                }}
+              >
+                <svg className="fl-row-action-icon" width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                  <path
+                    fillRule="evenodd"
+                    clipRule="evenodd"
+                    d="M2.5 4.5A2 2 0 0 1 4.5 2.5h11a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2v-11zm3.07 2.27a.85.85 0 0 1 1.2-.04l3.2 2.9a.85.85 0 0 1 0 1.26l-3.2 2.9a.85.85 0 1 1-1.14-1.26L8.14 10.26 5.63 7.97a.85.85 0 0 1-.06-1.2zm4.68 5.48a.85.85 0 0 0 0 1.7h4a.85.85 0 0 0 0-1.7h-4z"
+                    fill="currentColor"
+                  />
+                </svg>
+                <span className="fl-row-action-label">Shell</span>
+                <svg className="fl-row-action-chevron" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M6 3.5L10.5 8L6 12.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                {rowActionMenu.submenu === "shell" && (
+                  <div className="fl-row-action-submenu" onClick={(e) => e.stopPropagation()}>
+                    <div
+                      className="fl-container-menu-item"
+                      onClick={() => {
+                        const target = rowActionMenu.res;
+                        setRowActionMenu(null);
+                        openNodeShellInTerminalTab(target, "host");
+                      }}
+                    >
+                      <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
+                      <span>Node Host Shell (nsenter /host)</span>
+                    </div>
+                    <div style={{ borderTop: "1px solid var(--fl-border)", margin: "4px 0" }} />
+                    <div
+                      className="fl-container-menu-item"
+                      onClick={() => {
+                        const target = rowActionMenu.res;
+                        setRowActionMenu(null);
+                        openNodeShellInTerminalTab(target, "busybox");
+                      }}
+                    >
+                      <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
+                      <span>Debug Shell (busybox:latest)</span>
+                    </div>
+                    <div
+                      className="fl-container-menu-item"
+                      onClick={() => {
+                        const target = rowActionMenu.res;
+                        setRowActionMenu(null);
+                        openNodeShellInTerminalTab(target, "custom");
+                      }}
+                    >
+                      <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
+                      <span>{`Debug Shell (${debuggerImage})`}</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {["Deployment", "StatefulSet", "DaemonSet"].includes(rowActionMenu.res.kind) && (
+              <div
+                className="fl-row-action-item"
+                onMouseEnter={() => setRowActionMenu((m) => (m ? { ...m, submenu: null } : null))}
+                onClick={() => {
+                  const target = rowActionMenu.res;
+                  setRowActionMenu(null);
+                  sendToBackend({
+                    op: "restart",
+                    kind: target.kind,
+                    namespace: target.namespace,
+                    name: target.name,
+                  });
+                }}
+              >
+                <svg className="fl-row-action-icon" width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                  <path
+                    d="M15.5 10a5.5 5.5 0 1 1-1.6-3.9L15.5 7.7M15.5 4.2v3.5H12"
+                    stroke="currentColor"
+                    strokeWidth="1.9"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+                <span className="fl-row-action-label">Restart</span>
+              </div>
+            )}
+
+            <div
+              className="fl-row-action-item"
+              onMouseEnter={() => setRowActionMenu((m) => (m ? { ...m, submenu: null } : null))}
+              onClick={() => {
+                const target = rowActionMenu.res;
+                setRowActionMenu(null);
+                openResourceYamlInEditorTab(target);
+              }}
+            >
+              <svg className="fl-row-action-icon" width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                <path
+                  d="M3 14.25V17h2.75L13.86 8.89l-2.75-2.75L3 14.25zM16.71 6.04a.75.75 0 0 0 0-1.06l-1.69-1.69a.75.75 0 0 0-1.06 0l-1.32 1.32 2.75 2.75 1.32-1.32z"
+                  fill="currentColor"
+                />
+              </svg>
+              <span className="fl-row-action-label">Edit</span>
+            </div>
+
+            {rowActionMenu.res.kind !== "Node" && (
+              <div
+                className="fl-row-action-item"
+                onMouseEnter={() => setRowActionMenu((m) => (m ? { ...m, submenu: null } : null))}
+                onClick={() => {
+                  const target = rowActionMenu.res;
+                  const removedKey = `${target.kind}:${target.namespace}/${target.name}`;
+                  setRowActionMenu(null);
+                  if (selectedRowKey === removedKey) {
+                    setDrawerOpen(false);
+                    setSelectedRowKey(null);
+                  }
+                  setSnapshot((prev) => ({
+                    ...prev,
+                    resources: (prev.resources || []).filter(
+                      (r) => `${r.kind}:${r.namespace}/${r.name}` !== removedKey,
+                    ),
+                    helm_releases: (prev.helm_releases || []).filter(
+                      (rel) => `HelmRelease:${rel.namespace || "default"}/${rel.name}` !== removedKey,
+                    ),
+                  }));
+                  sendToBackend({
+                    op: "delete",
+                    kind: target.kind,
+                    namespace: target.namespace,
+                    name: target.name,
+                    force: false,
+                  });
+                }}
+              >
+                <svg className="fl-row-action-icon" width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                  <path
+                    d="M5.5 16.5c0 .83.67 1.5 1.5 1.5h6c.83 0 1.5-.67 1.5-1.5v-9h-9v9zM15.25 4.5h-2.62l-.75-.75h-3.76l-.75.75H4.75V6h10.5V4.5z"
+                    fill="currentColor"
+                  />
+                </svg>
+                <span className="fl-row-action-label">Delete</span>
+              </div>
+            )}
+
+            {rowActionMenu.res.kind !== "Node" && rowActionMenu.res.kind !== "HelmRelease" && (
+              <div
+                className="fl-row-action-item"
+                onMouseEnter={() => setRowActionMenu((m) => (m ? { ...m, submenu: null } : null))}
+                onClick={() => {
+                  const target = rowActionMenu.res;
+                  const removedKey = `${target.kind}:${target.namespace}/${target.name}`;
+                  setRowActionMenu(null);
+                  if (selectedRowKey === removedKey) {
+                    setDrawerOpen(false);
+                    setSelectedRowKey(null);
+                  }
+                  setSnapshot((prev) => ({
+                    ...prev,
+                    resources: (prev.resources || []).filter(
+                      (r) => `${r.kind}:${r.namespace}/${r.name}` !== removedKey,
+                    ),
+                  }));
+                  sendToBackend({
+                    op: "delete",
+                    kind: target.kind,
+                    namespace: target.namespace,
+                    name: target.name,
+                    force: true,
+                  });
+                }}
+              >
+                <svg className="fl-row-action-icon" width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                  <path
+                    fillRule="evenodd"
+                    clipRule="evenodd"
+                    d="M15.25 4.5h-2.62l-.75-.75h-3.76l-.75.75H4.75V6h10.5V4.5zM5.5 7.5v9c0 .83.67 1.5 1.5 1.5h6c.83 0 1.5-.67 1.5-1.5v-9h-9zm2.56 2.94a.65.65 0 0 1 .92 0L10 11.48l1.02-1.04a.65.65 0 1 1 .92.92L10.92 12.4l1.02 1.04a.65.65 0 1 1-.92.92L10 13.32l-1.02 1.04a.65.65 0 0 1-.92-.92l1.02-1.04-1.02-1.04a.65.65 0 0 1 0-.92z"
+                    fill="currentColor"
+                  />
+                </svg>
+                <span className="fl-row-action-label">Force Delete</span>
+              </div>
+            )}
           </div>
         )}
 
