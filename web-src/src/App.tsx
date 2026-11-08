@@ -2712,35 +2712,6 @@ export function App() {
                     </div>
                   </>
                 )}
-                {(selectedResource.kind === "Pod" || selectedResource.kind === "Service") && (
-                  <button
-                    className="fl-drawer-act-btn"
-                    title="Port Forward (kubectl port-forward)"
-                    onClick={() => {
-                      const port = (selectedResource.ports && selectedResource.ports[0]) || "8080";
-                      setPfModal({
-                        kind: selectedResource.kind,
-                        namespace: selectedResource.namespace,
-                        name: selectedResource.name,
-                        port,
-                        address: "localhost",
-                        localPort: "",
-                        https: false,
-                        openInBrowser: true,
-                      });
-                    }}
-                  >
-                    <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                      <path
-                        d="M5 7h10m0 0l-2.5-2.5M15 7l-2.5 2.5M15 13H5m0 0l2.5-2.5M5 13l2.5 2.5"
-                        stroke="#ffffff"
-                        strokeWidth="1.9"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      />
-                    </svg>
-                  </button>
-                )}
                 {["Deployment", "StatefulSet", "DaemonSet"].includes(selectedResource.kind) && (
                   <button
                     className="fl-drawer-act-btn"
