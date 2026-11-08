@@ -2718,13 +2718,28 @@ export function App() {
                       <div className="fl-col-resizer" onMouseDown={(e) => startColResize(e, col)} />
                     </th>
                   ))}
+                  <th style={{ width: 44, textAlign: "right", paddingRight: 12 }}>
+                    <button
+                      type="button"
+                      className="fl-col-menu-btn"
+                      title="Customize table columns"
+                      aria-label="Customize table columns"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setRowActionMenu(null);
+                        setColMenuOpen((v) => !v);
+                      }}
+                    >
+                      ⋮
+                    </button>
+                  </th>
                 </tr>
               </thead>
               <tbody>
                 {filteredResources.length === 0 ? (
                   <tr>
                     <td
-                      colSpan={visibleCols.length + (activeKind === "Node" ? 0 : 1)}
+                      colSpan={visibleCols.length + (activeKind === "Node" ? 1 : 2)}
                       style={{ textAlign: "center", padding: "32px 16px", color: "var(--fl-fg-muted)" }}
                     >
                       {banner && !banner.isError
@@ -2784,6 +2799,40 @@ export function App() {
                             {renderPodCell(res, col.id)}
                           </td>
                         ))}
+                        <td
+                          style={{ textAlign: "right", paddingRight: 10, whiteSpace: "nowrap" }}
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <button
+                            type="button"
+                            className="fl-row-icon-btn"
+                            title="Resource Actions"
+                            aria-label="Resource Actions"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setColMenuOpen(false);
+                              const r = e.currentTarget.getBoundingClientRect();
+                              const estHeight = res.kind === "Pod" ? 215 : 150;
+                              const openUpward = r.bottom + estHeight > window.innerHeight - 16;
+                              setRowActionMenu((prev) =>
+                                prev &&
+                                prev.res.kind === res.kind &&
+                                prev.res.namespace === res.namespace &&
+                                prev.res.name === res.name
+                                  ? null
+                                  : {
+                                      res,
+                                      x: Math.max(12, Math.min(window.innerWidth - 188, r.right - 176)),
+                                      y: openUpward ? r.top - 6 : r.bottom + 4,
+                                      openUpward,
+                                      submenu: null,
+                                    },
+                              );
+                            }}
+                          >
+                            ⋮
+                          </button>
+                        </td>
                       </tr>
                     );
                   })
