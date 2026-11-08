@@ -2076,7 +2076,7 @@ pub fn fetch_helm_into_snapshot(project: &Project, cfg: &KubeConfigState, snap: 
     if !cfg.context.trim().is_empty() {
         helm_args.push(format!("--kube-context={}", cfg.context.trim()));
     }
-    helm_args.extend(["list".into(), "-a".into()]);
+    helm_args.push("list".into());
     if cfg.all_namespaces {
         helm_args.push("-A".into());
     } else if !cfg.namespace.trim().is_empty() {
