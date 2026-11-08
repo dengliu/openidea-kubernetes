@@ -34,6 +34,7 @@ id = "kubernetes"
 title = "Kubernetes"
 icon = "icons/kubernetes.svg"
 location = "right"
+secondary = true
 web = "web/index.html"
 header = "none"
 
