@@ -2315,7 +2315,7 @@ pub fn fetch_category_into_snapshot(
                             .iter()
                             .filter(|r| {
                                 r.kind == "Pod"
-                                    && r.name.starts_with("node-debugger-")
+                                    && (r.name.starts_with("node-debugger-") || r.name.starts_with("node-dbg-watch-"))
                                     && matches!(r.status.as_str(), "Succeeded" | "Completed" | "Failed")
                             })
                             .map(|r| (r.namespace.clone(), r.name.clone()))
@@ -2324,12 +2324,13 @@ pub fn fetch_category_into_snapshot(
                             for (ns, name) in &finished_debuggers {
                                 let _ = delete_cluster_resource(project, cfg, "Pod", ns, name);
                             }
-                            snap.resources.retain(|r| {
-                                !(r.kind == "Pod"
-                                    && r.name.starts_with("node-debugger-")
-                                    && matches!(r.status.as_str(), "Succeeded" | "Completed" | "Failed"))
-                            });
                         }
+                        snap.resources.retain(|r| {
+                            !(r.kind == "Pod"
+                                && (r.name.starts_with("node-dbg-watch-")
+                                    || (r.name.starts_with("node-debugger-")
+                                        && matches!(r.status.as_str(), "Succeeded" | "Completed" | "Failed"))))
+                        });
                         enrich_pod_metrics(project, cfg, snap);
                     }
                 }
@@ -2920,8 +2921,10 @@ pub fn open_exec_or_debug_terminal(
     open_exec_terminal(cfg, namespace, pod, container)
 }
 
-/// Opens an ephemeral debug container (`kubectl debug -it --image=<image>`) for Pods.
+/// Opens an ephemeral debug container (`kubectl debug --image=<image>`) for Pods,
+/// automatically terminating the ephemeral container when the Terminal tab is closed.
 pub fn open_debug_terminal(
+    project: Option<&Project>,
     cfg: &KubeConfigState,
     namespace: &str,
     pod: &str,
@@ -2938,6 +2941,169 @@ pub fn open_debug_terminal(
         Some(explicit) => explicit,
         None => "busybox:latest",
     };
+    let title = match container.filter(|c| !c.is_empty()) {
+        Some(c) => format!("Debug: {pod} ({c})"),
+        None => format!("Debug: {pod}"),
+    };
+
+    if let Some(proj) = project {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() % 1_000_000)
+            .unwrap_or(1000);
+        let dbg_name = format!("debugger-{secs}");
+
+        let mut create_args = cfg.target_args(Some(namespace));
+        create_args.extend([
+            "debug".into(),
+            pod.to_owned(),
+            "--attach=false".into(),
+            format!("--container={dbg_name}"),
+            format!("--image={debug_image}"),
+        ]);
+        if let Some(c) = container.filter(|c| !c.is_empty()) {
+            create_args.push(format!("--target={c}"));
+        }
+        create_args.extend([
+            "--".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            "rm -f /tmp/.openidea-dbg-stop; trap 'exit 0' TERM INT HUP USR1; i=0; while [ ! -f /tmp/.openidea-dbg-stop ] && [ $i -lt 7200 ]; do sleep 1; i=$((i+1)); done; exit 0".into(),
+        ]);
+        let out = run_kubectl(proj, &create_args, None)?;
+        if out.status != Some(0) {
+            return Err(Error::Failed(first_line_or(&out.stderr, "kubectl debug failed")));
+        }
+
+        // Wait until the ephemeral container is running and read its containerID + nodeName
+        let mut node_name = String::new();
+        let mut cid = String::new();
+        for _ in 0..30 {
+            let mut get_args = cfg.target_args(Some(namespace));
+            get_args.extend(["get".into(), "pod".into(), pod.to_owned(), "-o".into(), "json".into()]);
+            if let Ok(gout) = run_kubectl(proj, &get_args, None)
+                && gout.status == Some(0)
+                && let Ok(v) = serde_json::from_str::<Value>(&gout.stdout)
+            {
+                if node_name.is_empty() {
+                    node_name = v
+                        .pointer("/spec/nodeName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                }
+                if let Some(arr) = v.pointer("/status/ephemeralContainerStatuses").and_then(Value::as_array) {
+                    for ecs in arr {
+                        if ecs.get("name").and_then(Value::as_str) == Some(dbg_name.as_str())
+                            && ecs.pointer("/state/running").is_some()
+                        {
+                            cid = ecs
+                                .get("containerID")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .split("://")
+                                .last()
+                                .unwrap_or("")
+                                .to_owned();
+                            break;
+                        }
+                    }
+                }
+                if !cid.is_empty() {
+                    break;
+                }
+            }
+            std::thread::sleep( std::time::Duration::from_millis(250));
+        }
+
+        // Launch a self-deleting node watcher pod that monitors containerd's open -stdout FIFOs for `cid`
+        // and touches `/tmp/.openidea-dbg-stop` inside `dbg_name` as soon as `kubectl exec -it` disconnects.
+        if !node_name.is_empty() && !cid.is_empty() {
+            let watch_pod = format!("node-dbg-watch-{secs}");
+            let watcher_entrypoint = format!(
+                concat!(
+                    "CID='{cid}'; ",
+                    "CPID=$(pidof containerd 2>/dev/null | awk '{{print $1}}'); ",
+                    "if [ -n \"$CID\" ] && [ -n \"$CPID\" ]; then ",
+                    "  BASE=$(ls -l /proc/$CPID/fd 2>/dev/null | grep -F \"$CID\" | grep -c -- '-stdout$'); ",
+                    "  i=0; ATTACHED=0; ",
+                    "  while true; do ",
+                    "    CUR=$(ls -l /proc/$CPID/fd 2>/dev/null | grep -F \"$CID\" | grep -c -- '-stdout$'); ",
+                    "    if [ \"$CUR\" -gt \"$BASE\" ]; then ATTACHED=1; ",
+                    "    elif [ \"$ATTACHED\" -eq 1 ] || [ \"$CUR\" -eq 0 ]; then ",
+                    "      for kc in /etc/kubernetes/admin.conf /etc/kubernetes/kubelet.conf /var/lib/kubelet/kubeconfig; do ",
+                    "        if [ -f \"/host$kc\" ]; then ",
+                    "          chroot /host kubectl --kubeconfig=\"$kc\" exec {pod} -n {ns} -c {dbg} -- touch /tmp/.openidea-dbg-stop >/dev/null 2>&1 || true; ",
+                    "          chroot /host kubectl --kubeconfig=\"$kc\" delete pod {watch_pod} -n default --force --grace-period=0 >/dev/null 2>&1 && break; ",
+                    "        fi; ",
+                    "      done; ",
+                    "      exit 0; ",
+                    "    else i=$((i+1)); if [ $i -ge 30 ]; then ",
+                    "      for kc in /etc/kubernetes/admin.conf /etc/kubernetes/kubelet.conf /var/lib/kubelet/kubeconfig; do ",
+                    "        if [ -f \"/host$kc\" ]; then ",
+                    "          chroot /host kubectl --kubeconfig=\"$kc\" exec {pod} -n {ns} -c {dbg} -- touch /tmp/.openidea-dbg-stop >/dev/null 2>&1 || true; ",
+                    "          chroot /host kubectl --kubeconfig=\"$kc\" delete pod {watch_pod} -n default --force --grace-period=0 >/dev/null 2>&1 && break; ",
+                    "        fi; ",
+                    "      done; ",
+                    "      exit 0; ",
+                    "    fi; fi; ",
+                    "    sleep 1; ",
+                    "  done; ",
+                    "fi"
+                ),
+                cid = cid,
+                pod = pod,
+                ns = namespace,
+                dbg = dbg_name,
+                watch_pod = watch_pod
+            );
+            let manifest = json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": watch_pod,
+                    "namespace": "default",
+                    "labels": {
+                        "app.kubernetes.io/managed-by": "openidea-dbg-watch"
+                    }
+                },
+                "spec": {
+                    "nodeName": node_name,
+                    "hostPID": true,
+                    "hostNetwork": true,
+                    "restartPolicy": "Never",
+                    "terminationGracePeriodSeconds": 0,
+                    "tolerations": [{ "operator": "Exists" }],
+                    "containers": [{
+                        "name": "watcher",
+                        "image": "busybox:latest",
+                        "securityContext": { "privileged": true },
+                        "command": ["/bin/sh", "-c", watcher_entrypoint],
+                        "volumeMounts": [{ "name": "host-root", "mountPath": "/host" }]
+                    }],
+                    "volumes": [{ "name": "host-root", "hostPath": { "path": "/" } }]
+                }
+            });
+            let mut apply_args = cfg.target_args(Some("default"));
+            apply_args.extend(["apply".into(), "-f".into(), "-".into()]);
+            let _ = run_kubectl(proj, &apply_args, Some(&manifest.to_string()));
+        }
+
+        let mut exec_args = cfg.target_args(Some(namespace));
+        exec_args.extend([
+            "exec".into(),
+            "-it".into(),
+            pod.to_owned(),
+            "-c".into(),
+            dbg_name,
+            "--".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap 'touch /tmp/.openidea-dbg-stop' EXIT HUP INT TERM; export TERM=xterm-256color; if [ -x /bin/bash ]; then /bin/bash; elif [ -x /bin/ash ]; then /bin/ash; else /bin/sh; fi; touch /tmp/.openidea-dbg-stop".into(),
+        ]);
+        return host::open_terminal(&title, "kubectl", &exec_args);
+    }
+
     let mut args = cfg.target_args(Some(namespace));
     args.extend(["debug".into(), "-it".into(), pod.to_owned(), format!("--image={debug_image}")]);
     if let Some(c) = container.filter(|c| !c.is_empty()) {
@@ -2949,10 +3115,6 @@ pub fn open_debug_terminal(
         "-c".into(),
         "export TERM=xterm-256color; if [ -x /bin/bash ]; then exec /bin/bash; elif [ -x /bin/ash ]; then exec /bin/ash; else exec /bin/sh; fi".into(),
     ]);
-    let title = match container.filter(|c| !c.is_empty()) {
-        Some(c) => format!("Debug: {pod} ({c})"),
-        None => format!("Debug: {pod}"),
-    };
     host::open_terminal(&title, "kubectl", &args)
 }
 

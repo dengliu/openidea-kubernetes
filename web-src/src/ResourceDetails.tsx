@@ -914,11 +914,17 @@ function PodEphemeralContainerSection({
   containerStatuses: any[];
 }) {
   if (!Array.isArray(containers) || containers.length === 0) return null;
+  const activeContainers = containers.filter((c: any) => {
+    const st = (containerStatuses || []).find((cs: any) => cs.name === c.name);
+    if (!st?.state) return true;
+    return Boolean(st.state.running || st.state.waiting);
+  });
+  if (activeContainers.length === 0) return null;
 
   return (
     <>
       <DrawerSectionBanner>Ephemeral Containers</DrawerSectionBanner>
-      {containers.map((c: any) => {
+      {activeContainers.map((c: any) => {
         const st = (containerStatuses || []).find((cs: any) => cs.name === c.name);
         const stateKey = st?.state ? Object.keys(st.state)[0] : "running";
         const terminated = st?.state?.terminated;

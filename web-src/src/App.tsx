@@ -940,11 +940,37 @@ export function App() {
     if (!snapshot.connected || activeKind === "ClusterCatalog" || activeKind === "Workspace") return;
     const id = window.setInterval(() => {
       if (document.visibilityState === "visible") {
-        sendToBackend({ op: "poll-category", category: activeKind });
+        let inspectKind: string | null = null;
+        let inspectNs: string | null = null;
+        let inspectName: string | null = null;
+        if (drawerOpen && selectedRowKey) {
+          const colonIdx = selectedRowKey.indexOf(":");
+          const slashIdx = selectedRowKey.indexOf("/", colonIdx + 1);
+          if (colonIdx > 0 && slashIdx > colonIdx) {
+            inspectKind = selectedRowKey.slice(0, colonIdx);
+            inspectNs = selectedRowKey.slice(colonIdx + 1, slashIdx);
+            inspectName = selectedRowKey.slice(slashIdx + 1);
+          }
+        }
+        sendToBackend({
+          op: "poll-category",
+          category: activeKind,
+          inspectKind,
+          inspectNs,
+          inspectName,
+        });
       }
     }, 5000);
     return () => window.clearInterval(id);
-  }, [snapshot.connected, snapshot.current_context, snapshot.current_namespace, snapshot.all_namespaces, activeKind]);
+  }, [
+    snapshot.connected,
+    snapshot.current_context,
+    snapshot.current_namespace,
+    snapshot.all_namespaces,
+    activeKind,
+    drawerOpen,
+    selectedRowKey,
+  ]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !window.openidea) return;
@@ -1500,12 +1526,12 @@ export function App() {
 
     for (const cs of res.container_states || []) {
       if (!cs.name || seen.has(cs.name)) continue;
+      seen.add(cs.name);
       const isSidecar = Boolean(cs.is_sidecar || sidecarSet.has(cs.name));
       const isRegularInit = Boolean(cs.is_init && !isSidecar);
       if (!includeTerminated && cs.state === "terminated" && (isRegularInit || cs.is_ephemeral)) {
         continue;
       }
-      seen.add(cs.name);
       const tag = cs.is_ephemeral ? "ephemeral" : isSidecar ? "sidecar" : isRegularInit ? "init" : undefined;
       items.push({
         name: cs.name,

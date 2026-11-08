@@ -486,6 +486,21 @@ impl KubernetesPlugin {
                     }
                 }
                 self.post_snapshot(false);
+                if let Some("Pod") = v.get("inspectKind").and_then(Value::as_str)
+                    && let Some(ins_name) = v.get("inspectName").and_then(Value::as_str).filter(|s| !s.is_empty())
+                {
+                    let ins_ns = v.get("inspectNs").and_then(Value::as_str).unwrap_or("default");
+                    if let Ok(out) = inspect_cluster_resource_json(&project, &cfg, "Pod", ins_ns, ins_name) {
+                        let msg = json!({
+                            "op": "resource-json",
+                            "kind": "Pod",
+                            "namespace": ins_ns,
+                            "name": ins_name,
+                            "json": out,
+                        });
+                        let _ = host::post_view_message(VIEW_ID, &msg.to_string());
+                    }
+                }
             }
             "set-namespace" => {
                 if let Some(ns) = v.get("namespace").and_then(Value::as_str) {
@@ -618,7 +633,24 @@ impl KubernetesPlugin {
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let container = v.get("container").and_then(Value::as_str);
                 let image = v.get("image").and_then(Value::as_str);
-                open_debug_terminal(&cfg, ns, name, container, image)?;
+                let project = resolve_project(ctx).ok();
+                open_debug_terminal(project.as_ref(), &cfg, ns, name, container, image)?;
+                if let Some(ref proj) = project {
+                    if let Some(ref mut snap) = self.snapshot {
+                        fetch_category_into_snapshot(proj, &cfg, snap, "Pod");
+                    }
+                    self.post_snapshot(false);
+                    if let Ok(out) = inspect_cluster_resource_json(proj, &cfg, "Pod", ns, name) {
+                        let msg = json!({
+                            "op": "resource-json",
+                            "kind": "Pod",
+                            "namespace": ns,
+                            "name": name,
+                            "json": out,
+                        });
+                        let _ = host::post_view_message(VIEW_ID, &msg.to_string());
+                    }
+                }
             }
             "node-shell" => {
                 let mut cfg = KubeConfigState::load();
