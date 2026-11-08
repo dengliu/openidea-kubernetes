@@ -692,6 +692,10 @@ body,
   background: var(--fl-green);
 }
 
+.fl-csq.ephemeral {
+  background: #1565c0;
+}
+
 .fl-csq.waiting {
   background: var(--fl-orange);
 }
@@ -711,6 +715,11 @@ body,
   font-weight: 500;
 }
 
+.fl-status-text.ephemeral {
+  color: color-mix(in srgb, #1565c0 80%, var(--fl-fg));
+  font-weight: 500;
+}
+
 .fl-status-text.warn {
   color: color-mix(in srgb, #d97706 78%, var(--fl-fg));
   font-weight: 500;
@@ -719,6 +728,53 @@ body,
 .fl-status-text.err {
   color: color-mix(in srgb, #c62828 78%, var(--fl-fg));
   font-weight: 500;
+}
+
+.fl-csq-tooltip {
+  position: fixed;
+  transform: translateX(-50%);
+  background: var(--fl-bg-elevated);
+  color: var(--fl-fg);
+  border: 1px solid var(--fl-border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  z-index: 650;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.fl-csq-tooltip-header {
+  margin-bottom: 2px;
+}
+
+.fl-csq-tooltip-state.running {
+  color: color-mix(in srgb, #2e7d32 76%, var(--fl-fg));
+}
+
+.fl-csq-tooltip-state.ephemeral {
+  color: color-mix(in srgb, #1565c0 80%, var(--fl-fg));
+}
+
+.fl-csq-tooltip-state.waiting {
+  color: color-mix(in srgb, #d97706 78%, var(--fl-fg));
+}
+
+.fl-csq-tooltip-state.failed {
+  color: color-mix(in srgb, #c62828 78%, var(--fl-fg));
+}
+
+.fl-csq-tooltip-row {
+  display: flex;
+  gap: 12px;
+  margin-top: 4px;
+  font-size: 11.5px;
+}
+
+.fl-csq-tooltip-key {
+  color: var(--fl-fg-muted);
 }
 
 /* Column visibility & order popover menu */

@@ -115,7 +115,7 @@ pub struct ClusterContextInfo {
     pub hotbar_order: Option<u32>,
 }
 
-/// State of one container or initContainer in a Pod (rendered as colored status squares in Freelens).
+/// State of one container, initContainer, sidecar, or ephemeralContainer in a Pod (rendered as colored status squares in Freelens).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerStateBadge {
     pub name: String,
@@ -124,6 +124,12 @@ pub struct ContainerStateBadge {
     pub ready: bool,
     pub reason: String,
     pub is_init: bool,
+    #[serde(default)]
+    pub is_ephemeral: bool,
+    #[serde(default)]
+    pub is_sidecar: bool,
+    #[serde(default)]
+    pub started_at: String,
 }
 
 /// Summary of one Kubernetes resource returned by `kubectl get`.
@@ -722,6 +728,8 @@ struct RawSpec {
     containers: Option<Vec<RawContainer>>,
     #[serde(default, rename = "initContainers")]
     init_containers: Option<Vec<RawContainer>>,
+    #[serde(default, rename = "ephemeralContainers")]
+    ephemeral_containers: Option<Vec<RawContainer>>,
     #[serde(default)]
     template: Option<RawPodTemplate>,
     #[serde(default)]
@@ -764,6 +772,8 @@ struct RawPodTemplateSpec {
 struct RawContainer {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default, rename = "restartPolicy")]
+    restart_policy: Option<String>,
     #[serde(default)]
     ports: Option<Vec<RawContainerPort>>,
 }
@@ -814,6 +824,8 @@ struct RawStatus {
     container_statuses: Option<Vec<RawContainerStatus>>,
     #[serde(default, rename = "initContainerStatuses")]
     init_container_statuses: Option<Vec<RawContainerStatus>>,
+    #[serde(default, rename = "ephemeralContainerStatuses")]
+    ephemeral_container_statuses: Option<Vec<RawContainerStatus>>,
     #[serde(default, rename = "readyReplicas")]
     ready_replicas: Option<u64>,
     #[serde(default, rename = "updatedReplicas")]
@@ -859,11 +871,17 @@ struct RawContainerStatus {
 #[derive(Deserialize)]
 struct RawContainerState {
     #[serde(default)]
-    running: Option<serde::de::IgnoredAny>,
+    running: Option<RawRunningState>,
     #[serde(default)]
     waiting: Option<RawWaitingState>,
     #[serde(default)]
     terminated: Option<RawTerminatedState>,
+}
+
+#[derive(Deserialize)]
+struct RawRunningState {
+    #[serde(default, rename = "startedAt")]
+    started_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -878,6 +896,8 @@ struct RawTerminatedState {
     reason: Option<String>,
     #[serde(default, rename = "exitCode")]
     exit_code: Option<i64>,
+    #[serde(default, rename = "startedAt")]
+    started_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -943,6 +963,7 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         names: None,
         containers: None,
         init_containers: None,
+        ephemeral_containers: None,
         template: None,
         ports: None,
         min_replicas: None,
@@ -962,6 +983,7 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         qos_class: None,
         container_statuses: None,
         init_container_statuses: None,
+        ephemeral_container_statuses: None,
         ready_replicas: None,
         updated_replicas: None,
         desired_number_scheduled: None,
@@ -1017,6 +1039,7 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
             }
         }
     }
+    let mut sidecar_names = std::collections::BTreeSet::new();
     let init_arr = spec
         .init_containers
         .as_ref()
@@ -1024,6 +1047,18 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
     if let Some(init_arr) = init_arr {
         for c in init_arr {
             if let Some(ref cname) = c.name {
+                containers.push(cname.clone());
+                if c.restart_policy.as_deref() == Some("Always") {
+                    sidecar_names.insert(cname.clone());
+                }
+            }
+        }
+    }
+    if let Some(ref ephem_arr) = spec.ephemeral_containers {
+        for c in ephem_arr {
+            if let Some(ref cname) = c.name
+                && !containers.contains(cname)
+            {
                 containers.push(cname.clone());
             }
         }
@@ -1040,11 +1075,16 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                 for cs in &cs_arr {
                     let cname = cs.name.clone().unwrap_or_default();
                     let cready = cs.ready.unwrap_or(false);
-                    let (cstate, creason) = match cs.state.as_ref() {
-                        Some(s) if s.running.is_some() => ("running".to_owned(), String::new()),
+                    let (cstate, creason, cstarted) = match cs.state.as_ref() {
+                        Some(s) if s.running.is_some() => (
+                            "running".to_owned(),
+                            String::new(),
+                            s.running.as_ref().and_then(|r| r.started_at.clone()).unwrap_or_default(),
+                        ),
                         Some(s) if s.waiting.is_some() => (
                             "waiting".to_owned(),
                             s.waiting.as_ref().and_then(|w| w.reason.clone()).unwrap_or_default(),
+                            String::new(),
                         ),
                         Some(s) if s.terminated.is_some() => {
                             let r = s.terminated.as_ref().and_then(|t| t.reason.clone()).unwrap_or_else(|| {
@@ -1054,9 +1094,10 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                                     "Error".into()
                                 }
                             });
-                            ("terminated".to_owned(), r)
+                            let started = s.terminated.as_ref().and_then(|t| t.started_at.clone()).unwrap_or_default();
+                            ("terminated".to_owned(), r, started)
                         }
-                        _ => ("unknown".to_owned(), String::new()),
+                        _ => ("unknown".to_owned(), String::new(), String::new()),
                     };
                     if cstate == "waiting" && !creason.is_empty() {
                         status = creason.clone();
@@ -1067,17 +1108,26 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                         ready: cready,
                         reason: creason,
                         is_init: false,
+                        is_ephemeral: false,
+                        is_sidecar: false,
+                        started_at: cstarted,
                     });
                 }
                 if let Some(init_cs_arr) = st.init_container_statuses {
                     for ics in init_cs_arr {
                         let cname = ics.name.unwrap_or_default();
                         let cready = ics.ready.unwrap_or(false);
-                        let (cstate, creason) = match ics.state.as_ref() {
-                            Some(s) if s.running.is_some() => ("running".to_owned(), String::new()),
+                        let is_sidecar = sidecar_names.contains(&cname);
+                        let (cstate, creason, cstarted) = match ics.state.as_ref() {
+                            Some(s) if s.running.is_some() => (
+                                "running".to_owned(),
+                                String::new(),
+                                s.running.as_ref().and_then(|r| r.started_at.clone()).unwrap_or_default(),
+                            ),
                             Some(s) if s.waiting.is_some() => (
                                 "waiting".to_owned(),
                                 s.waiting.as_ref().and_then(|w| w.reason.clone()).unwrap_or_default(),
+                                String::new(),
                             ),
                             Some(s) if s.terminated.is_some() => (
                                 "terminated".to_owned(),
@@ -1085,8 +1135,9 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                                     .as_ref()
                                     .and_then(|t| t.reason.clone())
                                     .unwrap_or_else(|| "Completed".into()),
+                                s.terminated.as_ref().and_then(|t| t.started_at.clone()).unwrap_or_default(),
                             ),
-                            _ => ("terminated".to_owned(), "Completed".into()),
+                            _ => ("terminated".to_owned(), "Completed".into(), String::new()),
                         };
                         container_states.push(ContainerStateBadge {
                             name: cname,
@@ -1094,6 +1145,45 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                             ready: cready,
                             reason: creason,
                             is_init: true,
+                            is_ephemeral: false,
+                            is_sidecar,
+                            started_at: cstarted,
+                        });
+                    }
+                }
+                if let Some(ephem_cs_arr) = st.ephemeral_container_statuses {
+                    for ecs in ephem_cs_arr {
+                        let cname = ecs.name.unwrap_or_default();
+                        let (cstate, creason, cstarted) = match ecs.state.as_ref() {
+                            Some(s) if s.running.is_some() => (
+                                "running".to_owned(),
+                                String::new(),
+                                s.running.as_ref().and_then(|r| r.started_at.clone()).unwrap_or_default(),
+                            ),
+                            Some(s) if s.waiting.is_some() => (
+                                "waiting".to_owned(),
+                                s.waiting.as_ref().and_then(|w| w.reason.clone()).unwrap_or_default(),
+                                String::new(),
+                            ),
+                            Some(s) if s.terminated.is_some() => (
+                                "terminated".to_owned(),
+                                s.terminated
+                                    .as_ref()
+                                    .and_then(|t| t.reason.clone())
+                                    .unwrap_or_else(|| "Completed".into()),
+                                s.terminated.as_ref().and_then(|t| t.started_at.clone()).unwrap_or_default(),
+                            ),
+                            _ => ("terminated".to_owned(), "Completed".into(), String::new()),
+                        };
+                        container_states.push(ContainerStateBadge {
+                            name: cname,
+                            state: cstate.clone(),
+                            ready: cstate == "running",
+                            reason: creason,
+                            is_init: false,
+                            is_ephemeral: true,
+                            is_sidecar: false,
+                            started_at: cstarted,
                         });
                     }
                 }
@@ -2066,7 +2156,7 @@ pub fn fetch_workloads_into_snapshot(project: &Project, cfg: &KubeConfigState, s
 /// Maps a Kubernetes resource `Kind` to `(kubectl_plural_name, is_cluster_scoped, prefer_json_in_all_ns)`.
 pub fn kubectl_resource_info(kind: &str) -> (&'static str, bool, bool) {
     match kind {
-        "Pod" => ("pods", false, false),
+        "Pod" => ("pods", false, true),
         "Deployment" => ("deployments", false, false),
         "StatefulSet" => ("statefulsets", false, false),
         "DaemonSet" => ("daemonsets", false, false),
@@ -2201,6 +2291,23 @@ pub fn fetch_category_into_snapshot(
                     snap.error = Some(first_line_or(&out.stderr, "kubectl get resources failed"));
                 }
                 Err(e) => {
+                    if cfg.all_namespaces && !cluster_scoped && prefer_json_in_all_ns {
+                        let mut fallback_args = cfg.base_args(true);
+                        fallback_args.extend(["get".into(), kubectl_type.into(), "--all-namespaces".into()]);
+                        fallback_args.extend(["-o".into(), CUSTOM_COLUMNS_SPEC.into(), "--no-headers".into()]);
+                        if let Ok(out) = run_kubectl(project, &fallback_args, None)
+                            && out.status == Some(0)
+                        {
+                            snap.connected = true;
+                            snap.error = None;
+                            snap.resources.retain(|r| r.kind != kind);
+                            snap.resources.extend(parse_custom_columns_resources(&out.stdout));
+                            if kind == "Pod" {
+                                enrich_pod_metrics(project, cfg, snap);
+                            }
+                            return;
+                        }
+                    }
                     snap.error = Some(e.to_string());
                 }
             }

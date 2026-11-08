@@ -646,10 +646,18 @@ function PodContainerSection({
         const terminated = st?.state?.terminated;
         const waiting = st?.state?.waiting;
         const lastTerminated = st?.lastState?.terminated;
+        const isSidecar = Boolean(isInit && c.restartPolicy === "Always");
         const brickCls =
-          stateKey === "running" && (st?.ready ?? true) ? "running" : stateKey === "waiting" ? "waiting" : "terminated";
+          stateKey === "running" && (st?.ready ?? true)
+            ? "running"
+            : stateKey === "waiting"
+              ? "waiting"
+              : stateKey === "terminated" && (terminated?.reason === "Completed" || terminated?.exitCode === 0)
+                ? "completed"
+                : "failed";
         const statusParts: string[] = [stateKey || "unknown"];
-        if (isInit) statusParts.push("init");
+        if (isSidecar) statusParts.push("sidecar");
+        else if (isInit) statusParts.push("init");
         if (st?.restartCount) statusParts.push(`restarted (${st.restartCount})`);
         if (st?.ready) statusParts.push("ready");
         let statusLine = statusParts.join(", ");
@@ -670,16 +678,22 @@ function PodContainerSection({
             <div className="fl-container-title">
               <span className={`fl-csq ${brickCls}`} />
               <span>{c.name}</span>
+              {isSidecar && (
+                <span className="fl-chip" style={{ fontSize: 10.5, padding: "1px 6px" }}>
+                  sidecar
+                </span>
+              )}
             </div>
             {st && (
               <DrawerRow name="Status">
                 <span
-                  className={`fl-status-text ${brickCls === "running" ? "ok" : brickCls === "waiting" ? "warn" : ""}`}
+                  className={`fl-status-text ${brickCls === "running" ? "ok" : brickCls === "waiting" ? "warn" : brickCls === "failed" ? "err" : ""}`}
                 >
                   {statusLine}
                 </span>
               </DrawerRow>
             )}
+            {isSidecar && <DrawerRow name="RestartPolicy">Always (Native Sidecar)</DrawerRow>}
             {lastTerminated && (
               <DrawerRow name="Last Status">
                 <div>
@@ -881,6 +895,90 @@ function PodContainerSection({
                     </span>
                   ))}
                 </div>
+              </DrawerRow>
+            )}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+function PodEphemeralContainerSection({
+  containers,
+  containerStatuses,
+}: {
+  containers: any[];
+  containerStatuses: any[];
+}) {
+  if (!Array.isArray(containers) || containers.length === 0) return null;
+
+  return (
+    <>
+      <DrawerSectionBanner>Ephemeral Containers</DrawerSectionBanner>
+      {containers.map((c: any) => {
+        const st = (containerStatuses || []).find((cs: any) => cs.name === c.name);
+        const stateKey = st?.state ? Object.keys(st.state)[0] : "running";
+        const terminated = st?.state?.terminated;
+        const waiting = st?.state?.waiting;
+        const brickCls =
+          stateKey === "running"
+            ? "ephemeral"
+            : stateKey === "waiting"
+              ? "waiting"
+              : stateKey === "terminated" && (terminated?.reason === "Completed" || terminated?.exitCode === 0)
+                ? "completed"
+                : "failed";
+        let statusLine = `${stateKey || "running"}, ephemeral`;
+        if (terminated) {
+          statusLine += ` - ${terminated.reason || "Terminated"} (exit code: ${terminated.exitCode ?? 0})`;
+        } else if (waiting?.reason) {
+          statusLine += ` - ${waiting.reason}`;
+        }
+
+        const hasEnv = (Array.isArray(c.env) && c.env.length > 0) || (Array.isArray(c.envFrom) && c.envFrom.length > 0);
+
+        return (
+          <div key={c.name} className="fl-container-block">
+            <div className="fl-container-title">
+              <span className={`fl-csq ${brickCls}`} />
+              <span>{c.name}</span>
+            </div>
+            <DrawerRow name="Target Container">
+              <span className="fl-link-teal">{c.targetContainerName || "—"}</span>
+            </DrawerRow>
+            <DrawerRow name="Status">
+              <span className={`fl-status-text ${stateKey === "running" ? "ephemeral" : brickCls === "failed" ? "err" : ""}`}>
+                {statusLine}
+              </span>
+            </DrawerRow>
+            <DrawerRow name="Image">
+              <span className="fl-chip" title={st?.imageID || c.image}>
+                {c.image}
+              </span>
+            </DrawerRow>
+            <DrawerRow name="ImagePullPolicy">{c.imagePullPolicy || "Always"}</DrawerRow>
+            <DrawerRow name="Environment">
+              {hasEnv ? (
+                <div className="fl-env-list">
+                  {(c.env || []).map((e: any) => (
+                    <div key={e.name} className="fl-env-item">
+                      <span className="fl-env-key">{e.name}</span>: {e.value ?? ""}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                "—"
+              )}
+            </DrawerRow>
+            {Array.isArray(c.command) && c.command.length > 0 && (
+              <DrawerRow name="Command">
+                <code style={{ fontFamily: "var(--fl-mono)", fontSize: 11.5 }}>{c.command.join(" ")}</code>
+              </DrawerRow>
+            )}
+            {Array.isArray(c.args) && c.args.length > 0 && (
+              <DrawerRow name="Arguments">
+                <code style={{ fontFamily: "var(--fl-mono)", fontSize: 11.5 }}>{c.args.join(" ")}</code>
               </DrawerRow>
             )}
           </div>
@@ -1341,6 +1439,10 @@ export function ResourceDetails({
             namespace={selectedResource.namespace}
             onOpenResourceByRef={onOpenResourceByRef}
             onPortForward={onPortForward}
+          />
+          <PodEphemeralContainerSection
+            containers={spec.ephemeralContainers || []}
+            containerStatuses={st.ephemeralContainerStatuses || []}
           />
           <PodVolumesSection
             volumes={spec.volumes}

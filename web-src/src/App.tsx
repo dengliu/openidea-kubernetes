@@ -899,6 +899,14 @@ export function App() {
   const [hotbarContextMenu, setHotbarContextMenu] = useState<{ name: string; x: number; y: number } | null>(null);
   const [hbDrag, setHbDrag] = useState<{ dragged: string; over: string; pos: "before" | "after" } | null>(null);
   const hbDragJustEndedRef = useRef<boolean>(false);
+  const [csqTooltip, setCsqTooltip] = useState<{
+    name: string;
+    statusText: string;
+    statusCls: string;
+    startedAt?: string;
+    x: number;
+    y: number;
+  } | null>(null);
   const [, setAgeTick] = useState<number>(0);
 
   const loadedLazyRef = useRef<Record<string, boolean>>({});
@@ -1399,26 +1407,93 @@ export function App() {
   function getPodContainerItems(
     res: ClusterResource,
     json: Record<string, any> | null,
-  ): Array<{ name: string; cls: string }> {
-    const items: Array<{ name: string; cls: string }> = [];
+    includeTerminated = false,
+  ): Array<{ name: string; cls: string; tag?: string }> {
+    const items: Array<{ name: string; cls: string; tag?: string }> = [];
     const seen = new Set<string>();
-    const clsFor = (state: string, ready: boolean, reason: string): string => {
+    const clsFor = (
+      state: string,
+      ready: boolean,
+      reason: string,
+      isEphemeral?: boolean,
+    ): string => {
       if (state === "terminated") {
         return reason === "Completed" || res.status === "Succeeded" ? "completed" : "failed";
       }
+      if (isEphemeral && state === "running") return "ephemeral";
       if (state === "waiting" || !ready) return "waiting";
       return "running";
     };
 
-    for (const cs of res.container_states || []) {
-      if (cs.name && !seen.has(cs.name)) {
-        seen.add(cs.name);
-        items.push({ name: cs.name, cls: clsFor(cs.state, cs.ready, cs.reason) });
+    const sidecarSet = new Set<string>();
+    for (const ic of json?.spec?.initContainers || []) {
+      if (ic?.name && ic?.restartPolicy === "Always") {
+        sidecarSet.add(ic.name);
       }
     }
+
+    for (const cs of res.container_states || []) {
+      if (!cs.name || seen.has(cs.name)) continue;
+      const isSidecar = Boolean(cs.is_sidecar || sidecarSet.has(cs.name));
+      const isRegularInit = Boolean(cs.is_init && !isSidecar);
+      if (!includeTerminated && cs.state === "terminated" && (isRegularInit || cs.is_ephemeral)) {
+        continue;
+      }
+      seen.add(cs.name);
+      const tag = cs.is_ephemeral ? "ephemeral" : isSidecar ? "sidecar" : isRegularInit ? "init" : undefined;
+      items.push({
+        name: cs.name,
+        cls: clsFor(cs.state, cs.ready, cs.reason, cs.is_ephemeral),
+        tag,
+      });
+    }
+
     const statusMap = new Map<string, any>();
     for (const cs of json?.status?.containerStatuses || []) {
       if (cs?.name) statusMap.set(cs.name, cs);
+    }
+    for (const cs of json?.status?.initContainerStatuses || []) {
+      if (cs?.name) statusMap.set(cs.name, cs);
+    }
+    for (const cs of json?.status?.ephemeralContainerStatuses || []) {
+      if (cs?.name) statusMap.set(cs.name, cs);
+    }
+
+    for (const c of json?.spec?.containers || []) {
+      if (c?.name && !seen.has(c.name)) {
+        seen.add(c.name);
+        const st = statusMap.get(c.name);
+        const running = Boolean(st?.state?.running);
+        const ready = st?.ready !== undefined ? Boolean(st.ready) : res.status === "Running";
+        items.push({ name: c.name, cls: running || ready ? "running" : "waiting" });
+      }
+    }
+    for (const ic of json?.spec?.initContainers || []) {
+      if (ic?.name && !seen.has(ic.name)) {
+        const isSidecar = ic.restartPolicy === "Always";
+        const st = statusMap.get(ic.name);
+        const running = Boolean(st?.state?.running);
+        if (!includeTerminated && !isSidecar && !running) continue;
+        seen.add(ic.name);
+        items.push({
+          name: ic.name,
+          cls: running ? "running" : "completed",
+          tag: isSidecar ? "sidecar" : "init",
+        });
+      }
+    }
+    for (const ec of json?.spec?.ephemeralContainers || []) {
+      if (ec?.name && !seen.has(ec.name)) {
+        const st = statusMap.get(ec.name);
+        const running = st ? Boolean(st?.state?.running) : true;
+        if (!includeTerminated && !running) continue;
+        seen.add(ec.name);
+        items.push({
+          name: ec.name,
+          cls: running ? "ephemeral" : "completed",
+          tag: "ephemeral",
+        });
+      }
     }
     for (const cname of res.containers || []) {
       if (cname && !seen.has(cname)) {
@@ -1427,15 +1502,6 @@ export function App() {
         const running = Boolean(st?.state?.running);
         const ready = st?.ready !== undefined ? Boolean(st.ready) : res.status === "Running";
         items.push({ name: cname, cls: running || ready ? "running" : "waiting" });
-      }
-    }
-    for (const c of json?.spec?.containers || []) {
-      if (c?.name && !seen.has(c.name)) {
-        seen.add(c.name);
-        const st = statusMap.get(c.name);
-        const running = Boolean(st?.state?.running);
-        const ready = st?.ready !== undefined ? Boolean(st.ready) : res.status === "Running";
-        items.push({ name: c.name, cls: running || ready ? "running" : "waiting" });
       }
     }
     return items;
@@ -1610,7 +1676,7 @@ export function App() {
   }
 
   function renderContainerSquares(res: ClusterResource) {
-    const states: ContainerStateBadge[] =
+    const rawStates: ContainerStateBadge[] =
       res.container_states && res.container_states.length > 0
         ? res.container_states
         : (res.containers || []).map((name) => ({
@@ -1620,19 +1686,60 @@ export function App() {
             reason: res.status,
             is_init: false,
           }));
+    const visibleStates = rawStates.filter((cs) => {
+      if (cs.is_ephemeral) {
+        return cs.state === "running" || cs.state === "waiting";
+      }
+      if (cs.is_init && !cs.is_sidecar) {
+        return cs.state !== "terminated" || cs.reason !== "Completed";
+      }
+      return true;
+    });
     return (
       <div className="fl-container-squares">
-        {states.map((cs, i) => {
+        {visibleStates.map((cs, i) => {
           let cls = "running";
-          if (cs.state === "terminated") {
+          if (cs.is_ephemeral && cs.state === "running") {
+            cls = "ephemeral";
+          } else if (cs.state === "terminated") {
             cls = cs.reason === "Completed" || res.status === "Succeeded" ? "completed" : "failed";
           } else if (cs.state === "waiting") {
             cls = "waiting";
           } else if (!cs.ready) {
             cls = "waiting";
           }
-          const tip = `${cs.is_init ? "[init] " : ""}${cs.name}: ${cs.state}${cs.reason ? ` (${cs.reason})` : ""}`;
-          return <span key={`${cs.name}-${i}`} className={`fl-csq ${cls}`} title={tip} />;
+          const parts: string[] = [cs.state];
+          if (cs.is_ephemeral) parts.push("ephemeral");
+          else if (cs.is_sidecar) {
+            if (cs.ready) parts.push("ready");
+            parts.push("sidecar");
+          } else if (cs.is_init) {
+            parts.push("init");
+          } else if (cs.ready) {
+            parts.push("ready");
+          }
+          if (cs.reason && cs.state !== "running") {
+            parts.push(`(${cs.reason})`);
+          }
+          const statusText = parts.join(", ");
+          return (
+            <span
+              key={`${cs.name}-${i}`}
+              className={`fl-csq ${cls}`}
+              onMouseEnter={(e) => {
+                const r = e.currentTarget.getBoundingClientRect();
+                setCsqTooltip({
+                  name: cs.name,
+                  statusText,
+                  statusCls: cls,
+                  startedAt: cs.started_at || undefined,
+                  x: r.left + r.width / 2,
+                  y: r.bottom + 6,
+                });
+              }}
+              onMouseLeave={() => setCsqTooltip(null)}
+            />
+          );
         })}
       </div>
     );
@@ -2809,7 +2916,7 @@ export function App() {
                       </button>
                       {shellContainerMenuOpen && (
                         <div className="fl-container-menu" style={{ minWidth: 250 }}>
-                          {getPodContainerItems(selectedResource, drawerJson).map((c) => (
+                          {getPodContainerItems(selectedResource, drawerJson, false).map((c) => (
                             <div
                               key={c.name}
                               className="fl-container-menu-item"
@@ -2821,7 +2928,12 @@ export function App() {
                               }}
                             >
                               <span className={`fl-csq ${c.cls}`} />
-                              <span>{c.name}</span>
+                              <span style={{ flex: 1 }}>{c.name}</span>
+                              {c.tag && (
+                                <span style={{ fontSize: 10.5, color: "var(--fl-fg-muted)", marginLeft: 6 }}>
+                                  {c.tag}
+                                </span>
+                              )}
                             </div>
                           ))}
                           <div style={{ borderTop: "1px solid var(--fl-border)", margin: "4px 0" }} />
@@ -2860,7 +2972,7 @@ export function App() {
                         title="Pod Logs"
                         onClick={() => {
                           setShellContainerMenuOpen(false);
-                          const items = getPodContainerItems(selectedResource, drawerJson);
+                          const items = getPodContainerItems(selectedResource, drawerJson, true);
                           if (items.length > 1) {
                             setLogContainerMenuOpen((v) => !v);
                           } else {
@@ -2877,7 +2989,7 @@ export function App() {
                       </button>
                       {logContainerMenuOpen && (
                         <div className="fl-container-menu">
-                          {getPodContainerItems(selectedResource, drawerJson).map((c) => (
+                          {getPodContainerItems(selectedResource, drawerJson, true).map((c) => (
                             <div
                               key={c.name}
                               className="fl-container-menu-item"
@@ -2887,7 +2999,12 @@ export function App() {
                               }}
                             >
                               <span className={`fl-csq ${c.cls}`} />
-                              <span>{c.name}</span>
+                              <span style={{ flex: 1 }}>{c.name}</span>
+                              {c.tag && (
+                                <span style={{ fontSize: 10.5, color: "var(--fl-fg-muted)", marginLeft: 6 }}>
+                                  {c.tag}
+                                </span>
+                              )}
                             </div>
                           ))}
                         </div>
@@ -3330,6 +3447,27 @@ export function App() {
                 </button>
               </div>
             </div>
+          </div>
+        )}
+
+        {csqTooltip && (
+          <div
+            className="fl-csq-tooltip"
+            style={{
+              top: Math.min(window.innerHeight - 80, csqTooltip.y),
+              left: Math.min(window.innerWidth - 260, Math.max(12, csqTooltip.x)),
+            }}
+          >
+            <div className="fl-csq-tooltip-header">
+              <strong>{csqTooltip.name}</strong>{" "}
+              <span className={`fl-csq-tooltip-state ${csqTooltip.statusCls}`}>{csqTooltip.statusText}</span>
+            </div>
+            {csqTooltip.startedAt && (
+              <div className="fl-csq-tooltip-row">
+                <span className="fl-csq-tooltip-key">Started At</span>
+                <span>{csqTooltip.startedAt}</span>
+              </div>
+            )}
           </div>
         )}
         </div>

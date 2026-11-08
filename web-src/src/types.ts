@@ -20,6 +20,9 @@ export interface ContainerStateBadge {
   ready: boolean;
   reason: string;
   is_init: boolean;
+  is_ephemeral?: boolean;
+  is_sidecar?: boolean;
+  started_at?: string;
 }
 
 export interface ClusterResource {
