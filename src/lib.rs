@@ -27,8 +27,9 @@ use kubectl::{
     drain_node, exec_pod_command, fetch_category_into_snapshot, fetch_cluster_snapshot, fetch_helm_release_detail,
     fetch_kubeconfig_overview, fetch_namespaces_into_snapshot, fetch_nodes_into_snapshot, fetch_pod_logs,
     fetch_resource_extras, inspect_cluster_resource, inspect_cluster_resource_json, open_debug_terminal,
-    open_exec_terminal, open_follow_logs_terminal, open_port_forward_terminal, render_helm_template, resolve_project,
-    rollout_restart, scale_workload, suspend_cronjob, trigger_cronjob, workspace_manifests_json,
+    open_exec_or_debug_terminal, open_exec_terminal, open_follow_logs_terminal, open_node_shell_terminal,
+    open_port_forward_terminal, render_helm_template, resolve_project, rollout_restart, scale_workload,
+    suspend_cronjob, trigger_cronjob, workspace_manifests_json,
 };
 use manifest::{parse_yaml, utf16_len};
 use openidea_plugin::host::{self, storage};
@@ -571,18 +572,40 @@ impl KubernetesPlugin {
                 open_follow_logs_terminal(&cfg, ns, name, container)?;
             }
             "exec-shell" => {
-                let cfg = KubeConfigState::load();
+                let mut cfg = KubeConfigState::load();
+                if let Some(c) = v.get("context").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    cfg.context = c.to_owned();
+                }
                 let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let container = v.get("container").and_then(Value::as_str);
-                open_exec_terminal(&cfg, ns, name, container)?;
+                let project = resolve_project(ctx).ok();
+                let (used_debug, ()) = open_exec_or_debug_terminal(project.as_ref(), &cfg, ns, name, container)?;
+                if used_debug {
+                    host::notify(
+                        NotificationLevel::Info,
+                        "Kubernetes Debug Shell",
+                        &format!("{name} has no /bin/sh (distroless); opened ephemeral debug shell (busybox:latest)"),
+                    );
+                }
             }
             "debug-shell" => {
-                let cfg = KubeConfigState::load();
+                let mut cfg = KubeConfigState::load();
+                if let Some(c) = v.get("context").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    cfg.context = c.to_owned();
+                }
                 let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let container = v.get("container").and_then(Value::as_str);
                 open_debug_terminal(&cfg, ns, name, container)?;
+            }
+            "node-shell" => {
+                let mut cfg = KubeConfigState::load();
+                if let Some(c) = v.get("context").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    cfg.context = c.to_owned();
+                }
+                let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+                open_node_shell_terminal(&cfg, name)?;
             }
             "pod-exec" => {
                 let project = resolve_project(ctx)?;

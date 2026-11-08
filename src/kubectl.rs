@@ -2559,16 +2559,52 @@ pub fn open_exec_terminal(
         args.push("-c".into());
         args.push(c.to_owned());
     }
-    args.push("--".into());
-    args.push(cfg.shell.clone());
+    args.extend([
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        "export TERM=xterm-256color; if [ -x /bin/bash ]; then exec /bin/bash; elif [ -x /bin/ash ]; then exec /bin/ash; else exec /bin/sh; fi".into(),
+    ]);
     let title = match container.filter(|c| !c.is_empty()) {
-        Some(c) => format!("k8s exec: {pod}/{c}"),
-        None => format!("k8s exec: {pod}"),
+        Some(c) => format!("Pod: {pod} ({c})"),
+        None => format!("Pod: {pod}"),
     };
     host::open_terminal(&title, "kubectl", &args)
 }
 
-/// Opens an ephemeral debug container (`kubectl debug -it --image=busybox`) for distroless Pods.
+/// Probes whether the target Pod container has `/bin/sh`; if distroless (missing `/bin/sh`),
+/// automatically falls back to `open_debug_terminal` (`kubectl debug --image=busybox:latest`).
+pub fn open_exec_or_debug_terminal(
+    project: Option<&Project>,
+    cfg: &KubeConfigState,
+    namespace: &str,
+    pod: &str,
+    container: Option<&str>,
+) -> Result<(bool, ()), Error> {
+    if let Some(proj) = project {
+        let mut probe = cfg.target_args(Some(namespace));
+        probe.extend(["exec".into(), pod.to_owned()]);
+        if let Some(c) = container.filter(|c| !c.is_empty()) {
+            probe.extend(["-c".into(), c.to_owned()]);
+        }
+        probe.extend(["--".into(), "/bin/sh".into(), "-c".into(), "true".into()]);
+        if let Err(err) = run_kubectl(proj, &probe, None) {
+            let msg = err.to_string().to_lowercase();
+            if msg.contains("no such file or directory")
+                || msg.contains("executable file not found")
+                || msg.contains("oci runtime exec failed")
+                || msg.contains("stat /bin/sh")
+            {
+                open_debug_terminal(cfg, namespace, pod, container)?;
+                return Ok((true, ()));
+            }
+        }
+    }
+    open_exec_terminal(cfg, namespace, pod, container)?;
+    Ok((false, ()))
+}
+
+/// Opens an ephemeral debug container (`kubectl debug -it --image=busybox:latest`) for distroless Pods.
 pub fn open_debug_terminal(
     cfg: &KubeConfigState,
     namespace: &str,
@@ -2580,8 +2616,33 @@ pub fn open_debug_terminal(
     if let Some(c) = container.filter(|c| !c.is_empty()) {
         args.push(format!("--target={c}"));
     }
-    args.extend(["--".into(), "/bin/sh".into()]);
-    host::open_terminal(&format!("k8s debug: {pod}"), "kubectl", &args)
+    args.extend([
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        "export TERM=xterm-256color; if [ -x /bin/ash ]; then exec /bin/ash; else exec /bin/sh; fi".into(),
+    ]);
+    let title = match container.filter(|c| !c.is_empty()) {
+        Some(c) => format!("Debug: {pod} ({c})"),
+        None => format!("Debug: {pod}"),
+    };
+    host::open_terminal(&title, "kubectl", &args)
+}
+
+/// Opens a root host shell on a Kubernetes Node (`kubectl debug node/<name> -it --image=busybox:latest -- chroot /host`).
+pub fn open_node_shell_terminal(cfg: &KubeConfigState, node: &str) -> Result<(), Error> {
+    let mut args = cfg.target_args(None);
+    args.extend([
+        "debug".into(),
+        format!("node/{node}"),
+        "-it".into(),
+        "--image=busybox:latest".into(),
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        "export TERM=xterm-256color; if [ -d /host ]; then exec chroot /host /bin/sh -c 'if [ -x /bin/bash ]; then exec /bin/bash; else exec /bin/sh; fi'; else exec /bin/sh; fi".into(),
+    ]);
+    host::open_terminal(&format!("Node: {node}"), "kubectl", &args)
 }
 
 /// Runs a shell command inside a Pod container (`kubectl exec`) and returns structured output + updated working directory.

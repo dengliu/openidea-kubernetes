@@ -1293,6 +1293,27 @@ export function App() {
     });
   }
 
+  function openPodShellInTerminalTab(res: ClusterResource, containerName: string, debug = false) {
+    const ns = res.namespace || snapshot.current_namespace || "default";
+    const ctx = snapshot.current_context;
+    sendToBackend({
+      op: debug ? "debug-shell" : "exec-shell",
+      context: ctx,
+      namespace: ns,
+      name: res.name,
+      container: containerName || null,
+    });
+  }
+
+  function openNodeShellInTerminalTab(res: ClusterResource) {
+    const ctx = snapshot.current_context;
+    sendToBackend({
+      op: "node-shell",
+      context: ctx,
+      name: res.name,
+    });
+  }
+
   function openResourceDrawer(
     res: ClusterResource,
     mode: "overview" | "yaml" | "logs" | "describe" | "shell" = "overview",
@@ -1304,6 +1325,15 @@ export function App() {
     if (mode === "logs") {
       const firstContainer = (res.containers && res.containers[0]) || "";
       openPodLogsInEditorTab(res, firstContainer);
+      return;
+    }
+    if (mode === "shell") {
+      if (res.kind === "Node") {
+        openNodeShellInTerminalTab(res);
+      } else {
+        const firstContainer = (res.containers && res.containers[0]) || "";
+        openPodShellInTerminalTab(res, firstContainer, false);
+      }
       return;
     }
     const key = `${res.kind}:${res.namespace}/${res.name}`;
@@ -2345,9 +2375,9 @@ export function App() {
                 {selectedResource.kind === "Node" && (
                   <>
                     <button
-                      className={`fl-drawer-act-btn ${drawerMode === "shell" ? "active" : ""}`}
-                      title="Node Shell"
-                      onClick={() => setDrawerMode((m) => (m === "shell" ? "overview" : "shell"))}
+                      className="fl-drawer-act-btn"
+                      title="Open Node Shell in Terminal Tab"
+                      onClick={() => openNodeShellInTerminalTab(selectedResource)}
                     >
                       <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                         <rect x="2.5" y="2.5" width="15" height="15" rx="2.5" fill="#ffffff" />
@@ -2431,17 +2461,11 @@ export function App() {
                   <>
                     <div className="fl-drawer-act-wrap" onClick={(e) => e.stopPropagation()}>
                       <button
-                        className={`fl-drawer-act-btn ${drawerMode === "shell" || shellContainerMenuOpen ? "active" : ""}`}
-                        title="Pod Shell"
+                        className={`fl-drawer-act-btn ${shellContainerMenuOpen ? "active" : ""}`}
+                        title="Open Pod Shell in Terminal Tab"
                         onClick={() => {
                           setLogContainerMenuOpen(false);
-                          const items = getPodContainerItems(selectedResource, drawerJson);
-                          if (items.length > 1) {
-                            setShellContainerMenuOpen((v) => !v);
-                          } else {
-                            setLogContainer(items[0]?.name || "");
-                            setDrawerMode("shell");
-                          }
+                          setShellContainerMenuOpen((v) => !v);
                         }}
                       >
                         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
@@ -2473,13 +2497,27 @@ export function App() {
                               onClick={() => {
                                 setShellContainerMenuOpen(false);
                                 setLogContainer(c.name);
-                                setDrawerMode("shell");
+                                openPodShellInTerminalTab(selectedResource, c.name, false);
                               }}
                             >
                               <span className={`fl-csq ${c.cls}`} />
                               <span>{c.name}</span>
                             </div>
                           ))}
+                          <div style={{ borderTop: "1px solid var(--fl-border)", margin: "4px 0" }} />
+                          <div
+                            className="fl-container-menu-item"
+                            title="Attach an ephemeral busybox:latest debug container (for distroless images without /bin/sh)"
+                            onClick={() => {
+                              setShellContainerMenuOpen(false);
+                              const items = getPodContainerItems(selectedResource, drawerJson);
+                              const targetContainer = logContainer || items[0]?.name || "";
+                              openPodShellInTerminalTab(selectedResource, targetContainer, true);
+                            }}
+                          >
+                            <span style={{ fontSize: 12, color: "var(--fl-teal)", fontWeight: 700 }}>{">_"}</span>
+                            <span>Debug Shell (busybox)</span>
+                          </div>
                         </div>
                       )}
                     </div>
