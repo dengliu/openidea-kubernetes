@@ -23,8 +23,8 @@ use intelligence::{
     ProjectIndex, completions_at, definitions_at, inspect_document, line_markers_for, normalize_slashes, project_of,
 };
 use kubectl::{
-    ClusterSnapshot, KubeConfigState, apply_or_diff_manifest, build_kustomize, cordon_node, delete_cluster_resource,
-    drain_node, exec_pod_command, fetch_category_into_snapshot, fetch_cluster_snapshot, fetch_helm_release_detail,
+    ClusterSnapshot, KubeConfigState, apply_or_diff_manifest, build_kustomize, cordon_node,
+    delete_cluster_resource_opts, drain_node, exec_pod_command, fetch_category_into_snapshot, fetch_cluster_snapshot, fetch_helm_release_detail,
     fetch_kubeconfig_overview, fetch_namespaces_into_snapshot, fetch_nodes_into_snapshot, fetch_pod_logs,
     fetch_resource_extras, inspect_cluster_resource, inspect_cluster_resource_json, open_debug_terminal,
     open_exec_or_debug_terminal, open_exec_terminal, open_follow_logs_terminal, open_node_shell_terminal,
@@ -727,7 +727,8 @@ impl KubernetesPlugin {
                 let kind = v.get("kind").and_then(Value::as_str).unwrap_or("Pod");
                 let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
-                match delete_cluster_resource(&project, &cfg, kind, ns, name) {
+                let force = v.get("force").and_then(Value::as_bool).unwrap_or(false);
+                match delete_cluster_resource_opts(&project, &cfg, kind, ns, name, force) {
                     Ok(msg) => {
                         if let Some(ref mut snap) = self.snapshot {
                             snap.resources.retain(|r| !(r.kind == kind && r.namespace == ns && r.name == name));
@@ -746,6 +747,7 @@ impl KubernetesPlugin {
                 let project = resolve_project(ctx)?;
                 let mut cfg = KubeConfigState::load();
                 self.ensure_catalog_loaded(&project, &mut cfg);
+                let force = v.get("force").and_then(Value::as_bool).unwrap_or(false);
                 let items = v.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
                 if items.is_empty() {
                     return Ok(());
@@ -758,13 +760,14 @@ impl KubernetesPlugin {
                     let kind = item.get("kind").and_then(Value::as_str).unwrap_or("Pod");
                     let ns = item.get("namespace").and_then(Value::as_str).unwrap_or("");
                     let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                    let item_force = item.get("force").and_then(Value::as_bool).unwrap_or(force);
                     if name.is_empty() {
                         continue;
                     }
                     if !touched_kinds.iter().any(|k: &String| k == kind) {
                         touched_kinds.push(kind.to_owned());
                     }
-                    match delete_cluster_resource(&project, &cfg, kind, ns, name) {
+                    match delete_cluster_resource_opts(&project, &cfg, kind, ns, name, item_force) {
                         Ok(_) => {
                             deleted.push(if ns.is_empty() {
                                 format!("{kind}/{name}")

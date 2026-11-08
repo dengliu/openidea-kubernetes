@@ -3331,6 +3331,18 @@ pub fn delete_cluster_resource(
     namespace: &str,
     name: &str,
 ) -> Result<String, Error> {
+    delete_cluster_resource_opts(project, cfg, kind, namespace, name, false)
+}
+
+/// Deletes a cluster resource, optionally forcing immediate removal (`--force --grace-period=0`).
+pub fn delete_cluster_resource_opts(
+    project: &Project,
+    cfg: &KubeConfigState,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    force: bool,
+) -> Result<String, Error> {
     if kind == "HelmRelease" {
         let mut args = Vec::new();
         if !cfg.kubeconfig.trim().is_empty() {
@@ -3356,6 +3368,9 @@ pub fn delete_cluster_resource(
     let mut args =
         if cluster_scoped || namespace.is_empty() { cfg.base_args(false) } else { cfg.target_args(Some(namespace)) };
     args.extend(["delete".into(), target_type, name.to_owned(), "--wait=false".into()]);
+    if force {
+        args.extend(["--force".into(), "--grace-period=0".into()]);
+    }
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
         return Err(Error::Failed(first_line_or(&out.stderr, "kubectl delete failed")));

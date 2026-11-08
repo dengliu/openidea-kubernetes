@@ -856,6 +856,8 @@ export function App() {
   const [selectedRowKey, setSelectedRowKey] = useState<string | null>(null);
   const [checkedRows, setCheckedRows] = useState<Record<string, boolean>>({});
   const [bulkDeleteConfirmOpen, setBulkDeleteConfirmOpen] = useState<boolean>(false);
+  const [bulkDeleteForce, setBulkDeleteForce] = useState<boolean>(false);
+  const drawerResizeJustEndedRef = useRef<boolean>(false);
   const [sortCol, setSortCol] = useState<string>("name");
   const [sortAsc, setSortAsc] = useState<boolean>(true);
   const [colMenuOpen, setColMenuOpen] = useState<boolean>(false);
@@ -1319,6 +1321,7 @@ export function App() {
 
   function startDrawerResize(e: React.MouseEvent) {
     e.preventDefault();
+    e.stopPropagation();
     const startX = e.clientX;
     const startW = drawerWidth;
     const onMove = (ev: MouseEvent) => {
@@ -1327,6 +1330,10 @@ export function App() {
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      drawerResizeJustEndedRef.current = true;
+      window.setTimeout(() => {
+        drawerResizeJustEndedRef.current = false;
+      }, 60);
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -1410,12 +1417,13 @@ export function App() {
     [filteredResources, checkedRows],
   );
 
-  function executeBulkDelete() {
+  function executeBulkDelete(forceDelete = bulkDeleteForce) {
     if (selectedCheckedResources.length === 0) return;
     const items = selectedCheckedResources.map((r) => ({
       kind: r.kind,
       namespace: r.namespace || "",
       name: r.name,
+      force: forceDelete,
     }));
     const removedSet = new Set(selectedCheckedResources.map((r) => `${r.kind}:${r.namespace}/${r.name}`));
     if (selectedRowKey && removedSet.has(selectedRowKey)) {
@@ -1424,8 +1432,9 @@ export function App() {
     }
     setCheckedRows({});
     setBulkDeleteConfirmOpen(false);
+    setBulkDeleteForce(false);
     setBanner({
-      text: `Removing ${items.length} selected item(s)…`,
+      text: `${forceDelete ? "Force-removing" : "Removing"} ${items.length} selected item(s)…`,
       isError: false,
     });
     setSnapshot((prev) => ({
@@ -1437,6 +1446,7 @@ export function App() {
     }));
     sendToBackend({
       op: "delete-batch",
+      force: forceDelete,
       items,
     });
   }
@@ -2066,6 +2076,9 @@ export function App() {
         setClusterMenuOpen(false);
         setNsMenuOpen(false);
         setHotbarContextMenu(null);
+        if (!drawerResizeJustEndedRef.current) {
+          setDrawerOpen(false);
+        }
       }}
     >
       {/* Far-left Freelens Hotbar rail */}
@@ -2707,7 +2720,18 @@ export function App() {
                       <tr
                         key={rowKey}
                         className={isSel ? "selected" : ""}
-                        onClick={() => openResourceDrawer(res, "overview")}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setColMenuOpen(false);
+                          setClusterMenuOpen(false);
+                          setNsMenuOpen(false);
+                          setHotbarContextMenu(null);
+                          if (isSel) {
+                            setDrawerOpen(false);
+                          } else {
+                            openResourceDrawer(res, "overview");
+                          }
+                        }}
                       >
                         {activeKind !== "Node" && (
                           <td style={{ textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
@@ -2782,7 +2806,13 @@ export function App() {
 
         {/* Bulk Remove Confirmation Modal */}
         {bulkDeleteConfirmOpen && selectedCheckedResources.length > 0 && (
-          <div className="fl-pf-modal-backdrop" onClick={() => setBulkDeleteConfirmOpen(false)}>
+          <div
+            className="fl-pf-modal-backdrop"
+            onClick={(e) => {
+              e.stopPropagation();
+              setBulkDeleteConfirmOpen(false);
+            }}
+          >
             <div
               className="fl-pf-modal"
               style={{ width: 460 }}
@@ -2805,12 +2835,25 @@ export function App() {
                     </div>
                   ))}
                 </div>
+                {activeKind !== "HelmRelease" && (
+                  <label className="fl-pf-checkbox-row" style={{ marginTop: 2 }}>
+                    <input
+                      type="checkbox"
+                      checked={bulkDeleteForce}
+                      onChange={(e) => setBulkDeleteForce(e.target.checked)}
+                    />
+                    <span>Force delete (--force --grace-period=0)</span>
+                  </label>
+                )}
               </div>
               <div className="fl-pf-modal-footer">
                 <button
                   type="button"
                   className="fl-pf-cancel-btn"
-                  onClick={() => setBulkDeleteConfirmOpen(false)}
+                  onClick={() => {
+                    setBulkDeleteConfirmOpen(false);
+                    setBulkDeleteForce(false);
+                  }}
                 >
                   Cancel
                 </button>
@@ -2818,9 +2861,9 @@ export function App() {
                   type="button"
                   className="fl-bulk-remove-confirm-btn"
                   autoFocus
-                  onClick={executeBulkDelete}
+                  onClick={() => executeBulkDelete(bulkDeleteForce)}
                 >
-                  Remove
+                  {bulkDeleteForce ? "Force Remove" : "Remove"}
                 </button>
               </div>
             </div>
@@ -3258,11 +3301,19 @@ export function App() {
                   className="fl-drawer-act-btn"
                   title="Delete Resource"
                   onClick={() => {
+                    const removedKey = `${selectedResource.kind}:${selectedResource.namespace}/${selectedResource.name}`;
+                    setSnapshot((prev) => ({
+                      ...prev,
+                      resources: (prev.resources || []).filter(
+                        (r) => `${r.kind}:${r.namespace}/${r.name}` !== removedKey,
+                      ),
+                    }));
                     sendToBackend({
                       op: "delete",
                       kind: selectedResource.kind,
                       namespace: selectedResource.namespace,
                       name: selectedResource.name,
+                      force: false,
                     });
                     setDrawerOpen(false);
                   }}
@@ -3274,6 +3325,38 @@ export function App() {
                     />
                   </svg>
                 </button>
+                {selectedResource.kind !== "Node" && selectedResource.kind !== "HelmRelease" && (
+                  <button
+                    className="fl-drawer-act-btn"
+                    title="Force Delete Resource (--force --grace-period=0)"
+                    onClick={() => {
+                      const removedKey = `${selectedResource.kind}:${selectedResource.namespace}/${selectedResource.name}`;
+                      setSnapshot((prev) => ({
+                        ...prev,
+                        resources: (prev.resources || []).filter(
+                          (r) => `${r.kind}:${r.namespace}/${r.name}` !== removedKey,
+                        ),
+                      }));
+                      sendToBackend({
+                        op: "delete",
+                        kind: selectedResource.kind,
+                        namespace: selectedResource.namespace,
+                        name: selectedResource.name,
+                        force: true,
+                      });
+                      setDrawerOpen(false);
+                    }}
+                  >
+                    <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                      <path
+                        fillRule="evenodd"
+                        clipRule="evenodd"
+                        d="M15.25 4.5h-2.62l-.75-.75h-3.76l-.75.75H4.75V6h10.5V4.5zM5.5 7.5v9c0 .83.67 1.5 1.5 1.5h6c.83 0 1.5-.67 1.5-1.5v-9h-9zm2.56 2.94a.65.65 0 0 1 .92 0L10 11.48l1.02-1.04a.65.65 0 1 1 .92.92L10.92 12.4l1.02 1.04a.65.65 0 1 1-.92.92L10 13.32l-1.02 1.04a.65.65 0 0 1-.92-.92l1.02-1.04-1.02-1.04a.65.65 0 0 1 0-.92z"
+                        fill="#ffffff"
+                      />
+                    </svg>
+                  </button>
+                )}
                 <button className="fl-drawer-act-btn" title="Close" onClick={() => setDrawerOpen(false)}>
                   <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                     <path d="M5 5l10 10M15 5L5 15" stroke="#ffffff" strokeWidth="2.2" strokeLinecap="round" />
@@ -3502,7 +3585,13 @@ export function App() {
         )}
 
         {pfModal && (
-          <div className="fl-pf-modal-backdrop" onClick={() => setPfModal(null)}>
+          <div
+            className="fl-pf-modal-backdrop"
+            onClick={(e) => {
+              e.stopPropagation();
+              setPfModal(null);
+            }}
+          >
             <div className="fl-pf-modal" onClick={(e) => e.stopPropagation()}>
               <div className="fl-pf-modal-header">
                 <span>Port Forwarding for </span>
