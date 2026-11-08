@@ -935,6 +935,29 @@ export function App() {
     return () => window.clearInterval(id);
   }, []);
 
+  // Support Cmd/Ctrl + =/-/0 font size zoom inside the Kubernetes plugin window
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+      const root = document.documentElement;
+      const cur = Math.round((parseFloat(root.style.zoom || "1") || 1) * 100);
+      if (e.key === "=" || e.key === "+" || e.code === "Equal" || e.code === "NumpadAdd") {
+        e.preventDefault();
+        const next = Math.min(200, cur + 8);
+        root.style.zoom = next === 100 ? "" : (next / 100).toFixed(2);
+      } else if (e.key === "-" || e.key === "_" || e.code === "Minus" || e.code === "NumpadSubtract") {
+        e.preventDefault();
+        const next = Math.max(60, cur - 8);
+        root.style.zoom = next === 100 ? "" : (next / 100).toFixed(2);
+      } else if (e.key === "0" || e.code === "Digit0" || e.code === "Numpad0") {
+        e.preventDefault();
+        root.style.zoom = "";
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   // Live 5-second background category poll so resource status, metrics, and deleted pods stay fresh
   useEffect(() => {
     if (!snapshot.connected || activeKind === "ClusterCatalog" || activeKind === "Workspace") return;
