@@ -2076,13 +2076,14 @@ pub fn fetch_helm_into_snapshot(project: &Project, cfg: &KubeConfigState, snap: 
     if !cfg.context.trim().is_empty() {
         helm_args.push(format!("--kube-context={}", cfg.context.trim()));
     }
+    helm_args.extend(["list".into(), "-a".into()]);
     if cfg.all_namespaces {
         helm_args.push("-A".into());
     } else if !cfg.namespace.trim().is_empty() {
         helm_args.push("-n".into());
         helm_args.push(cfg.namespace.trim().to_owned());
     }
-    helm_args.extend(["list".into(), "-o".into(), "json".into()]);
+    helm_args.extend(["-o".into(), "json".into()]);
     if let Ok(out) = project.run_process("helm", &helm_args, None)
         && out.status == Some(0)
     {

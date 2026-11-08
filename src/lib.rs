@@ -517,6 +517,7 @@ impl KubernetesPlugin {
                             }
                             snap.current_namespace = ns.to_owned();
                             snap.all_namespaces = false;
+                            snap.helm_releases.clear();
                             snap.resources.retain(|r| {
                                 matches!(r.kind.as_str(), "Namespace" | "Node" | "CustomResourceDefinition")
                             });
@@ -544,6 +545,7 @@ impl KubernetesPlugin {
                             fetch_namespaces_into_snapshot(&project, &cfg, snap);
                         }
                         snap.all_namespaces = all;
+                        snap.helm_releases.clear();
                         snap.resources
                             .retain(|r| matches!(r.kind.as_str(), "Namespace" | "Node" | "CustomResourceDefinition"));
                         fetch_category_into_snapshot(&project, &cfg, snap, cat);
