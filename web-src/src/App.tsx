@@ -859,6 +859,16 @@ export function App() {
   const [logPrevious, setLogPrevious] = useState<boolean>(false);
   const [logContainerMenuOpen, setLogContainerMenuOpen] = useState<boolean>(false);
   const [shellContainerMenuOpen, setShellContainerMenuOpen] = useState<boolean>(false);
+  const [pfModal, setPfModal] = useState<{
+    kind: string;
+    namespace: string;
+    name: string;
+    port: string;
+    address: string;
+    localPort: string;
+    https: boolean;
+    openInBrowser: boolean;
+  } | null>(null);
 
   // Searchable Namespace Picker state
   const [nsMenuOpen, setNsMenuOpen] = useState<boolean>(false);
@@ -1558,7 +1568,7 @@ export function App() {
             <div className="fl-line-progress">
               <div
                 className="fl-line-progress-fill"
-                style={{ width: `${pct > 0 ? Math.max(3, pct) : 0}%`, background: "#4db6ac" }}
+                style={{ width: `${pct > 0 ? Math.max(3, pct) : 0}%`, background: "#326ce5" }}
               />
             </div>
             <div className="fl-node-metric-text">{`${uStr} / ${aStr}`}</div>
@@ -1740,7 +1750,7 @@ export function App() {
       <div className="fl-hotbar">
         <div
           className={`fl-hb-item ${activeKind === "ClusterCatalog" ? "active" : ""}`}
-          style={{ background: "#00a7a0" }}
+          style={{ background: "#326ce5" }}
           title={`Cluster Catalog (${catalogList.length} clusters)`}
           onClick={() => handleSelectKind("ClusterCatalog")}
         >
@@ -2659,16 +2669,15 @@ export function App() {
                     title="Port Forward (kubectl port-forward)"
                     onClick={() => {
                       const port = (selectedResource.ports && selectedResource.ports[0]) || "8080";
-                      setBanner({
-                        text: `Starting port-forward for ${selectedResource.kind}/${selectedResource.name} (${port})…`,
-                        isError: false,
-                      });
-                      sendToBackend({
-                        op: "port-forward",
+                      setPfModal({
                         kind: selectedResource.kind,
                         namespace: selectedResource.namespace,
                         name: selectedResource.name,
                         port,
+                        address: "localhost",
+                        localPort: "",
+                        https: false,
+                        openInBrowser: true,
                       });
                     }}
                   >
@@ -2985,22 +2994,139 @@ export function App() {
                   onSelectNamespace={handleSelectNamespace}
                   onSelectKind={handleSelectKind}
                   onOpenResourceByRef={openResourceByRef}
-                  onPortForward={(kind, ns, name, port) => {
-                    setBanner({
-                      text: `Starting port-forward for ${kind}/${name} (${port})…`,
-                      isError: false,
-                    });
+                  onPortForward={(kind, ns, name, port, openDialog) => {
+                    if (openDialog) {
+                      setPfModal({
+                        kind,
+                        namespace: ns,
+                        name,
+                        port,
+                        address: "localhost",
+                        localPort: "",
+                        https: false,
+                        openInBrowser: true,
+                      });
+                      return;
+                    }
                     sendToBackend({
                       op: "port-forward",
+                      context: snapshot.current_context,
                       kind,
                       namespace: ns,
                       name,
                       port,
+                      localPort: "",
+                      address: "localhost",
+                      https: false,
+                      openInBrowser: true,
                     });
                   }}
                 />
               </div>
             )}
+          </div>
+        )}
+
+        {pfModal && (
+          <div className="fl-pf-modal-backdrop" onClick={() => setPfModal(null)}>
+            <div className="fl-pf-modal" onClick={(e) => e.stopPropagation()}>
+              <div className="fl-pf-modal-header">
+                <span>Port Forwarding for </span>
+                <span className="fl-pf-modal-target">{pfModal.name}</span>
+              </div>
+              <div className="fl-pf-modal-body">
+                <div className="fl-pf-row">
+                  <label className="fl-pf-label">
+                    <span>Addresses to listen on (comma separated):</span>
+                    <span
+                      className="fl-pf-info-icon"
+                      title="Specify one or more local addresses (e.g. localhost, 127.0.0.1, 0.0.0.0)"
+                    >
+                      i
+                    </span>
+                  </label>
+                  <input
+                    type="text"
+                    className="fl-pf-underline-input"
+                    value={pfModal.address}
+                    onChange={(e) => setPfModal({ ...pfModal, address: e.target.value })}
+                  />
+                </div>
+                <div className="fl-pf-row">
+                  <label className="fl-pf-label">Local port to forward from:</label>
+                  <input
+                    type="text"
+                    className="fl-pf-underline-input"
+                    placeholder="Random"
+                    value={pfModal.localPort}
+                    onChange={(e) => setPfModal({ ...pfModal, localPort: e.target.value.replace(/[^\d]/g, "") })}
+                    autoFocus
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        sendToBackend({
+                          op: "port-forward",
+                          context: snapshot.current_context,
+                          kind: pfModal.kind,
+                          namespace: pfModal.namespace,
+                          name: pfModal.name,
+                          port: pfModal.port,
+                          localPort: pfModal.localPort.trim(),
+                          address: pfModal.address.trim() || "localhost",
+                          https: pfModal.https,
+                          openInBrowser: pfModal.openInBrowser,
+                        });
+                        setPfModal(null);
+                      } else if (e.key === "Escape") {
+                        setPfModal(null);
+                      }
+                    }}
+                  />
+                </div>
+                <label className="fl-pf-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={pfModal.https}
+                    onChange={(e) => setPfModal({ ...pfModal, https: e.target.checked })}
+                  />
+                  <span>https</span>
+                </label>
+                <label className="fl-pf-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={pfModal.openInBrowser}
+                    onChange={(e) => setPfModal({ ...pfModal, openInBrowser: e.target.checked })}
+                  />
+                  <span>Open in Browser</span>
+                </label>
+              </div>
+              <div className="fl-pf-modal-footer">
+                <button type="button" className="fl-pf-cancel-btn" onClick={() => setPfModal(null)}>
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="fl-pf-start-btn"
+                  onClick={() => {
+                    sendToBackend({
+                      op: "port-forward",
+                      context: snapshot.current_context,
+                      kind: pfModal.kind,
+                      namespace: pfModal.namespace,
+                      name: pfModal.name,
+                      port: pfModal.port,
+                      localPort: pfModal.localPort.trim(),
+                      address: pfModal.address.trim() || "localhost",
+                      https: pfModal.https,
+                      openInBrowser: pfModal.openInBrowser,
+                    });
+                    setPfModal(null);
+                  }}
+                >
+                  Start
+                </button>
+              </div>
+            </div>
           </div>
         )}
         </div>

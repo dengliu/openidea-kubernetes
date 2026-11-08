@@ -43,12 +43,6 @@
       "description": "Container image (image:tag) used for the custom Debug Shell option on Pods and Nodes.",
       "default": "dengliu/k8sdebugger:3cfd912"
     },
-    "portForwardLocalPort": {
-      "type": "integer",
-      "title": "Default local port for Port Forward",
-      "description": "Local port to bind when forwarding a Pod or Service port (0 = match target port).",
-      "default": 0
-    },
     "validateOnSave": {
       "type": "boolean",
       "title": "Inspect manifests on save",

@@ -52,8 +52,8 @@ export function PodTerminal({ context, namespace, pod, container, kind = "Pod" }
       theme: {
         background: "#14171a",
         foreground: "#e6edf3",
-        cursor: "#00a7a0",
-        selectionBackground: "rgba(0, 167, 160, 0.32)",
+        cursor: "#326ce5",
+        selectionBackground: "rgba(50, 108, 229, 0.32)",
         black: "#14171a",
         red: "#ff7b72",
         green: "#3fb950",

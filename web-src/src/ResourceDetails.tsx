@@ -15,7 +15,7 @@ export interface ResourceDetailsProps {
   onSelectNamespace: (ns: string) => void;
   onSelectKind?: (kind: string) => void;
   onOpenResourceByRef: (kind: string, name: string, namespace?: string) => void;
-  onPortForward: (kind: string, namespace: string, name: string, port: string) => void;
+  onPortForward: (kind: string, namespace: string, name: string, port: string, openDialog?: boolean) => void;
 }
 
 const BINARY_PREFIXES: Record<string, number> = {
@@ -205,7 +205,7 @@ function DrawerSectionBanner({ children }: { children: React.ReactNode }) {
 
 function LineProgress({ value, max, tooltip }: { value: number; max: number; tooltip?: string }) {
   const pct = max > 0 ? Math.min(100, Math.max(0, (value / max) * 100)) : 0;
-  const barColor = pct >= 90 ? "#ce3933" : pct >= 75 ? "#ff9800" : "#00a7a0";
+  const barColor = pct >= 90 ? "#ce3933" : pct >= 75 ? "#ff9800" : "#326ce5";
   return (
     <div className="fl-line-progress" title={tooltip}>
       <div
@@ -633,7 +633,7 @@ function PodContainerSection({
   podName: string;
   namespace: string;
   onOpenResourceByRef: (kind: string, name: string, namespace?: string) => void;
-  onPortForward: (kind: string, namespace: string, name: string, port: string) => void;
+  onPortForward: (kind: string, namespace: string, name: string, port: string, openDialog?: boolean) => void;
 }) {
   if (!Array.isArray(containers) || containers.length === 0) return null;
 
@@ -701,17 +701,24 @@ function PodContainerSection({
             )}
             {Array.isArray(c.ports) && c.ports.length > 0 && (
               <DrawerRow name="Ports">
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                   {c.ports.map((p: any, i: number) => (
-                    <div key={i}>
+                    <div key={i} className="fl-port-item-row">
                       <span
-                        className="fl-link-teal"
-                        title="Click to port-forward"
-                        onClick={() => onPortForward("Pod", namespace, podName, String(p.containerPort))}
+                        className="fl-link-teal fl-port-link"
+                        title="Open in a browser"
+                        onClick={() => onPortForward("Pod", namespace, podName, String(p.containerPort), false)}
                       >
                         {p.name ? `${p.name}: ` : ""}
                         {p.containerPort}/{p.protocol || "TCP"}
                       </span>
+                      <button
+                        type="button"
+                        className="fl-port-forward-btn"
+                        onClick={() => onPortForward("Pod", namespace, podName, String(p.containerPort), true)}
+                      >
+                        Forward...
+                      </button>
                     </div>
                   ))}
                 </div>
@@ -1635,14 +1642,14 @@ export function ResourceDetails({
           )}
           {Array.isArray(spec.ports) && spec.ports.length > 0 && (
             <DrawerRow name="Ports">
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 {spec.ports.map((p: any, i: number) => (
-                  <div key={i}>
+                  <div key={i} className="fl-port-item-row">
                     <span
-                      className="fl-link-teal"
-                      title="Click to port-forward"
+                      className="fl-link-teal fl-port-link"
+                      title="Open in a browser"
                       onClick={() =>
-                        onPortForward("Service", selectedResource.namespace, selectedResource.name, String(p.port))
+                        onPortForward("Service", selectedResource.namespace, selectedResource.name, String(p.port), false)
                       }
                     >
                       {p.name ? `${p.name}: ` : ""}
@@ -1650,6 +1657,15 @@ export function ResourceDetails({
                       {p.targetPort ? `:${p.targetPort}` : ""}
                       {p.nodePort ? ` (nodePort: ${p.nodePort})` : ""}/{p.protocol || "TCP"}
                     </span>
+                    <button
+                      type="button"
+                      className="fl-port-forward-btn"
+                      onClick={() =>
+                        onPortForward("Service", selectedResource.namespace, selectedResource.name, String(p.port), true)
+                      }
+                    >
+                      Forward...
+                    </button>
                   </div>
                 ))}
               </div>

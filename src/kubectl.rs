@@ -19,7 +19,6 @@ pub struct KubeConfigState {
     pub tail_lines: u32,
     pub shell: String,
     pub debugger_image: String,
-    pub port_forward_local_port: u32,
 }
 
 impl KubeConfigState {
@@ -48,8 +47,6 @@ impl KubeConfigState {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_DEBUGGER_IMAGE.into());
-        let port_forward_local_port =
-            host::setting_number("portForwardLocalPort").map(|n| n.max(0.0) as u32).unwrap_or(0);
 
         Self {
             kubeconfig,
@@ -59,7 +56,6 @@ impl KubeConfigState {
             tail_lines,
             shell,
             debugger_image,
-            port_forward_local_port,
         }
     }
 
@@ -2960,27 +2956,66 @@ pub fn exec_pod_command(
 }
 
 /// Opens a terminal running `kubectl port-forward`.
+/// Never defaults to forwarding onto the same local port number: when `local_port` is omitted/empty,
+/// binds a random available local port (`:<target_port>` or an ephemeral port `49152..=65000` when `open_in_browser` is true).
+#[allow(clippy::too_many_arguments)]
 pub fn open_port_forward_terminal(
     cfg: &KubeConfigState,
     kind: &str,
     namespace: &str,
     name: &str,
     port_spec: &str,
+    local_port: Option<&str>,
+    address: Option<&str>,
+    https: bool,
+    open_in_browser: bool,
 ) -> Result<(), Error> {
     let mut args = cfg.target_args(Some(namespace));
     args.push("port-forward".into());
+    let addr = address.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("localhost");
+    if addr != "localhost" && addr != "127.0.0.1" {
+        args.push(format!("--address={addr}"));
+    }
     let resource_target = format!("{}/{name}", kind.to_ascii_lowercase());
-    args.push(resource_target.clone());
-    let mapping = if port_spec.contains(':') {
-        port_spec.to_owned()
-    } else if cfg.port_forward_local_port > 0 {
-        format!("{}:{port_spec}", cfg.port_forward_local_port)
+    args.push(resource_target);
+
+    let target_port = if port_spec.trim().is_empty() { "8080" } else { port_spec.trim() };
+    let clean_local = local_port
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("random") && *s != "0");
+
+    let (mapping, resolved_local_port): (String, Option<String>) = if target_port.contains(':') {
+        let lp = target_port.split(':').next().filter(|s| !s.is_empty()).map(str::to_owned);
+        (target_port.to_owned(), lp)
+    } else if let Some(lp) = clean_local {
+        (format!("{lp}:{target_port}"), Some(lp.to_owned()))
+    } else if open_in_browser {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(12345);
+        let ephem = 49152 + (nanos % 15000);
+        (format!("{ephem}:{target_port}"), Some(ephem.to_string()))
     } else {
-        let p = if port_spec.is_empty() { "8080" } else { port_spec };
-        format!("{p}:{p}")
+        (format!(":{target_port}"), None)
     };
+
     args.push(mapping.clone());
-    host::open_terminal(&format!("k8s port-forward: {name} ({mapping})"), "kubectl", &args)
+    host::open_terminal(&format!("Port Forward: {name} ({mapping})"), "kubectl", &args)?;
+
+    if open_in_browser
+        && let Some(lp) = resolved_local_port
+    {
+        let scheme = if https { "https" } else { "http" };
+        let first_host = addr
+            .split(',')
+            .next()
+            .map(str::trim)
+            .filter(|h| !h.is_empty() && *h != "0.0.0.0" && *h != "::")
+            .unwrap_or("localhost");
+        let _ = host::open_url(&format!("{scheme}://{first_host}:{lp}"));
+    }
+    Ok(())
 }
 
 /// Scales a workload (`kubectl scale --replicas=N`).

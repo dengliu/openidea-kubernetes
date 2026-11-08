@@ -626,12 +626,19 @@ impl KubernetesPlugin {
                 let _ = host::post_view_message(VIEW_ID, &out.to_string());
             }
             "port-forward" => {
-                let cfg = KubeConfigState::load();
+                let mut cfg = KubeConfigState::load();
+                if let Some(c) = v.get("context").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    cfg.context = c.to_owned();
+                }
                 let kind = v.get("kind").and_then(Value::as_str).unwrap_or("Pod");
                 let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let port = v.get("port").and_then(Value::as_str).unwrap_or("8080");
-                open_port_forward_terminal(&cfg, kind, ns, name, port)?;
+                let local_port = v.get("localPort").and_then(Value::as_str);
+                let address = v.get("address").and_then(Value::as_str);
+                let https = v.get("https").and_then(Value::as_bool).unwrap_or(false);
+                let open_in_browser = v.get("openInBrowser").and_then(Value::as_bool).unwrap_or(false);
+                open_port_forward_terminal(&cfg, kind, ns, name, port, local_port, address, https, open_in_browser)?;
             }
             "scale" => {
                 let project = resolve_project(ctx)?;
@@ -1201,7 +1208,7 @@ impl Plugin for KubernetesPlugin {
             "port-forward" => {
                 let cfg = KubeConfigState::load();
                 let (kind, ns, name, port) = self.resolve_port_forward_target(ctx, arg, &cfg)?;
-                open_port_forward_terminal(&cfg, &kind, &ns, &name, &port)?;
+                open_port_forward_terminal(&cfg, &kind, &ns, &name, &port, None, None, false, false)?;
                 Ok(Some(format!("{kind}/{name}:{port}")))
             }
             "scale" => {
