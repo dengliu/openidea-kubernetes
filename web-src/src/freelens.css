@@ -11,8 +11,11 @@
   --fl-bg-hover: var(--openidea-bg-hover, rgba(128, 128, 128, 0.1));
   --fl-fg: var(--openidea-fg, #262b31);
   --fl-fg-muted: var(--openidea-fg-muted, #6c757d);
+  --fl-text: var(--fl-fg);
+  --fl-text-muted: var(--fl-fg-muted);
+  --fl-teal-text: color-mix(in srgb, var(--fl-teal) 72%, var(--fl-fg));
   --fl-border: var(--openidea-border, #e1e4e8);
-  --fl-chip-bg: color-mix(in srgb, var(--fl-fg) 9%, transparent);
+  --fl-chip-bg: color-mix(in srgb, var(--fl-fg) 10%, transparent);
   --fl-font: var(--openidea-font-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
   --fl-mono: var(--openidea-font-mono, "SF Mono", Menlo, Monaco, Consolas, monospace);
 }
@@ -199,7 +202,7 @@ body,
 }
 
 .fl-tree-group-header.active-leaf {
-  color: var(--fl-teal);
+  color: var(--fl-teal-text);
   font-weight: 600;
 }
 
@@ -248,7 +251,7 @@ body,
 }
 
 .fl-tree-child.active {
-  color: var(--fl-teal);
+  color: var(--fl-teal-text);
   font-weight: 600;
 }
 
@@ -324,9 +327,11 @@ body,
   padding: 8px 16px;
   font-size: 12.5px;
   line-height: 1.4;
-  background: var(--fl-teal-tint);
-  color: var(--fl-teal);
+  background: color-mix(in srgb, var(--fl-teal) 14%, var(--fl-bg));
+  color: color-mix(in srgb, var(--fl-teal) 55%, var(--fl-fg));
   border-bottom: 1px solid var(--fl-border);
+  border-left: 3px solid var(--fl-teal);
+  font-weight: 500;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -340,8 +345,9 @@ body,
 }
 
 .fl-banner.error {
-  background: rgba(217, 83, 79, 0.14);
-  color: var(--fl-red);
+  background: color-mix(in srgb, #d32f2f 14%, var(--fl-bg));
+  color: color-mix(in srgb, #b71c1c 60%, var(--fl-fg));
+  border-left-color: #d32f2f;
 }
 
 .fl-banner-text {
@@ -539,7 +545,7 @@ body,
 }
 
 .fl-link-teal {
-  color: var(--fl-teal);
+  color: var(--fl-teal-text);
   cursor: pointer;
   text-decoration: none;
 }
@@ -581,15 +587,18 @@ body,
 
 /* Status text coloring matching Freelens */
 .fl-status-text.ok {
-  color: var(--fl-green);
+  color: color-mix(in srgb, #2e7d32 76%, var(--fl-fg));
+  font-weight: 500;
 }
 
 .fl-status-text.warn {
-  color: var(--fl-orange);
+  color: color-mix(in srgb, #d97706 78%, var(--fl-fg));
+  font-weight: 500;
 }
 
 .fl-status-text.err {
-  color: var(--fl-red);
+  color: color-mix(in srgb, #c62828 78%, var(--fl-fg));
+  font-weight: 500;
 }
 
 /* Column visibility & order popover menu */
@@ -916,19 +925,22 @@ body,
 
 .fl-sched-badge {
   display: inline-block;
-  padding: 2px 7px;
-  border-radius: 3px;
+  padding: 2px 8px;
+  border-radius: 4px;
   font-size: 11.5px;
-  font-weight: 500;
+  font-weight: 600;
   background: var(--fl-chip-bg);
+  color: var(--fl-fg);
 }
 
 .fl-sched-badge.true {
-  color: #2e7d32;
+  background: #2e7d32;
+  color: #ffffff;
 }
 
 .fl-sched-badge.false {
-  color: #c62828;
+  background: #c62828;
+  color: #ffffff;
 }
 
 .fl-param-toggler {
@@ -1061,23 +1073,24 @@ body,
   padding: 2px 8px;
   border-radius: 4px;
   font-size: 11.5px;
-  font-weight: 500;
+  font-weight: 600;
+  line-height: 1.4;
 }
 
 .fl-cond-badge.ok {
-  background: color-mix(in srgb, #2e7d32 20%, var(--fl-chip-bg));
-  color: #4caf50;
+  background: #2e7d32;
+  color: #ffffff;
 }
 
 .fl-cond-badge.danger {
-  background: color-mix(in srgb, #c62828 22%, var(--fl-chip-bg));
-  color: #ef5350;
+  background: #c62828;
+  color: #ffffff;
 }
 
 .fl-cond-badge.muted {
-  background: var(--fl-chip-bg);
-  color: var(--fl-fg-muted);
-  opacity: 0.78;
+  background: color-mix(in srgb, var(--fl-fg) 10%, var(--fl-bg));
+  color: var(--fl-fg);
+  border: 1px solid var(--fl-border);
 }
 
 .fl-container-block {
@@ -1197,8 +1210,8 @@ body,
 }
 
 .fl-log-find-toggle.active {
-  background: color-mix(in srgb, var(--fl-teal) 22%, transparent);
-  color: var(--fl-teal);
+  background: color-mix(in srgb, var(--fl-teal) 20%, var(--fl-bg));
+  color: var(--fl-teal-text);
   font-weight: 600;
 }
 
@@ -1392,8 +1405,8 @@ body,
 }
 
 .fl-ns-opt.active {
-  background: var(--fl-teal-tint);
-  color: var(--fl-teal);
+  background: color-mix(in srgb, var(--fl-teal) 16%, var(--fl-bg));
+  color: var(--fl-teal-text);
   font-weight: 600;
 }
 
