@@ -2608,15 +2608,16 @@ pub fn open_exec_terminal(
     host::open_terminal(&title, "kubectl", &args)
 }
 
-/// Probes whether the target Pod container has `/bin/sh`; if distroless (missing `/bin/sh`),
-/// automatically falls back to `open_debug_terminal` (`kubectl debug --image=busybox:latest`).
+/// Probes whether the target Pod container has `/bin/sh` before opening a Terminal tab.
+/// If the container is distroless (missing `/bin/sh`), returns a descriptive error instructing
+/// the user to choose one of the `Debug Shell` options instead of opening a failing Terminal tab.
 pub fn open_exec_or_debug_terminal(
     project: Option<&Project>,
     cfg: &KubeConfigState,
     namespace: &str,
     pod: &str,
     container: Option<&str>,
-) -> Result<(bool, ()), Error> {
+) -> Result<(), Error> {
     if let Some(proj) = project {
         let mut probe = cfg.target_args(Some(namespace));
         probe.extend(["exec".into(), pod.to_owned()]);
@@ -2624,20 +2625,33 @@ pub fn open_exec_or_debug_terminal(
             probe.extend(["-c".into(), c.to_owned()]);
         }
         probe.extend(["--".into(), "/bin/sh".into(), "-c".into(), "true".into()]);
-        if let Err(err) = run_kubectl(proj, &probe, None) {
-            let msg = err.to_string().to_lowercase();
-            if msg.contains("no such file or directory")
-                || msg.contains("executable file not found")
-                || msg.contains("oci runtime exec failed")
-                || msg.contains("stat /bin/sh")
+        let probe_err = match run_kubectl(proj, &probe, None) {
+            Ok(out) if out.status != Some(0) => Some(format!("{} {}", out.stderr, out.stdout)),
+            Err(err) => Some(err.to_string()),
+            Ok(_) => None,
+        };
+        if let Some(raw_msg) = probe_err {
+            let low = raw_msg.to_lowercase();
+            let cname = container.filter(|c| !c.is_empty()).unwrap_or(pod);
+            let custom_img = if cfg.debugger_image.trim().is_empty() {
+                DEFAULT_DEBUGGER_IMAGE
+            } else {
+                cfg.debugger_image.trim()
+            };
+            if low.contains("no such file or directory")
+                || low.contains("executable file not found")
+                || low.contains("oci runtime exec failed")
+                || low.contains("stat /bin/sh")
+                || low.contains("unable to start container process")
             {
-                open_debug_terminal(cfg, namespace, pod, container, None)?;
-                return Ok((true, ()));
+                return Err(Error::Failed(format!(
+                    "Container '{cname}' in pod '{pod}' does not have a shell (/bin/sh). Please choose 'Debug Shell (busybox:latest)' or 'Debug Shell ({custom_img})' from the Shell (>_) menu."
+                )));
             }
+            return Err(Error::Failed(first_line_or(&raw_msg, "kubectl exec failed")));
         }
     }
-    open_exec_terminal(cfg, namespace, pod, container)?;
-    Ok((false, ()))
+    open_exec_terminal(cfg, namespace, pod, container)
 }
 
 /// Opens an ephemeral debug container (`kubectl debug -it --image=<image>`) for Pods.

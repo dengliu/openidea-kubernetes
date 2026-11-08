@@ -587,13 +587,10 @@ impl KubernetesPlugin {
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let container = v.get("container").and_then(Value::as_str);
                 let project = resolve_project(ctx).ok();
-                let (used_debug, ()) = open_exec_or_debug_terminal(project.as_ref(), &cfg, ns, name, container)?;
-                if used_debug {
-                    host::notify(
-                        NotificationLevel::Info,
-                        "Kubernetes Debug Shell",
-                        &format!("{name} has no /bin/sh (distroless); opened ephemeral debug shell (busybox:latest)"),
-                    );
+                if let Err(e) = open_exec_or_debug_terminal(project.as_ref(), &cfg, ns, name, container) {
+                    let msg = e.to_string();
+                    host::notify(NotificationLevel::Error, "Kubernetes Pod Shell", &msg);
+                    Self::post_detail(msg.clone(), Some(msg), true);
                 }
             }
             "debug-shell" => {
