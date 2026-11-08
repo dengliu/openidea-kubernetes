@@ -1253,6 +1253,8 @@ export function App() {
 
   function handleSelectKind(nextKind: string) {
     setActiveKind(nextKind);
+    setSortCol(nextKind === "CustomResourceDefinition" ? "crd_resource" : nextKind === "Event" ? "age" : "name");
+    setSortAsc(true);
     setSelectedRowKey(null);
     setCheckedRows({});
     setBulkDeleteConfirmOpen(false);
@@ -1450,9 +1452,37 @@ export function App() {
         const bv = b.restarts ?? 0;
         return sortAsc ? av - bv : bv - av;
       }
-      const av = String((a as any)[sortCol] ?? a.name ?? "");
-      const bv = String((b as any)[sortCol] ?? b.name ?? "");
-      return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+      if (sortCol === "containers") {
+        const av = (a.container_states?.length || a.containers?.length || 0);
+        const bv = (b.container_states?.length || b.containers?.length || 0);
+        return sortAsc ? av - bv : bv - av;
+      }
+      const valOf = (r: ClusterResource): string => {
+        switch (sortCol) {
+          case "controlled_by":
+            return r.controlled_by_kind || r.controlled_by_name || "";
+          case "ip":
+          case "node_ip":
+            return r.pod_ip || "";
+          case "node":
+          case "node_roles":
+            return r.node_name || "";
+          case "node_version":
+          case "svc_type":
+            return r.detail || "";
+          case "cm_keys":
+            return (r.data_keys || []).join(",");
+          case "ns_labels":
+            return (r.labels || []).join(",");
+          case "crd_resource":
+            return r.name.split(".")[0] || r.name;
+          default:
+            return String((r as any)[sortCol] ?? r.name ?? "");
+        }
+      };
+      const av = valOf(a);
+      const bv = valOf(b);
+      return sortAsc ? av.localeCompare(bv, undefined, { numeric: true }) : bv.localeCompare(av, undefined, { numeric: true });
     });
   }, [snapshot.resources, snapshot.helm_releases, activeKind, searchQuery, sortCol, sortAsc]);
 
@@ -2546,11 +2576,38 @@ export function App() {
               <thead>
                 <tr>
                   {visibleCols.map((col) => (
-                    <th key={col.id} style={{ width: getColWidth(col) }}>
-                      {col.label}
+                    <th
+                      key={col.id}
+                      className="sortable"
+                      style={{ width: getColWidth(col), textAlign: col.align || "left" }}
+                      onClick={() => {
+                        if (sortCol === col.id) setSortAsc((v) => !v);
+                        else {
+                          setSortCol(col.id);
+                          setSortAsc(true);
+                        }
+                      }}
+                    >
+                      <span>{col.label}</span>
+                      {sortCol === col.id && <span style={{ marginLeft: 4 }}>{sortAsc ? "▲" : "▼"}</span>}
                       <div className="fl-col-resizer" onMouseDown={(e) => startColResize(e, col)} />
                     </th>
                   ))}
+                  <th style={{ width: 44, textAlign: "right", paddingRight: 12 }}>
+                    <button
+                      type="button"
+                      className="fl-col-menu-btn"
+                      title="Customize table columns"
+                      aria-label="Customize table columns"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setRowActionMenu(null);
+                        setColMenuOpen((v) => !v);
+                      }}
+                    >
+                      ⋮
+                    </button>
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -2561,6 +2618,35 @@ export function App() {
                       c.name.toLowerCase().includes(searchQuery.trim().toLowerCase()) ||
                       (c.distro || "").toLowerCase().includes(searchQuery.trim().toLowerCase()),
                   )
+                  .slice()
+                  .sort((a, b) => {
+                    if (sortCol === "nodes") {
+                      const av = a.nodes ?? -1;
+                      const bv = b.nodes ?? -1;
+                      return sortAsc ? av - bv : bv - av;
+                    }
+                    const valOf = (c: ClusterContextInfo): string => {
+                      switch (sortCol) {
+                        case "source":
+                          return "local";
+                        case "labels":
+                          return c.source || "~/.kube/config";
+                        case "distro":
+                          return c.distro || "";
+                        case "version":
+                          return c.version || "";
+                        case "status":
+                          return c.name === snapshot.current_context ? "connected" : "disconnected";
+                        default:
+                          return c.name || "";
+                      }
+                    };
+                    const av = valOf(a);
+                    const bv = valOf(b);
+                    return sortAsc
+                      ? av.localeCompare(bv, undefined, { numeric: true })
+                      : bv.localeCompare(av, undefined, { numeric: true });
+                  })
                   .map((c) => {
                     const isCur = c.name === snapshot.current_context;
                     const isPinned = activeHotbarNames.includes(c.name);
@@ -2634,6 +2720,7 @@ export function App() {
                           }
                           return <td key={col.id} />;
                         })}
+                        <td />
                       </tr>
                     );
                   })}
@@ -2643,54 +2730,129 @@ export function App() {
             <table className="fl-table">
               <thead>
                 <tr>
-                  <th style={{ width: 90 }}>Type</th>
-                  <th style={{ width: 360 }}>Message</th>
-                  <th style={{ width: 130 }}>Namespace</th>
-                  <th style={{ width: 200 }}>Involved Object</th>
-                  <th style={{ width: 80 }}>Count</th>
-                  <th style={{ width: 90 }}>Age</th>
+                  {(
+                    [
+                      ["type", "Type", 90],
+                      ["message", "Message", 360],
+                      ["namespace", "Namespace", 130],
+                      ["object", "Involved Object", 200],
+                      ["count", "Count", 80],
+                      ["age", "Age", 90],
+                    ] as const
+                  ).map(([id, label, width]) => (
+                    <th
+                      key={id}
+                      className="sortable"
+                      style={{ width }}
+                      onClick={() => {
+                        if (sortCol === id) setSortAsc((v) => !v);
+                        else {
+                          setSortCol(id);
+                          setSortAsc(true);
+                        }
+                      }}
+                    >
+                      <span>{label}</span>
+                      {sortCol === id && <span style={{ marginLeft: 4 }}>{sortAsc ? "▲" : "▼"}</span>}
+                    </th>
+                  ))}
                 </tr>
               </thead>
               <tbody>
-                {(snapshot.events || []).map((ev, i) => (
-                  <tr key={i}>
-                    <td>
-                      <span className={`fl-status-text ${ev.event_type === "Warning" ? "warn" : "ok"}`}>
-                        {ev.event_type}
-                      </span>
-                    </td>
-                    <td title={ev.message}>{ev.message}</td>
-                    <td>{ev.namespace}</td>
-                    <td className="fl-link-teal">
-                      {ev.kind}: {ev.object}
-                    </td>
-                    <td>{ev.count}</td>
-                    <td>{formatCompactAge(ev.last_seen)}</td>
-                  </tr>
-                ))}
+                {(snapshot.events || [])
+                  .slice()
+                  .sort((a, b) => {
+                    if (sortCol === "count") {
+                      const av = Number(a.count) || 0;
+                      const bv = Number(b.count) || 0;
+                      return sortAsc ? av - bv : bv - av;
+                    }
+                    const valOf = (ev: ClusterEvent): string => {
+                      switch (sortCol) {
+                        case "type":
+                          return ev.event_type || "";
+                        case "message":
+                          return ev.message || "";
+                        case "namespace":
+                          return ev.namespace || "";
+                        case "object":
+                          return `${ev.kind}: ${ev.object}`;
+                        case "age":
+                          return ev.last_seen || "";
+                        default:
+                          return ev.last_seen || "";
+                      }
+                    };
+                    const av = valOf(a);
+                    const bv = valOf(b);
+                    return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+                  })
+                  .map((ev, i) => (
+                    <tr key={i}>
+                      <td>
+                        <span className={`fl-status-text ${ev.event_type === "Warning" ? "warn" : "ok"}`}>
+                          {ev.event_type}
+                        </span>
+                      </td>
+                      <td title={ev.message}>{ev.message}</td>
+                      <td>{ev.namespace}</td>
+                      <td className="fl-link-teal">
+                        {ev.kind}: {ev.object}
+                      </td>
+                      <td>{ev.count}</td>
+                      <td>{formatCompactAge(ev.last_seen)}</td>
+                    </tr>
+                  ))}
               </tbody>
             </table>
           ) : activeKind === "Workspace" ? (
             <table className="fl-table">
               <thead>
                 <tr>
-                  <th style={{ width: 140 }}>Kind</th>
-                  <th style={{ width: 220 }}>Name</th>
-                  <th style={{ width: 130 }}>Namespace</th>
-                  <th>File</th>
+                  {(
+                    [
+                      ["kind", "Kind", 140],
+                      ["name", "Name", 220],
+                      ["namespace", "Namespace", 130],
+                      ["path", "File", undefined],
+                    ] as const
+                  ).map(([id, label, width]) => (
+                    <th
+                      key={id}
+                      className="sortable"
+                      style={width ? { width } : undefined}
+                      onClick={() => {
+                        if (sortCol === id) setSortAsc((v) => !v);
+                        else {
+                          setSortCol(id);
+                          setSortAsc(true);
+                        }
+                      }}
+                    >
+                      <span>{label}</span>
+                      {sortCol === id && <span style={{ marginLeft: 4 }}>{sortAsc ? "▲" : "▼"}</span>}
+                    </th>
+                  ))}
                 </tr>
               </thead>
               <tbody>
-                {workspace.map((w, i) => (
-                  <tr key={i} onClick={() => sendToBackend({ op: "open-location", path: w.fullPath, line: w.line })}>
-                    <td>{w.kind}</td>
-                    <td>{w.name}</td>
-                    <td>{w.namespace}</td>
-                    <td className="fl-link-teal">
-                      {w.path}:{w.line + 1}
-                    </td>
-                  </tr>
-                ))}
+                {workspace
+                  .slice()
+                  .sort((a, b) => {
+                    const av = String((a as any)[sortCol] ?? a.name ?? "");
+                    const bv = String((b as any)[sortCol] ?? b.name ?? "");
+                    return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+                  })
+                  .map((w, i) => (
+                    <tr key={i} onClick={() => sendToBackend({ op: "open-location", path: w.fullPath, line: w.line })}>
+                      <td>{w.kind}</td>
+                      <td>{w.name}</td>
+                      <td>{w.namespace}</td>
+                      <td className="fl-link-teal">
+                        {w.path}:{w.line + 1}
+                      </td>
+                    </tr>
+                  ))}
               </tbody>
             </table>
           ) : (
