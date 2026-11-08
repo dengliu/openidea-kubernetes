@@ -92,10 +92,21 @@ The architecture spans four layers across the OpenIDEA workbench, Tauri host, WA
     - **`Pod`**: `Status`, `Node`, `Host IPs`, `Pod IPs`, `Service Account`, `Priority Class`, `QoS Class`, collapsible `Tolerations` table, collapsible YAML `Affinities` (`<YamlCodeViewer>` with line numbers and indent guides), `Init Containers`, `Containers` (status brick, image, ports with one-click port-forward, environment variables with clickable `Secret`/`ConfigMap` links, mounts, probes, requests/limits), and `Volumes`.
     - **`CustomResourceDefinition` & Custom Objects**: `Group`, `Versions`, `Scope`, clickable `Resource` link, `Names` table, `Additional Printer Columns`, and an inline `Custom Objects (<count>)` table listing all instances of that CRD.
     - **`Events` (`KubeEventDetails`)**: Bottom events feed for every resource.
-- **Interactive Pod & Node Shell (`PodTerminal.tsx`)**:
-  - Uses `xterm.js` (`@xterm/xterm` + `@xterm/addon-fit`) connected to OpenIDEA's native PTY bridge (`window.openidea.termSpawn`).
-  - For `Pod`: spawns `kubectl exec -it <pod> [-c <container>] -- /bin/sh -c "exec /bin/bash || exec /bin/ash || exec /bin/sh"`, with a multi-container status-square selector popup when a Pod has multiple containers.
-  - For `Node`: spawns `kubectl debug node/<name> -it --image=busybox -- chroot /host`.
+- **Interactive Pod & Node Shell in Native Terminal Tabs (`kubectl.rs` & `App.tsx`)**:
+  - Clicking the Shell (`>_`) button in the Pod or Node Details Drawer opens a native tab in OpenIDEA's **Terminal** tool window via `host::open_terminal`, keeping the resource's **Properties Overview** drawer open and unobstructed alongside full native Terminal features (split, find `⌘F`, copy/paste, scrollback, and theme sync).
+  - **Configurable Custom Debugger Image (`debuggerImage` in `settings.schema.json`)**:
+    - Defaults to `dengliu/k8sdebugger:3cfd912` and can be customized to any `image:tag` in **Settings › Plugins › Kubernetes**.
+  - **Pod Shell (`>_` menu — 3 options)**:
+    1. **Container Shell (`<container>`)**: Probes `kubectl exec <pod> [-c <container>] -- /bin/sh -c true` and opens `kubectl exec -it <pod> [-c <container>] -- /bin/sh -c "if [ -x /bin/bash ]; then exec /bin/bash; elif [ -x /bin/ash ]; then exec /bin/ash; else exec /bin/sh; fi"`. If the target container is **distroless** (missing `/bin/sh`, e.g. `coredns`), it automatically falls back to attaching an ephemeral `busybox:latest` debug container (`kubectl debug -it --image=busybox:latest --target=<container>`) and notifies the user.
+    2. **`Debug Shell (busybox:latest)`**: Attaches an ephemeral `busybox:latest` debug container (`kubectl debug -it <pod> --image=busybox:latest --target=<container>`).
+    3. **`Debug Shell (<debuggerImage>)`**: Attaches an ephemeral debug container using the configured `debuggerImage` (`kubectl debug -it <pod> --image=<debuggerImage> --target=<container>`).
+  - **Node Shell (`>_` menu — 3 options & Self-Deleting `node-debugger-<node>` Pod Lifecycle)**:
+    1. **`Node Host Shell (nsenter /host)`**: Schedules a privileged `node-debugger-<node>` Pod (`hostPID: true`, `hostNetwork: true`, `hostIPC: true`, `terminationGracePeriodSeconds: 0`, `/` mounted at `/host`) and enters the Node's own OS namespaces and `/bin/bash` via `nsenter -t 1 -m -u -i -n -p` (with `chroot /host` fallback).
+    2. **`Debug Shell (busybox:latest)`**: Opens a `busybox:latest` debug shell with the Node's root filesystem mounted at `/host`.
+    3. **`Debug Shell (<debuggerImage>)`**: Schedules `node-debugger-<node>` using the configured `debuggerImage` (default `dengliu/k8sdebugger:3cfd912`) with the Node's root filesystem mounted at `/host`.
+    - **Automatic Cleanup on Exit and Terminal Tab Close (`SIGHUP`)**:
+      - The `node-debugger-<node>` Pod's PID 1 watchdog monitors `containerd`'s open `-stdout` FIFOs for the container (`/proc/$CPID/fd`), while the Terminal tab attaches via `kubectl exec -it`.
+      - As soon as the `kubectl exec -it` session disconnects — whether the user types `exit` / `Ctrl+D` **or** closes the Terminal tab (`×` → **Terminate**, which sends `SIGHUP` to the local `kubectl` client) — `containerd` closes the exec session's `-stdout` FIFO, and the watchdog immediately deletes its own `node-debugger-<node>` Pod (`--force --grace-period=0`) and exits `0`, with a 5-second background poll (`poll-category`) sweeping any remaining `Completed` `node-debugger-*` pods.
 
 ---
 
