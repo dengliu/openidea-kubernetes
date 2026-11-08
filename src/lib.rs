@@ -605,7 +605,8 @@ impl KubernetesPlugin {
                     cfg.context = c.to_owned();
                 }
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
-                open_node_shell_terminal(&cfg, name)?;
+                let project = resolve_project(ctx).ok();
+                open_node_shell_terminal(project.as_ref(), &cfg, name)?;
             }
             "pod-exec" => {
                 let project = resolve_project(ctx)?;

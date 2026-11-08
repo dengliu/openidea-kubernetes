@@ -2160,6 +2160,26 @@ pub fn fetch_category_into_snapshot(
                         snap.resources.extend(parse_custom_columns_resources(&out.stdout));
                     }
                     if kind == "Pod" {
+                        let finished_debuggers: Vec<(String, String)> = snap
+                            .resources
+                            .iter()
+                            .filter(|r| {
+                                r.kind == "Pod"
+                                    && r.name.starts_with("node-debugger-")
+                                    && matches!(r.status.as_str(), "Succeeded" | "Completed" | "Failed")
+                            })
+                            .map(|r| (r.namespace.clone(), r.name.clone()))
+                            .collect();
+                        if !finished_debuggers.is_empty() {
+                            for (ns, name) in &finished_debuggers {
+                                let _ = delete_cluster_resource(project, cfg, "Pod", ns, name);
+                            }
+                            snap.resources.retain(|r| {
+                                !(r.kind == "Pod"
+                                    && r.name.starts_with("node-debugger-")
+                                    && matches!(r.status.as_str(), "Succeeded" | "Completed" | "Failed"))
+                            });
+                        }
                         enrich_pod_metrics(project, cfg, snap);
                     }
                 }
@@ -2629,18 +2649,94 @@ pub fn open_debug_terminal(
     host::open_terminal(&title, "kubectl", &args)
 }
 
-/// Opens a root host shell on a Kubernetes Node (`kubectl debug node/<name> -it --image=busybox:latest -- chroot /host`).
-pub fn open_node_shell_terminal(cfg: &KubeConfigState, node: &str) -> Result<(), Error> {
-    let mut args = cfg.target_args(None);
+/// Opens a root host shell on a Kubernetes Node (`kubectl run node-debugger-<node> --rm -it`) with automatic pod cleanup.
+pub fn open_node_shell_terminal(
+    project: Option<&Project>,
+    cfg: &KubeConfigState,
+    node: &str,
+) -> Result<(), Error> {
+    let sanitized: String = node
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned();
+    let suffix = if sanitized.len() > 42 { &sanitized[..42] } else { &sanitized };
+    let pod_name = format!("node-debugger-{suffix}");
+
+    if let Some(proj) = project {
+        let mut del_args = cfg.target_args(Some("default"));
+        del_args.extend([
+            "delete".into(),
+            "pod".into(),
+            pod_name.clone(),
+            "--force".into(),
+            "--grace-period=0".into(),
+            "--ignore-not-found=true".into(),
+        ]);
+        let _ = run_kubectl(proj, &del_args, None);
+    }
+
+    let overrides = json!({
+        "apiVersion": "v1",
+        "metadata": {
+            "labels": {
+                "app.kubernetes.io/managed-by": "openidea-node-shell",
+                "openidea.io/node": suffix,
+            }
+        },
+        "spec": {
+            "nodeName": node,
+            "hostPID": true,
+            "hostNetwork": true,
+            "hostIPC": true,
+            "terminationGracePeriodSeconds": 0,
+            "tolerations": [
+                { "operator": "Exists" }
+            ],
+            "containers": [
+                {
+                    "name": "debugger",
+                    "image": "busybox:latest",
+                    "stdin": true,
+                    "stdinOnce": true,
+                    "tty": true,
+                    "securityContext": {
+                        "privileged": true
+                    },
+                    "command": [
+                        "/bin/sh",
+                        "-c",
+                        "export TERM=xterm-256color; if [ -d /host ]; then exec chroot /host /bin/sh -c 'if [ -x /bin/bash ]; then exec /bin/bash; else exec /bin/sh; fi'; else exec /bin/sh; fi"
+                    ],
+                    "volumeMounts": [
+                        {
+                            "name": "host-root",
+                            "mountPath": "/host"
+                        }
+                    ]
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "host-root",
+                    "hostPath": {
+                        "path": "/"
+                    }
+                }
+            ]
+        }
+    });
+
+    let mut args = cfg.target_args(Some("default"));
     args.extend([
-        "debug".into(),
-        format!("node/{node}"),
+        "run".into(),
+        pod_name,
+        "--rm".into(),
         "-it".into(),
+        "--restart=Never".into(),
         "--image=busybox:latest".into(),
-        "--".into(),
-        "/bin/sh".into(),
-        "-c".into(),
-        "export TERM=xterm-256color; if [ -d /host ]; then exec chroot /host /bin/sh -c 'if [ -x /bin/bash ]; then exec /bin/bash; else exec /bin/sh; fi'; else exec /bin/sh; fi".into(),
+        format!("--overrides={overrides}"),
     ]);
     host::open_terminal(&format!("Node: {node}"), "kubectl", &args)
 }
