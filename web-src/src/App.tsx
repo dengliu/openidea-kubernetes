@@ -2737,7 +2737,7 @@ export function App() {
                       }}
                     >
                       <span>{col.label}</span>
-                      {sortCol === col.id && <span style={{ marginLeft: 4, fontSize: 10 }}>{sortAsc ? "▴" : "▾"}</span>}
+                      {sortCol === col.id && <span style={{ marginLeft: 4 }}>{sortAsc ? "▲" : "▼"}</span>}
                       <div className="fl-col-resizer" onMouseDown={(e) => startColResize(e, col)} />
                     </th>
                   ))}
