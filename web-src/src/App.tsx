@@ -2692,25 +2692,13 @@ export function App() {
                       <div className="fl-col-resizer" onMouseDown={(e) => startColResize(e, col)} />
                     </th>
                   ))}
-                  <th style={{ width: 48, textAlign: "right", paddingRight: 12 }}>
-                    <button
-                      className="fl-col-menu-btn"
-                      title="Customize table columns"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setColMenuOpen((v) => !v);
-                      }}
-                    >
-                      ⋮
-                    </button>
-                  </th>
                 </tr>
               </thead>
               <tbody>
                 {filteredResources.length === 0 ? (
                   <tr>
                     <td
-                      colSpan={visibleCols.length + (activeKind === "Node" ? 1 : 2)}
+                      colSpan={visibleCols.length + (activeKind === "Node" ? 0 : 1)}
                       style={{ textAlign: "center", padding: "32px 16px", color: "var(--fl-fg-muted)" }}
                     >
                       {banner && !banner.isError
@@ -2741,6 +2729,19 @@ export function App() {
                             openResourceDrawer(res, "overview");
                           }
                         }}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          const estHeight = res.kind === "Pod" ? 215 : 150;
+                          const openUpward = e.clientY + estHeight > window.innerHeight - 16;
+                          setRowActionMenu({
+                            res,
+                            x: Math.max(12, Math.min(window.innerWidth - 188, e.clientX)),
+                            y: e.clientY,
+                            openUpward,
+                            submenu: null,
+                          });
+                        }}
                       >
                         {activeKind !== "Node" && (
                           <td style={{ textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
@@ -2757,60 +2758,6 @@ export function App() {
                             {renderPodCell(res, col.id)}
                           </td>
                         ))}
-                        <td
-                          style={{ textAlign: "right", paddingRight: 10, whiteSpace: "nowrap" }}
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          {res.kind === "Pod" && (
-                            <button
-                              type="button"
-                              className="fl-row-icon-btn"
-                              title="Pod Logs"
-                              aria-label="Pod Logs"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setRowActionMenu(null);
-                                const items = getPodContainerItems(res, null, true);
-                                openPodLogsInEditorTab(res, items[0]?.name || "");
-                              }}
-                            >
-                              <svg width="16" height="16" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                                <rect x="2.5" y="4" width="15" height="2.2" rx="0.8" fill="currentColor" />
-                                <rect x="2.5" y="7.8" width="15" height="2.2" rx="0.8" fill="currentColor" />
-                                <rect x="2.5" y="11.6" width="15" height="2.2" rx="0.8" fill="currentColor" />
-                                <rect x="2.5" y="15.4" width="10" height="2.2" rx="0.8" fill="currentColor" />
-                              </svg>
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            className="fl-row-icon-btn"
-                            title="Resource Actions"
-                            aria-label="Resource Actions"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              const r = e.currentTarget.getBoundingClientRect();
-                              const estHeight = res.kind === "Pod" ? 215 : 150;
-                              const openUpward = r.bottom + estHeight > window.innerHeight - 16;
-                              setRowActionMenu((prev) =>
-                                prev &&
-                                prev.res.kind === res.kind &&
-                                prev.res.namespace === res.namespace &&
-                                prev.res.name === res.name
-                                  ? null
-                                  : {
-                                      res,
-                                      x: Math.max(12, Math.min(window.innerWidth - 188, r.right - 176)),
-                                      y: openUpward ? r.top - 6 : r.bottom + 4,
-                                      openUpward,
-                                      submenu: null,
-                                    },
-                              );
-                            }}
-                          >
-                            ⋮
-                          </button>
-                        </td>
                       </tr>
                     );
                   })
