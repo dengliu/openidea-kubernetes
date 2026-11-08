@@ -33,7 +33,7 @@ optional = ["process:helm", "process:kustomize"]
 id = "kubernetes"
 title = "Kubernetes"
 icon = "icons/kubernetes.svg"
-location = "left"
+location = "right"
 web = "web/index.html"
 header = "none"
 
