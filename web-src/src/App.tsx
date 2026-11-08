@@ -831,7 +831,7 @@ export function App() {
   const [sidebarWidth, setSidebarWidth] = useState<number>(210);
   const [clusterMenuOpen, setClusterMenuOpen] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>("");
-  const [banner, setBanner] = useState<{ text: string; isError: boolean } | null>(null);
+  const [banner, setBanner] = useState<{ text: string; isError: boolean; sticky?: boolean } | null>(null);
   const [selectedRowKey, setSelectedRowKey] = useState<string | null>(null);
   const [checkedRows, setCheckedRows] = useState<Record<string, boolean>>({});
   const [sortCol, setSortCol] = useState<string>("name");
@@ -899,11 +899,11 @@ export function App() {
           return;
         }
         if (m.op === "log-error" || m.op === "content-tab-error") {
-          setBanner({ text: String(m.error || "Editor tab error"), isError: true });
+          setBanner({ text: String(m.error || "Editor tab error"), isError: true, sticky: true });
           return;
         }
         if (m.op === "resource-yaml-ready") {
-          setBanner(null);
+          setBanner((prev) => (prev?.isError && prev?.sticky ? prev : null));
           sendToBackend({
             op: "open-content-tab",
             key: m.key,
@@ -945,9 +945,9 @@ export function App() {
             setWorkspace(m.workspace);
           }
           if (m.snapshot?.error) {
-            setBanner({ text: m.snapshot.error, isError: true });
+            setBanner({ text: m.snapshot.error, isError: true, sticky: true });
           } else {
-            setBanner(null);
+            setBanner((prev) => (prev?.isError && prev?.sticky ? prev : null));
           }
           if (m.needsBackgroundSync) {
             const curCtx = m.snapshot?.current_context || "";
@@ -970,7 +970,8 @@ export function App() {
           setDrawerRawText(text);
           setYamlDraft(text);
           if (m.banner) {
-            setBanner({ text: m.banner, isError: Boolean(m.error) });
+            const isErr = Boolean(m.error);
+            setBanner({ text: m.banner, isError: isErr, sticky: isErr });
           }
         }
       } catch {
@@ -1934,9 +1935,11 @@ export function App() {
 
         {banner && (
           <div className={`fl-banner ${banner.isError ? "error" : ""}`}>
-            <span>{banner.text}</span>
+            <span className="fl-banner-text">{banner.text}</span>
             <button
-              style={{ border: "none", background: "transparent", color: "inherit", cursor: "pointer" }}
+              className="fl-banner-dismiss"
+              title="Dismiss"
+              aria-label="Dismiss"
               onClick={() => setBanner(null)}
             >
               ✕
@@ -1944,8 +1947,9 @@ export function App() {
           </div>
         )}
 
-        {/* Subheader Bar: Pods | 2 items | Namespace: dengliu v | Search Pods... */}
-        <div className="fl-subheader">
+        <div className="fl-workspace-body">
+          {/* Subheader Bar: Pods | 2 items | Namespace: dengliu v | Search Pods... */}
+          <div className="fl-subheader">
           <div className="fl-subheader-title">{currentViewLabel}</div>
           <div className="fl-subheader-count">
             {activeKind === "ClusterCatalog"
@@ -2999,6 +3003,7 @@ export function App() {
             )}
           </div>
         )}
+        </div>
       </div>
     </div>
   );

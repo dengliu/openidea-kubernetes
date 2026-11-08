@@ -321,19 +321,61 @@ body,
 
 /* Status banner */
 .fl-banner {
-  padding: 6px 16px;
-  font-size: 12px;
+  padding: 8px 16px;
+  font-size: 12.5px;
+  line-height: 1.4;
   background: var(--fl-teal-tint);
   color: var(--fl-teal);
   border-bottom: 1px solid var(--fl-border);
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+  z-index: 70;
+}
+
+.fl-main > .fl-banner:first-child {
+  padding-right: calc(var(--openidea-corner-inset-width, 64px) + 12px);
 }
 
 .fl-banner.error {
-  background: rgba(217, 83, 79, 0.12);
+  background: rgba(217, 83, 79, 0.14);
   color: var(--fl-red);
+}
+
+.fl-banner-text {
+  flex: 1;
+  min-width: 0;
+  user-select: text;
+}
+
+.fl-banner-dismiss {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 13px;
+}
+
+.fl-banner-dismiss:hover {
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.fl-workspace-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
 }
 
 /* Subheader bar: Title | N items | Namespace dropdown | Search input */
@@ -634,13 +676,13 @@ body,
 }
 
 /* Slide-over Right Detail Drawer (Screenshot 2) */
-.fl-main > .fl-subheader:first-child {
+.fl-main > .fl-workspace-body:first-child > .fl-subheader:first-child {
   padding-right: calc(var(--openidea-corner-inset-width, 64px) + 12px);
 }
 
 .fl-drawer {
   position: absolute;
-  top: 40px;
+  top: 0;
   right: 0;
   bottom: 0;
   background: var(--fl-bg);
