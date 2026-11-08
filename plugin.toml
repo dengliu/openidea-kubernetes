@@ -1,12 +1,12 @@
 id = "dengliu.kubernetes"
 name = "Kubernetes"
-version = "0.3.0"
+version = "0.3.1"
 icon = "icons/kubernetes-logo.svg"
 description = "Manage Kubernetes clusters, Helm releases and Kustomize overlays: cluster explorer with live Pod logs, shell and port-forward, YAML completion, cross-resource navigation, gutter markers and manifest inspections."
 authors = ["Deng Liu"]
 homepage = "https://github.com/dengliu/openidea-kubernetes"
 license = "Apache-2.0"
-change-notes = "0.3.0 — Pod & Node Debug Shells in native Terminal tabs with auto-cleanup on tab close, Ephemeral/Init/Kubernetes Native Sidecar containers with Golang-blue styling and terminated container hover tooltips, Freelens Port Forwarding dialog, Helm Releases view, Hotbar active ring and drag-and-drop reordering, batch Remove selected items & Force Delete, and Cmd/Ctrl + =/-/0 font size zoom."
+change-notes = "0.3.1 — add custom Kubernetes Blue plugin icon (icons/kubernetes-logo.svg), set secondary = true for Right Bottom default tool-window layout, and fix Helm v4 'helm list -A' flag compatibility under All Namespaces."
 categories = ["tools", "frameworks"]
 engines.openidea = "^1.3"
 wasm = "dist/plugin.wasm"
