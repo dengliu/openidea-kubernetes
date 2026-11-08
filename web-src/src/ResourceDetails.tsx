@@ -2600,6 +2600,83 @@ export function ResourceDetails({
         </>
       )}
 
+      {/* HELM RELEASE DETAILS */}
+      {kind === "HelmRelease" && (
+        <>
+          <DrawerRow name="Chart">{selectedResource.detail || "-"}</DrawerRow>
+          <DrawerRow name="App Version">{selectedResource.qos || "-"}</DrawerRow>
+          <DrawerRow name="Revision">{drawerJson?.helm?.revision ?? selectedResource.ready ?? "1"}</DrawerRow>
+          <DrawerRow name="Status">
+            <span className={`fl-status-text ${statusClass(selectedResource.status)}`}>{selectedResource.status}</span>
+          </DrawerRow>
+          {drawerJson?.helm?.description && <DrawerRow name="Description">{drawerJson.helm.description}</DrawerRow>}
+          {drawerJson?.helm?.notes && (
+            <div style={{ marginTop: 8 }}>
+              <DrawerSectionBanner>Notes</DrawerSectionBanner>
+              <pre
+                className="fl-pre-output"
+                style={{
+                  background: "var(--fl-bg-elevated)",
+                  border: "1px solid var(--fl-border)",
+                  borderRadius: 4,
+                  maxHeight: 200,
+                  overflow: "auto",
+                }}
+              >
+                {drawerJson.helm.notes}
+              </pre>
+            </div>
+          )}
+          {drawerJson?.helm?.values && Object.keys(drawerJson.helm.values).length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <DrawerSectionBanner>User-Supplied Values</DrawerSectionBanner>
+              <YamlCodeViewer value={drawerJson.helm.values} />
+            </div>
+          )}
+          <PodDetailsListSection
+            pods={relatedPods}
+            ownerKind="HelmRelease"
+            statusClass={statusClass}
+            onSelectNamespace={onSelectNamespace}
+            onSelectResource={onOpenResourceByRef}
+          />
+          {extraResources && extraResources.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <DrawerSectionBanner>Resources ({extraResources.length})</DrawerSectionBanner>
+              <table className="fl-subtable">
+                <thead>
+                  <tr>
+                    <th>Kind</th>
+                    <th>Name</th>
+                    <th>Status</th>
+                    <th>Age</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {extraResources.map((r) => (
+                    <tr key={`${r.kind}:${r.namespace}/${r.name}`}>
+                      <td>{r.kind}</td>
+                      <td>
+                        <span
+                          className="fl-link-teal"
+                          onClick={() => onOpenResourceByRef(r.kind, r.name, r.namespace)}
+                        >
+                          {r.name}
+                        </span>
+                      </td>
+                      <td>
+                        <span className={`fl-status-text ${statusClass(r.status)}`}>{r.status}</span>
+                      </td>
+                      <td>{formatAgeShort(r.age)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+
       {/* 3. Bottom Events section (KubeEventDetails) for all non-Event resources */}
       {kind !== "Event" && (
         <div style={{ marginTop: 8 }}>

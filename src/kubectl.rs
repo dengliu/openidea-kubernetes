@@ -1950,6 +1950,8 @@ pub fn fetch_helm_into_snapshot(project: &Project, cfg: &KubeConfigState, snap: 
     if let Ok(out) = project.run_process("helm", &helm_args, None)
         && out.status == Some(0)
     {
+        snap.connected = true;
+        snap.error = None;
         snap.helm_releases = parse_helm_releases_json(&out.stdout);
     }
 }
@@ -2303,6 +2305,9 @@ pub fn inspect_cluster_resource(
     name: &str,
     as_yaml: bool,
 ) -> Result<String, Error> {
+    if kind == "HelmRelease" {
+        return fetch_helm_release_detail(project, cfg, namespace, name, if as_yaml { "manifest" } else { "all" });
+    }
     let target_type = kind.strip_prefix("CR:").unwrap_or(kind).to_ascii_lowercase();
     let (_, cluster_scoped, _) =
         if kind.starts_with("CR:") { ("cr", namespace.is_empty(), false) } else { kubectl_resource_info(kind) };
@@ -2328,6 +2333,63 @@ pub fn inspect_cluster_resource_json(
     namespace: &str,
     name: &str,
 ) -> Result<String, Error> {
+    if kind == "HelmRelease" {
+        let mut base = Vec::new();
+        if !cfg.kubeconfig.trim().is_empty() {
+            base.push(format!("--kubeconfig={}", cfg.kubeconfig.trim()));
+        }
+        if !cfg.context.trim().is_empty() {
+            base.push(format!("--kube-context={}", cfg.context.trim()));
+        }
+        if !namespace.trim().is_empty() {
+            base.push("-n".into());
+            base.push(namespace.trim().to_owned());
+        }
+        let mut status_args = base.clone();
+        status_args.extend(["status".into(), name.to_owned(), "-o".into(), "json".into()]);
+        let status_json: Value = project
+            .run_process("helm", &status_args, None)
+            .ok()
+            .filter(|o| o.status == Some(0))
+            .and_then(|o| serde_json::from_str(&o.stdout).ok())
+            .unwrap_or_else(|| json!({}));
+
+        let mut val_args = base;
+        val_args.extend(["get".into(), "values".into(), name.to_owned(), "-o".into(), "json".into()]);
+        let values_json: Value = project
+            .run_process("helm", &val_args, None)
+            .ok()
+            .filter(|o| o.status == Some(0))
+            .and_then(|o| serde_json::from_str(&o.stdout).ok())
+            .unwrap_or_else(|| json!({}));
+
+        let deployed_at = status_json
+            .pointer("/info/last_deployed")
+            .or_else(|| status_json.pointer("/info/first_deployed"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let notes = status_json.pointer("/info/notes").and_then(Value::as_str).unwrap_or("");
+        let description = status_json.pointer("/info/description").and_then(Value::as_str).unwrap_or("");
+        let status_str = status_json.pointer("/info/status").and_then(Value::as_str).unwrap_or("deployed");
+        let version = status_json.get("version").and_then(Value::as_u64).unwrap_or(1);
+
+        let wrapped = json!({
+            "kind": "HelmRelease",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "creationTimestamp": deployed_at,
+            },
+            "helm": {
+                "revision": version,
+                "status": status_str,
+                "description": description,
+                "notes": notes,
+                "values": values_json,
+            }
+        });
+        return Ok(wrapped.to_string());
+    }
     let target_type = kind.strip_prefix("CR:").unwrap_or(kind).to_ascii_lowercase();
     let (_, cluster_scoped, _) =
         if kind.starts_with("CR:") { ("cr", namespace.is_empty(), false) } else { kubectl_resource_info(kind) };
@@ -2517,6 +2579,61 @@ pub fn fetch_resource_extras(
             && out.status == Some(0)
         {
             related_resources = parse_cr_instance_lines(&out.stdout, name);
+        }
+    } else if kind == "HelmRelease" {
+        let mut rel_args = cfg.target_args(Some(namespace));
+        rel_args.extend([
+            "get".into(),
+            "pods,deploy,sts,ds,svc,cm,sa,ing".into(),
+            "-l".into(),
+            format!("app.kubernetes.io/instance={name}"),
+            "-o".into(),
+            "json".into(),
+        ]);
+        if let Ok(out) = run_kubectl(project, &rel_args, None)
+            && out.status == Some(0)
+        {
+            for r in parse_resource_list_json(&out.stdout) {
+                if r.kind == "Pod" {
+                    related_pods.push(r);
+                } else {
+                    related_resources.push(r);
+                }
+            }
+            if !related_pods.is_empty() {
+                let mut t_args = cfg.target_args(Some(namespace));
+                t_args.extend([
+                    "top".into(),
+                    "pods".into(),
+                    "-l".into(),
+                    format!("app.kubernetes.io/instance={name}"),
+                    "--no-headers".into(),
+                ]);
+                if let Ok(out) = run_kubectl(project, &t_args, None)
+                    && out.status == Some(0)
+                {
+                    let mut metrics: BTreeMap<String, (String, String)> = BTreeMap::new();
+                    for line in out.stdout.lines() {
+                        let cols: Vec<&str> = line.split_whitespace().collect();
+                        if cols.len() >= 3 {
+                            let pname = cols[0].to_owned();
+                            let raw_cpu = cols[1];
+                            let cpu = if let Some(m) = raw_cpu.strip_suffix('m').and_then(|v| v.parse::<f64>().ok()) {
+                                format!("{:.3}", m / 1000.0)
+                            } else {
+                                raw_cpu.to_owned()
+                            };
+                            metrics.insert(pname, (cpu, cols[2].to_owned()));
+                        }
+                    }
+                    for pod in &mut related_pods {
+                        if let Some((cpu, mem)) = metrics.get(&pod.name) {
+                            pod.cpu = cpu.clone();
+                            pod.memory = mem.clone();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3061,6 +3178,25 @@ pub fn delete_cluster_resource(
     namespace: &str,
     name: &str,
 ) -> Result<String, Error> {
+    if kind == "HelmRelease" {
+        let mut args = Vec::new();
+        if !cfg.kubeconfig.trim().is_empty() {
+            args.push(format!("--kubeconfig={}", cfg.kubeconfig.trim()));
+        }
+        if !cfg.context.trim().is_empty() {
+            args.push(format!("--kube-context={}", cfg.context.trim()));
+        }
+        if !namespace.trim().is_empty() {
+            args.push("-n".into());
+            args.push(namespace.trim().to_owned());
+        }
+        args.extend(["uninstall".into(), name.to_owned()]);
+        let out = project.run_process("helm", &args, None)?;
+        if out.status != Some(0) {
+            return Err(Error::Failed(first_line_or(&out.stderr, "helm uninstall failed")));
+        }
+        return Ok(out.stdout.trim().to_owned());
+    }
     let target_type = kind.strip_prefix("CR:").unwrap_or(kind).to_ascii_lowercase();
     let (_, cluster_scoped, _) =
         if kind.starts_with("CR:") { ("cr", namespace.is_empty(), false) } else { kubectl_resource_info(kind) };

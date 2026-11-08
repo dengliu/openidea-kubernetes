@@ -43,11 +43,20 @@ function shortBadge(c?: Partial<ClusterContextInfo> | string): string {
   return name.slice(0, 3).toUpperCase();
 }
 
-/** Converts an ISO timestamp (`2026-10-31T00:30:56Z`) or duration string (`6d22h`) into compact Freelens Age (`6d22h`, `20h`, `45m`). */
+function parseKubeOrHelmTimestamp(raw?: string): number {
+  if (!raw) return Number.NaN;
+  const trimmed = raw.trim();
+  const direct = Date.parse(trimmed);
+  if (!Number.isNaN(direct)) return direct;
+  const withoutTzAbbrev = trimmed.replace(/\s+[A-Z]{2,5}$/, "");
+  return Date.parse(withoutTzAbbrev);
+}
+
+/** Converts an ISO timestamp (`2026-10-31T00:30:56Z`), Helm timestamp, or duration string (`6d22h`) into compact Freelens Age (`6d22h`, `20h`, `45m`). */
 function formatCompactAge(raw?: string): string {
   if (!raw) return "-";
   if (/^\d+[smhd](\d+[smhd])?$/.test(raw.trim())) return raw.trim();
-  const ts = Date.parse(raw);
+  const ts = parseKubeOrHelmTimestamp(raw);
   if (Number.isNaN(ts)) return raw;
   const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
   const days = Math.floor(diffSec / 86400);
@@ -62,10 +71,10 @@ function formatCompactAge(raw?: string): string {
   return `${diffSec}s`;
 }
 
-/** Formats an ISO timestamp for the Detail Drawer `Created` row in America/Los_Angeles (PDT/PST) like Freelens (`6d 22h 8m ago (2026-10-30 17:30:56 PDT)`). */
+/** Formats an ISO/Helm timestamp for the Detail Drawer `Created` row in America/Los_Angeles (PDT/PST) like Freelens (`6d 22h 8m ago (2026-10-30 17:30:56 PDT)`). */
 function formatCreatedDetailed(raw?: string): string {
   if (!raw) return "-";
-  const ts = Date.parse(raw);
+  const ts = parseKubeOrHelmTimestamp(raw);
   if (Number.isNaN(ts)) return raw;
   const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
   const days = Math.floor(diffSec / 86400);
@@ -280,11 +289,6 @@ const SIDEBAR_TREE: SidebarGroup[] = [
     leafKind: "Event",
   },
   {
-    id: "helm",
-    label: "Helm",
-    items: [{ kind: "HelmRelease", label: "Releases" }],
-  },
-  {
     id: "access",
     label: "Access Control",
     items: [
@@ -299,6 +303,11 @@ const SIDEBAR_TREE: SidebarGroup[] = [
     id: "crd",
     label: "Custom Resources",
     items: [{ kind: "CustomResourceDefinition", label: "Definitions" }],
+  },
+  {
+    id: "helm",
+    label: "Helm",
+    items: [{ kind: "HelmRelease", label: "Releases" }],
   },
   {
     id: "catalog",
@@ -482,6 +491,16 @@ const STORAGE_CLASS_COLUMNS: ColumnDef[] = [
   { id: "age", label: "Age", defaultWidth: 90, defaultVisible: true },
 ];
 
+const HELM_RELEASE_COLUMNS: ColumnDef[] = [
+  { id: "name", label: "Name", defaultWidth: 210, defaultVisible: true },
+  { id: "namespace", label: "Namespace", defaultWidth: 130, defaultVisible: true },
+  { id: "detail", label: "Chart", defaultWidth: 190, defaultVisible: true },
+  { id: "ready", label: "Revision", defaultWidth: 90, defaultVisible: true },
+  { id: "qos", label: "Version", defaultWidth: 110, defaultVisible: true },
+  { id: "age", label: "Updated", defaultWidth: 105, defaultVisible: true },
+  { id: "status", label: "Status", defaultWidth: 115, defaultVisible: true },
+];
+
 const GENERIC_RESOURCE_COLUMNS: ColumnDef[] = [
   { id: "name", label: "Name", defaultWidth: 250, defaultVisible: true },
   { id: "namespace", label: "Namespace", defaultWidth: 130, defaultVisible: true },
@@ -527,6 +546,8 @@ function columnsForKind(kind: string): ColumnDef[] {
       return NAMESPACE_COLUMNS;
     case "CustomResourceDefinition":
       return CRD_COLUMNS;
+    case "HelmRelease":
+      return HELM_RELEASE_COLUMNS;
     case "ClusterCatalog":
       return CLUSTER_CATALOG_COLUMNS;
     default:
@@ -1192,13 +1213,40 @@ export function App() {
   // Filtered and sorted rows for the active view
   const filteredResources = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    const list = (snapshot.resources || []).filter(
+    const baseItems: ClusterResource[] =
+      activeKind === "HelmRelease"
+        ? (snapshot.helm_releases || []).map((rel) => ({
+            kind: "HelmRelease",
+            name: rel.name,
+            namespace: rel.namespace || "default",
+            status: rel.status || "deployed",
+            ready: rel.revision || "1",
+            age: rel.updated || "",
+            detail: rel.chart || "",
+            containers: [],
+            ports: [],
+            data_keys: [],
+            container_states: [],
+            cpu: "",
+            memory: "",
+            restarts: 0,
+            controlled_by_kind: "",
+            controlled_by_name: "",
+            pod_ip: "",
+            host_ip: "",
+            node_name: "",
+            qos: rel.app_version || "",
+            labels: [],
+          }))
+        : snapshot.resources || [];
+    const list = baseItems.filter(
       (r) =>
         r.kind === activeKind &&
         (!q ||
           r.name.toLowerCase().includes(q) ||
           (r.namespace || "").toLowerCase().includes(q) ||
           (r.status || "").toLowerCase().includes(q) ||
+          (r.detail || "").toLowerCase().includes(q) ||
           (r.controlled_by_kind || "").toLowerCase().includes(q)),
     );
     return list.slice().sort((a, b) => {
@@ -1221,18 +1269,19 @@ export function App() {
       const bv = String((b as any)[sortCol] ?? b.name ?? "");
       return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
     });
-  }, [snapshot.resources, activeKind, searchQuery, sortCol, sortAsc]);
+  }, [snapshot.resources, snapshot.helm_releases, activeKind, searchQuery, sortCol, sortAsc]);
 
   const selectedResource: ClusterResource | null = useMemo(() => {
     if (!selectedRowKey) return null;
     const matchFn = (r: ClusterResource) => `${r.kind}:${r.namespace}/${r.name}` === selectedRowKey;
     return (
+      filteredResources.find(matchFn) ||
       (snapshot.resources || []).find(matchFn) ||
       drawerExtraPods.find(matchFn) ||
       drawerExtraResources.find(matchFn) ||
       (selectedResourceFallback && matchFn(selectedResourceFallback) ? selectedResourceFallback : null)
     );
-  }, [snapshot.resources, drawerExtraPods, drawerExtraResources, selectedResourceFallback, selectedRowKey]);
+  }, [filteredResources, snapshot.resources, drawerExtraPods, drawerExtraResources, selectedResourceFallback, selectedRowKey]);
 
   const allAvailableNamespaces = useMemo(() => {
     const set = new Set<string>(snapshot.namespaces || []);
