@@ -897,6 +897,8 @@ export function App() {
   const [debuggerImage, setDebuggerImage] = useState<string>("dengliu/k8sdebugger:3cfd912");
   const [customHotbar, setCustomHotbar] = useState<string[] | null>(null);
   const [hotbarContextMenu, setHotbarContextMenu] = useState<{ name: string; x: number; y: number } | null>(null);
+  const [hbDrag, setHbDrag] = useState<{ dragged: string; over: string; pos: "before" | "after" } | null>(null);
+  const hbDragJustEndedRef = useRef<boolean>(false);
   const [, setAgeTick] = useState<number>(0);
 
   const loadedLazyRef = useRef<Record<string, boolean>>({});
@@ -1078,6 +1080,68 @@ export function App() {
     } else {
       addClusterToHotbar(name);
     }
+  }
+
+  function reorderHotbarCluster(dragged: string, target: string, pos: "before" | "after") {
+    if (!dragged || !target || dragged === target) return;
+    const next = activeHotbarNames.filter((n) => n !== dragged);
+    const idx = next.indexOf(target);
+    if (idx < 0) return;
+    const insertAt = pos === "before" ? idx : idx + 1;
+    next.splice(insertAt, 0, dragged);
+    updateHotbarNames(next);
+  }
+
+  function startHotbarMouseDrag(e: React.MouseEvent, name: string) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const startY = e.clientY;
+    let dragging = false;
+    let latestOver = name;
+    let latestPos: "before" | "after" = "after";
+
+    const onMove = (ev: MouseEvent) => {
+      if (!dragging && Math.abs(ev.clientY - startY) >= 5) {
+        dragging = true;
+      }
+      if (!dragging) return;
+      const nodes = Array.from(document.querySelectorAll<HTMLElement>("[data-hotbar-name]"));
+      let bestNode: HTMLElement | null = null;
+      let bestDist = Infinity;
+      for (const el of nodes) {
+        const r = el.getBoundingClientRect();
+        const mid = r.top + r.height / 2;
+        const dist = Math.abs(ev.clientY - mid);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestNode = el;
+        }
+      }
+      if (bestNode) {
+        const overName = bestNode.getAttribute("data-hotbar-name") || name;
+        const r = bestNode.getBoundingClientRect();
+        const pos: "before" | "after" = ev.clientY < r.top + r.height / 2 ? "before" : "after";
+        latestOver = overName;
+        latestPos = pos;
+        setHbDrag({ dragged: name, over: overName, pos });
+      }
+    };
+
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      if (dragging) {
+        hbDragJustEndedRef.current = true;
+        setTimeout(() => {
+          hbDragJustEndedRef.current = false;
+        }, 50);
+        setHbDrag(null);
+        reorderHotbarCluster(name, latestOver, latestPos);
+      }
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
   }
 
   const activeClusterInfo = useMemo(() => {
@@ -1846,14 +1910,23 @@ export function App() {
           ALL
         </div>
         {hotbarItems.map((c) => {
-          const isCur = c.name === snapshot.current_context && activeKind !== "ClusterCatalog";
+          const isConnected = c.name === snapshot.current_context;
+          const isCur = isConnected && activeKind !== "ClusterCatalog";
+          const isDragging = hbDrag?.dragged === c.name;
+          const isDropBefore = hbDrag && hbDrag.over === c.name && hbDrag.dragged !== c.name && hbDrag.pos === "before";
+          const isDropAfter = hbDrag && hbDrag.over === c.name && hbDrag.dragged !== c.name && hbDrag.pos === "after";
           return (
             <div
               key={c.name}
-              className={`fl-hb-item ${isCur ? "active" : ""}`}
+              data-hotbar-name={c.name}
+              className={`fl-hb-item ${isCur ? "active" : ""} ${isDragging ? "dragging" : ""} ${isDropBefore ? "drop-before" : ""} ${isDropAfter ? "drop-after" : ""}`}
               style={{ background: avatarColor(c.name) }}
-              title={`${c.name} (${c.namespace || "default"}) — Right-click for options`}
-              onClick={() => handleSwitchContext(c.name, activeKind === "ClusterCatalog" ? "Pod" : activeKind)}
+              title={`${c.name} (${c.namespace || "default"}) — Drag to reorder • Right-click for options`}
+              onMouseDown={(e) => startHotbarMouseDrag(e, c.name)}
+              onClick={() => {
+                if (hbDragJustEndedRef.current) return;
+                handleSwitchContext(c.name, activeKind === "ClusterCatalog" ? "Pod" : activeKind);
+              }}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -1864,7 +1937,7 @@ export function App() {
                 });
               }}
             >
-              {isCur && <span className="fl-hb-online-dot" />}
+              {isConnected && <span className="fl-hb-online-dot" />}
               <span>{shortBadge(c)}</span>
               <span className="fl-hb-k8s-wheel" aria-hidden="true">
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
