@@ -130,6 +130,12 @@ pub struct ContainerStateBadge {
     pub is_sidecar: bool,
     #[serde(default)]
     pub started_at: String,
+    #[serde(default)]
+    pub finished_at: String,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    #[serde(default)]
+    pub container_id: String,
 }
 
 /// Summary of one Kubernetes resource returned by `kubectl get`.
@@ -864,6 +870,8 @@ struct RawContainerStatus {
     ready: Option<bool>,
     #[serde(default, rename = "restartCount")]
     restart_count: Option<u64>,
+    #[serde(default, rename = "containerID")]
+    container_id: Option<String>,
     #[serde(default)]
     state: Option<RawContainerState>,
 }
@@ -898,6 +906,10 @@ struct RawTerminatedState {
     exit_code: Option<i64>,
     #[serde(default, rename = "startedAt")]
     started_at: Option<String>,
+    #[serde(default, rename = "finishedAt")]
+    finished_at: Option<String>,
+    #[serde(default, rename = "containerID")]
+    container_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1075,6 +1087,9 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                 for cs in &cs_arr {
                     let cname = cs.name.clone().unwrap_or_default();
                     let cready = cs.ready.unwrap_or(false);
+                    let mut cfinished = String::new();
+                    let mut cexit = None;
+                    let mut cid = cs.container_id.clone().unwrap_or_default();
                     let (cstate, creason, cstarted) = match cs.state.as_ref() {
                         Some(s) if s.running.is_some() => (
                             "running".to_owned(),
@@ -1087,14 +1102,20 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                             String::new(),
                         ),
                         Some(s) if s.terminated.is_some() => {
-                            let r = s.terminated.as_ref().and_then(|t| t.reason.clone()).unwrap_or_else(|| {
-                                if s.terminated.as_ref().and_then(|t| t.exit_code) == Some(0) {
+                            let term = s.terminated.as_ref().unwrap();
+                            cexit = term.exit_code;
+                            cfinished = term.finished_at.clone().unwrap_or_default();
+                            if let Some(ref tc) = term.container_id {
+                                cid = tc.clone();
+                            }
+                            let r = term.reason.clone().unwrap_or_else(|| {
+                                if term.exit_code == Some(0) {
                                     "Completed".into()
                                 } else {
                                     "Error".into()
                                 }
                             });
-                            let started = s.terminated.as_ref().and_then(|t| t.started_at.clone()).unwrap_or_default();
+                            let started = term.started_at.clone().unwrap_or_default();
                             ("terminated".to_owned(), r, started)
                         }
                         _ => ("unknown".to_owned(), String::new(), String::new()),
@@ -1111,6 +1132,9 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                         is_ephemeral: false,
                         is_sidecar: false,
                         started_at: cstarted,
+                        finished_at: cfinished,
+                        exit_code: cexit,
+                        container_id: cid,
                     });
                 }
                 if let Some(init_cs_arr) = st.init_container_statuses {
@@ -1118,6 +1142,9 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                         let cname = ics.name.unwrap_or_default();
                         let cready = ics.ready.unwrap_or(false);
                         let is_sidecar = sidecar_names.contains(&cname);
+                        let mut cfinished = String::new();
+                        let mut cexit = None;
+                        let mut cid = ics.container_id.clone().unwrap_or_default();
                         let (cstate, creason, cstarted) = match ics.state.as_ref() {
                             Some(s) if s.running.is_some() => (
                                 "running".to_owned(),
@@ -1129,14 +1156,19 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                                 s.waiting.as_ref().and_then(|w| w.reason.clone()).unwrap_or_default(),
                                 String::new(),
                             ),
-                            Some(s) if s.terminated.is_some() => (
-                                "terminated".to_owned(),
-                                s.terminated
-                                    .as_ref()
-                                    .and_then(|t| t.reason.clone())
-                                    .unwrap_or_else(|| "Completed".into()),
-                                s.terminated.as_ref().and_then(|t| t.started_at.clone()).unwrap_or_default(),
-                            ),
+                            Some(s) if s.terminated.is_some() => {
+                                let term = s.terminated.as_ref().unwrap();
+                                cexit = term.exit_code;
+                                cfinished = term.finished_at.clone().unwrap_or_default();
+                                if let Some(ref tc) = term.container_id {
+                                    cid = tc.clone();
+                                }
+                                (
+                                    "terminated".to_owned(),
+                                    term.reason.clone().unwrap_or_else(|| "Completed".into()),
+                                    term.started_at.clone().unwrap_or_default(),
+                                )
+                            }
                             _ => ("terminated".to_owned(), "Completed".into(), String::new()),
                         };
                         container_states.push(ContainerStateBadge {
@@ -1148,12 +1180,18 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                             is_ephemeral: false,
                             is_sidecar,
                             started_at: cstarted,
+                            finished_at: cfinished,
+                            exit_code: cexit,
+                            container_id: cid,
                         });
                     }
                 }
                 if let Some(ephem_cs_arr) = st.ephemeral_container_statuses {
                     for ecs in ephem_cs_arr {
                         let cname = ecs.name.unwrap_or_default();
+                        let mut cfinished = String::new();
+                        let mut cexit = None;
+                        let mut cid = ecs.container_id.clone().unwrap_or_default();
                         let (cstate, creason, cstarted) = match ecs.state.as_ref() {
                             Some(s) if s.running.is_some() => (
                                 "running".to_owned(),
@@ -1165,14 +1203,19 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                                 s.waiting.as_ref().and_then(|w| w.reason.clone()).unwrap_or_default(),
                                 String::new(),
                             ),
-                            Some(s) if s.terminated.is_some() => (
-                                "terminated".to_owned(),
-                                s.terminated
-                                    .as_ref()
-                                    .and_then(|t| t.reason.clone())
-                                    .unwrap_or_else(|| "Completed".into()),
-                                s.terminated.as_ref().and_then(|t| t.started_at.clone()).unwrap_or_default(),
-                            ),
+                            Some(s) if s.terminated.is_some() => {
+                                let term = s.terminated.as_ref().unwrap();
+                                cexit = term.exit_code;
+                                cfinished = term.finished_at.clone().unwrap_or_default();
+                                if let Some(ref tc) = term.container_id {
+                                    cid = tc.clone();
+                                }
+                                (
+                                    "terminated".to_owned(),
+                                    term.reason.clone().unwrap_or_else(|| "Completed".into()),
+                                    term.started_at.clone().unwrap_or_default(),
+                                )
+                            }
                             _ => ("terminated".to_owned(), "Completed".into(), String::new()),
                         };
                         container_states.push(ContainerStateBadge {
@@ -1184,6 +1227,9 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                             is_ephemeral: true,
                             is_sidecar: false,
                             started_at: cstarted,
+                            finished_at: cfinished,
+                            exit_code: cexit,
+                            container_id: cid,
                         });
                     }
                 }
@@ -3309,7 +3355,7 @@ pub fn delete_cluster_resource(
         if kind.starts_with("CR:") { ("cr", namespace.is_empty(), false) } else { kubectl_resource_info(kind) };
     let mut args =
         if cluster_scoped || namespace.is_empty() { cfg.base_args(false) } else { cfg.target_args(Some(namespace)) };
-    args.extend(["delete".into(), target_type, name.to_owned()]);
+    args.extend(["delete".into(), target_type, name.to_owned(), "--wait=false".into()]);
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
         return Err(Error::Failed(first_line_or(&out.stderr, "kubectl delete failed")));

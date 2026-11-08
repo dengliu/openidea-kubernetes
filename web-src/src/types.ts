@@ -23,6 +23,9 @@ export interface ContainerStateBadge {
   is_ephemeral?: boolean;
   is_sidecar?: boolean;
   started_at?: string;
+  finished_at?: string;
+  exit_code?: number | null;
+  container_id?: string;
 }
 
 export interface ClusterResource {

@@ -692,6 +692,10 @@ body,
   background: var(--fl-green);
 }
 
+.fl-csq.sidecar {
+  background: #00add8;
+}
+
 .fl-csq.ephemeral {
   background: #1565c0;
 }
@@ -712,6 +716,11 @@ body,
 /* Status text coloring matching Freelens */
 .fl-status-text.ok {
   color: color-mix(in srgb, #2e7d32 76%, var(--fl-fg));
+  font-weight: 500;
+}
+
+.fl-status-text.sidecar {
+  color: color-mix(in srgb, #00add8 78%, var(--fl-fg));
   font-weight: 500;
 }
 
@@ -754,6 +763,10 @@ body,
   color: color-mix(in srgb, #2e7d32 76%, var(--fl-fg));
 }
 
+.fl-csq-tooltip-state.sidecar {
+  color: color-mix(in srgb, #00add8 78%, var(--fl-fg));
+}
+
 .fl-csq-tooltip-state.ephemeral {
   color: color-mix(in srgb, #1565c0 80%, var(--fl-fg));
 }
@@ -766,15 +779,140 @@ body,
   color: color-mix(in srgb, #c62828 78%, var(--fl-fg));
 }
 
+.fl-csq-tooltip-state.completed {
+  color: var(--fl-fg-muted);
+}
+
 .fl-csq-tooltip-row {
-  display: flex;
-  gap: 12px;
-  margin-top: 4px;
+  display: grid;
+  grid-template-columns: 78px 1fr;
+  gap: 10px;
+  margin-top: 3px;
   font-size: 11.5px;
 }
 
 .fl-csq-tooltip-key {
   color: var(--fl-fg-muted);
+  text-align: right;
+}
+
+/* Row Checkboxes & Floating "Remove selected items (N)" FAB */
+.fl-row-checkbox {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--fl-teal);
+  cursor: pointer;
+}
+
+.fl-bulk-remove-wrap {
+  position: absolute;
+  bottom: 24px;
+  right: 28px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  z-index: 420;
+  transition: right 0.14s ease;
+}
+
+.fl-bulk-remove-tooltip {
+  background: var(--fl-bg-elevated);
+  color: var(--fl-fg);
+  border: 1px solid var(--fl-border);
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.24);
+  opacity: 0;
+  transform: translateX(6px);
+  pointer-events: none;
+  transition: opacity 0.14s ease, transform 0.14s ease;
+}
+
+.fl-bulk-remove-wrap:hover .fl-bulk-remove-tooltip,
+.fl-bulk-remove-wrap:focus-within .fl-bulk-remove-tooltip {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.fl-bulk-remove-fab {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: 1px solid var(--fl-border);
+  background: color-mix(in srgb, var(--fl-fg) 14%, var(--fl-bg-elevated));
+  color: var(--fl-fg);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease, transform 0.12s ease;
+}
+
+.fl-bulk-remove-fab:hover {
+  background: #c62828;
+  border-color: #ef5350;
+  color: #ffffff;
+  transform: scale(1.05);
+}
+
+.fl-bulk-remove-fab:active {
+  transform: scale(0.97);
+}
+
+.fl-bulk-remove-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--fl-bg) 75%, var(--fl-bg-elevated));
+  border: 1px solid var(--fl-border);
+}
+
+.fl-bulk-remove-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12.5px;
+}
+
+.fl-bulk-remove-item-name {
+  font-weight: 600;
+  color: var(--fl-fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fl-bulk-remove-item-ns {
+  font-size: 11px;
+  color: var(--fl-fg-muted);
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--fl-fg) 8%, transparent);
+  flex-shrink: 0;
+}
+
+.fl-bulk-remove-confirm-btn {
+  padding: 7px 20px;
+  border-radius: 5px;
+  border: 1px solid #d32f2f;
+  background: #c62828;
+  color: #ffffff;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.fl-bulk-remove-confirm-btn:hover {
+  background: #d32f2f;
 }
 
 /* Column visibility & order popover menu */

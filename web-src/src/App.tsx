@@ -855,6 +855,7 @@ export function App() {
   const [banner, setBanner] = useState<{ text: string; isError: boolean; sticky?: boolean } | null>(null);
   const [selectedRowKey, setSelectedRowKey] = useState<string | null>(null);
   const [checkedRows, setCheckedRows] = useState<Record<string, boolean>>({});
+  const [bulkDeleteConfirmOpen, setBulkDeleteConfirmOpen] = useState<boolean>(false);
   const [sortCol, setSortCol] = useState<string>("name");
   const [sortAsc, setSortAsc] = useState<boolean>(true);
   const [colMenuOpen, setColMenuOpen] = useState<boolean>(false);
@@ -904,6 +905,10 @@ export function App() {
     statusText: string;
     statusCls: string;
     startedAt?: string;
+    finishedAt?: string;
+    reason?: string;
+    exitCode?: number | null;
+    containerId?: string;
     x: number;
     y: number;
   } | null>(null);
@@ -1168,6 +1173,8 @@ export function App() {
     loadedLazyRef.current = {};
     setClusterMenuOpen(false);
     setSelectedRowKey(null);
+    setCheckedRows({});
+    setBulkDeleteConfirmOpen(false);
     setDrawerOpen(false);
     setDrawerJson(null);
     setActiveKind(nextKind);
@@ -1189,6 +1196,8 @@ export function App() {
   function handleSelectKind(nextKind: string) {
     setActiveKind(nextKind);
     setSelectedRowKey(null);
+    setCheckedRows({});
+    setBulkDeleteConfirmOpen(false);
     setDrawerOpen(false);
     setColMenuOpen(false);
     // Ensure parent group is expanded
@@ -1209,6 +1218,8 @@ export function App() {
   function handleSelectNamespace(val: string) {
     loadedLazyRef.current = {};
     setSelectedRowKey(null);
+    setCheckedRows({});
+    setBulkDeleteConfirmOpen(false);
     setDrawerOpen(false);
     if (val === "__ALL__") {
       setSnapshot((prev) => ({ ...prev, all_namespaces: true }));
@@ -1394,6 +1405,42 @@ export function App() {
     );
   }, [filteredResources, snapshot.resources, drawerExtraPods, drawerExtraResources, selectedResourceFallback, selectedRowKey]);
 
+  const selectedCheckedResources = useMemo(
+    () => filteredResources.filter((r) => Boolean(checkedRows[`${r.kind}:${r.namespace}/${r.name}`])),
+    [filteredResources, checkedRows],
+  );
+
+  function executeBulkDelete() {
+    if (selectedCheckedResources.length === 0) return;
+    const items = selectedCheckedResources.map((r) => ({
+      kind: r.kind,
+      namespace: r.namespace || "",
+      name: r.name,
+    }));
+    const removedSet = new Set(selectedCheckedResources.map((r) => `${r.kind}:${r.namespace}/${r.name}`));
+    if (selectedRowKey && removedSet.has(selectedRowKey)) {
+      setDrawerOpen(false);
+      setSelectedRowKey(null);
+    }
+    setCheckedRows({});
+    setBulkDeleteConfirmOpen(false);
+    setBanner({
+      text: `Removing ${items.length} selected item(s)…`,
+      isError: false,
+    });
+    setSnapshot((prev) => ({
+      ...prev,
+      resources: (prev.resources || []).filter((r) => !removedSet.has(`${r.kind}:${r.namespace}/${r.name}`)),
+      helm_releases: (prev.helm_releases || []).filter(
+        (rel) => !removedSet.has(`HelmRelease:${rel.namespace || "default"}/${rel.name}`),
+      ),
+    }));
+    sendToBackend({
+      op: "delete-batch",
+      items,
+    });
+  }
+
   const allAvailableNamespaces = useMemo(() => {
     const set = new Set<string>(snapshot.namespaces || []);
     if (snapshot.current_namespace) set.add(snapshot.current_namespace);
@@ -1416,11 +1463,13 @@ export function App() {
       ready: boolean,
       reason: string,
       isEphemeral?: boolean,
+      isSidecar?: boolean,
     ): string => {
       if (state === "terminated") {
         return reason === "Completed" || res.status === "Succeeded" ? "completed" : "failed";
       }
       if (isEphemeral && state === "running") return "ephemeral";
+      if (isSidecar && state === "running" && ready) return "sidecar";
       if (state === "waiting" || !ready) return "waiting";
       return "running";
     };
@@ -1443,7 +1492,7 @@ export function App() {
       const tag = cs.is_ephemeral ? "ephemeral" : isSidecar ? "sidecar" : isRegularInit ? "init" : undefined;
       items.push({
         name: cs.name,
-        cls: clsFor(cs.state, cs.ready, cs.reason, cs.is_ephemeral),
+        cls: clsFor(cs.state, cs.ready, cs.reason, cs.is_ephemeral, isSidecar),
         tag,
       });
     }
@@ -1477,7 +1526,7 @@ export function App() {
         seen.add(ic.name);
         items.push({
           name: ic.name,
-          cls: running ? "running" : "completed",
+          cls: running ? (isSidecar ? "sidecar" : "running") : "completed",
           tag: isSidecar ? "sidecar" : "init",
         });
       }
@@ -1690,9 +1739,6 @@ export function App() {
       if (cs.is_ephemeral) {
         return cs.state === "running" || cs.state === "waiting";
       }
-      if (cs.is_init && !cs.is_sidecar) {
-        return cs.state !== "terminated" || cs.reason !== "Completed";
-      }
       return true;
     });
     return (
@@ -1701,27 +1747,39 @@ export function App() {
           let cls = "running";
           if (cs.is_ephemeral && cs.state === "running") {
             cls = "ephemeral";
+          } else if (cs.is_sidecar && cs.state === "running" && cs.ready) {
+            cls = "sidecar";
           } else if (cs.state === "terminated") {
-            cls = cs.reason === "Completed" || res.status === "Succeeded" ? "completed" : "failed";
+            cls =
+              cs.reason === "Completed" || cs.exit_code === 0 || res.status === "Succeeded"
+                ? "completed"
+                : "failed";
           } else if (cs.state === "waiting") {
             cls = "waiting";
           } else if (!cs.ready) {
             cls = "waiting";
           }
           const parts: string[] = [cs.state];
-          if (cs.is_ephemeral) parts.push("ephemeral");
-          else if (cs.is_sidecar) {
+          if (cs.is_ephemeral) {
+            parts.push("ephemeral");
+          } else if (cs.is_sidecar) {
+            parts.push("init");
             if (cs.ready) parts.push("ready");
             parts.push("sidecar");
           } else if (cs.is_init) {
             parts.push("init");
+            if (cs.ready) parts.push("ready");
           } else if (cs.ready) {
             parts.push("ready");
           }
-          if (cs.reason && cs.state !== "running") {
-            parts.push(`(${cs.reason})`);
+          let statusText = parts.join(", ");
+          if (cs.state === "terminated") {
+            const termReason = cs.reason || (cs.exit_code === 0 ? "Completed" : "Error");
+            const codeSuffix = cs.exit_code !== undefined && cs.exit_code !== null ? ` (exit code: ${cs.exit_code})` : "";
+            statusText += ` - ${termReason}${codeSuffix}`;
+          } else if (cs.reason && cs.state !== "running") {
+            statusText += ` (${cs.reason})`;
           }
-          const statusText = parts.join(", ");
           return (
             <span
               key={`${cs.name}-${i}`}
@@ -1733,6 +1791,10 @@ export function App() {
                   statusText,
                   statusCls: cls,
                   startedAt: cs.started_at || undefined,
+                  finishedAt: cs.finished_at || undefined,
+                  reason: cs.state === "terminated" ? cs.reason || "Completed" : undefined,
+                  exitCode: cs.state === "terminated" ? (cs.exit_code ?? 0) : undefined,
+                  containerId: cs.state === "terminated" ? cs.container_id || undefined : undefined,
                   x: r.left + r.width / 2,
                   y: r.bottom + 6,
                 });
@@ -2569,6 +2631,18 @@ export function App() {
                     <th style={{ width: 38, textAlign: "center" }}>
                       <input
                         type="checkbox"
+                        className="fl-row-checkbox"
+                        checked={
+                          filteredResources.length > 0 &&
+                          selectedCheckedResources.length === filteredResources.length
+                        }
+                        ref={(el) => {
+                          if (el) {
+                            el.indeterminate =
+                              selectedCheckedResources.length > 0 &&
+                              selectedCheckedResources.length < filteredResources.length;
+                          }
+                        }}
                         onChange={(e) => {
                           const next: Record<string, boolean> = {};
                           if (e.target.checked) {
@@ -2639,6 +2713,7 @@ export function App() {
                           <td style={{ textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
                             <input
                               type="checkbox"
+                              className="fl-row-checkbox"
                               checked={Boolean(checkedRows[rowKey])}
                               onChange={(e) => setCheckedRows((prev) => ({ ...prev, [rowKey]: e.target.checked }))}
                             />
@@ -2672,6 +2747,85 @@ export function App() {
             </table>
           )}
         </div>
+
+        {/* Floating Bulk Remove Button ("Remove selected items (N)") */}
+        {selectedCheckedResources.length > 0 &&
+          activeKind !== "Node" &&
+          activeKind !== "ClusterCatalog" &&
+          activeKind !== "Event" &&
+          activeKind !== "Workspace" &&
+          activeKind !== "ClusterOverview" &&
+          activeKind !== "WorkloadsOverview" && (
+            <div
+              className="fl-bulk-remove-wrap"
+              style={{ right: drawerOpen && selectedResource ? drawerWidth + 28 : 28 }}
+            >
+              <div className="fl-bulk-remove-tooltip">
+                Remove selected items ({selectedCheckedResources.length})
+              </div>
+              <button
+                type="button"
+                className="fl-bulk-remove-fab"
+                title={`Remove selected items (${selectedCheckedResources.length})`}
+                aria-label={`Remove selected items (${selectedCheckedResources.length})`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setBulkDeleteConfirmOpen(true);
+                }}
+              >
+                <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+                  <line x1="4" y1="9" x2="14" y2="9" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />
+                </svg>
+              </button>
+            </div>
+          )}
+
+        {/* Bulk Remove Confirmation Modal */}
+        {bulkDeleteConfirmOpen && selectedCheckedResources.length > 0 && (
+          <div className="fl-pf-modal-backdrop" onClick={() => setBulkDeleteConfirmOpen(false)}>
+            <div
+              className="fl-pf-modal"
+              style={{ width: 460 }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="fl-pf-modal-header">
+                <span>Remove Selected Items </span>
+                <span className="fl-pf-modal-target">({selectedCheckedResources.length})</span>
+              </div>
+              <div className="fl-pf-modal-body" style={{ gap: 12 }}>
+                <div style={{ fontSize: 13, color: "var(--fl-fg)", lineHeight: 1.5 }}>
+                  Are you sure you want to remove the following{" "}
+                  <strong>{selectedCheckedResources.length}</strong> item(s)?
+                </div>
+                <div className="fl-bulk-remove-list">
+                  {selectedCheckedResources.map((r) => (
+                    <div key={`${r.kind}:${r.namespace}/${r.name}`} className="fl-bulk-remove-item">
+                      <span className="fl-bulk-remove-item-name">{r.name}</span>
+                      {r.namespace && <span className="fl-bulk-remove-item-ns">{r.namespace}</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="fl-pf-modal-footer">
+                <button
+                  type="button"
+                  className="fl-pf-cancel-btn"
+                  onClick={() => setBulkDeleteConfirmOpen(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="fl-bulk-remove-confirm-btn"
+                  autoFocus
+                  onClick={executeBulkDelete}
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Floating Column Visibility & Order Popover (Screenshot 1 right side) */}
         {colMenuOpen && (
@@ -3454,18 +3608,42 @@ export function App() {
           <div
             className="fl-csq-tooltip"
             style={{
-              top: Math.min(window.innerHeight - 80, csqTooltip.y),
-              left: Math.min(window.innerWidth - 260, Math.max(12, csqTooltip.x)),
+              top: Math.min(window.innerHeight - 150, csqTooltip.y),
+              left: Math.min(window.innerWidth - 360, Math.max(12, csqTooltip.x)),
             }}
           >
             <div className="fl-csq-tooltip-header">
               <strong>{csqTooltip.name}</strong>{" "}
               <span className={`fl-csq-tooltip-state ${csqTooltip.statusCls}`}>{csqTooltip.statusText}</span>
             </div>
+            {csqTooltip.exitCode !== undefined && csqTooltip.exitCode !== null && (
+              <div className="fl-csq-tooltip-row">
+                <span className="fl-csq-tooltip-key">Exit Code</span>
+                <span>{csqTooltip.exitCode}</span>
+              </div>
+            )}
+            {csqTooltip.reason && (
+              <div className="fl-csq-tooltip-row">
+                <span className="fl-csq-tooltip-key">Reason</span>
+                <span>{csqTooltip.reason}</span>
+              </div>
+            )}
             {csqTooltip.startedAt && (
               <div className="fl-csq-tooltip-row">
                 <span className="fl-csq-tooltip-key">Started At</span>
                 <span>{csqTooltip.startedAt}</span>
+              </div>
+            )}
+            {csqTooltip.finishedAt && (
+              <div className="fl-csq-tooltip-row">
+                <span className="fl-csq-tooltip-key">Finished At</span>
+                <span>{csqTooltip.finishedAt}</span>
+              </div>
+            )}
+            {csqTooltip.containerId && (
+              <div className="fl-csq-tooltip-row">
+                <span className="fl-csq-tooltip-key">Container ID</span>
+                <span>{csqTooltip.containerId}</span>
               </div>
             )}
           </div>

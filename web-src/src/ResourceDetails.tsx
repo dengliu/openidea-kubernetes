@@ -649,7 +649,9 @@ function PodContainerSection({
         const isSidecar = Boolean(isInit && c.restartPolicy === "Always");
         const brickCls =
           stateKey === "running" && (st?.ready ?? true)
-            ? "running"
+            ? isSidecar
+              ? "sidecar"
+              : "running"
             : stateKey === "waiting"
               ? "waiting"
               : stateKey === "terminated" && (terminated?.reason === "Completed" || terminated?.exitCode === 0)
@@ -687,7 +689,7 @@ function PodContainerSection({
             {st && (
               <DrawerRow name="Status">
                 <span
-                  className={`fl-status-text ${brickCls === "running" ? "ok" : brickCls === "waiting" ? "warn" : brickCls === "failed" ? "err" : ""}`}
+                  className={`fl-status-text ${brickCls === "sidecar" ? "sidecar" : brickCls === "running" ? "ok" : brickCls === "waiting" ? "warn" : brickCls === "failed" ? "err" : ""}`}
                 >
                   {statusLine}
                 </span>

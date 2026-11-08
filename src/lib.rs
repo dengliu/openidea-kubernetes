@@ -730,12 +730,75 @@ impl KubernetesPlugin {
                 match delete_cluster_resource(&project, &cfg, kind, ns, name) {
                     Ok(msg) => {
                         if let Some(ref mut snap) = self.snapshot {
+                            snap.resources.retain(|r| !(r.kind == kind && r.namespace == ns && r.name == name));
+                            if kind == "HelmRelease" {
+                                snap.helm_releases.retain(|r| !(r.namespace == ns && r.name == name));
+                            }
                             fetch_category_into_snapshot(&project, &cfg, snap, kind);
                         }
                         self.post_snapshot(false);
                         Self::post_detail(msg.clone(), Some(msg), false);
                     }
                     Err(e) => Self::post_detail(e.to_string(), Some(e.to_string()), true),
+                }
+            }
+            "delete-batch" => {
+                let project = resolve_project(ctx)?;
+                let mut cfg = KubeConfigState::load();
+                self.ensure_catalog_loaded(&project, &mut cfg);
+                let items = v.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+                if items.is_empty() {
+                    return Ok(());
+                }
+                let mut deleted = Vec::new();
+                let mut deleted_keys = Vec::new();
+                let mut errors = Vec::new();
+                let mut touched_kinds = Vec::new();
+                for item in &items {
+                    let kind = item.get("kind").and_then(Value::as_str).unwrap_or("Pod");
+                    let ns = item.get("namespace").and_then(Value::as_str).unwrap_or("");
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    if !touched_kinds.iter().any(|k: &String| k == kind) {
+                        touched_kinds.push(kind.to_owned());
+                    }
+                    match delete_cluster_resource(&project, &cfg, kind, ns, name) {
+                        Ok(_) => {
+                            deleted.push(if ns.is_empty() {
+                                format!("{kind}/{name}")
+                            } else {
+                                format!("{kind}/{ns}/{name}")
+                            });
+                            deleted_keys.push((kind.to_owned(), ns.to_owned(), name.to_owned()));
+                        }
+                        Err(e) => errors.push(format!("{kind}/{name}: {e}")),
+                    }
+                }
+                if let Some(ref mut snap) = self.snapshot {
+                    for (k, ns, n) in &deleted_keys {
+                        snap.resources.retain(|r| !(r.kind == *k && r.namespace == *ns && r.name == *n));
+                        if k == "HelmRelease" {
+                            snap.helm_releases.retain(|r| !(r.namespace == *ns && r.name == *n));
+                        }
+                    }
+                    for kind in &touched_kinds {
+                        fetch_category_into_snapshot(&project, &cfg, snap, kind);
+                    }
+                }
+                self.post_snapshot(false);
+                if errors.is_empty() {
+                    let msg = format!("Removed {} item(s): {}", deleted.len(), deleted.join(", "));
+                    Self::post_detail(msg.clone(), Some(msg), false);
+                } else {
+                    let msg = format!(
+                        "Removed {} item(s); {} failed: {}",
+                        deleted.len(),
+                        errors.len(),
+                        errors.join("; ")
+                    );
+                    Self::post_detail(msg.clone(), Some(msg), true);
                 }
             }
             "cordon-node" => {
