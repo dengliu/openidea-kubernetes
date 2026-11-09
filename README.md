@@ -2,9 +2,7 @@
 
 An [OpenIDEA](https://github.com/l0ng-ai/openidea) plugin (`dengliu.kubernetes`) that combines a [Freelens](https://github.com/freelensapp/freelens)-style Kubernetes cluster explorer with [JetBrains Kubernetes](https://plugins.jetbrains.com/plugin/10485-kubernetes)-style YAML, Helm, and Kustomize editor intelligence.
 
-![Architecture](./architecture.excalidraw.svg)
-
-See [design.md](./design.md) for the full architectural and protocol design.
+![Demo](./demo.excalidraw.svg)
 
 ## Features
 
@@ -35,6 +33,12 @@ See [design.md](./design.md) for the full architectural and protocol design.
   - `k8s-selector-mismatch`: Workload `spec.selector.matchLabels` does not match `spec.template.metadata.labels`.
   - `k8s-dangling-service-selector`: `Service` selector does not match any workload in the project.
   - `k8s-unresolved-ref`: Reference to a `ConfigMap`, `Secret`, `Service`, or key not found in the workspace.
+
+## Architecture
+
+![Architecture](./architecture.excalidraw.svg)
+
+See [design.md](./design.md) for the full architectural and protocol design.
 
 ## Capabilities
 
