@@ -179,6 +179,7 @@ impl KubernetesPlugin {
             resources: Vec::new(),
             events: Vec::new(),
             helm_releases: Vec::new(),
+            ..Default::default()
         });
         match fetch_kubeconfig_overview(project, cfg) {
             Ok((current_ctx, contexts, ctx_ns, catalog)) => {
@@ -439,6 +440,11 @@ impl KubernetesPlugin {
                 let snap = self.snapshot.clone().unwrap_or_default();
                 let ws = workspace_manifests_json(&self.index.files, &root);
                 let cat = v.get("category").and_then(Value::as_str).unwrap_or("Pod");
+                let req_limit = v
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|n| (n as u32).clamp(10, 500))
+                    .unwrap_or(kubectl::DEFAULT_PAGE_LIMIT);
                 let needs_fetch =
                     snap.namespaces.len() <= 3 || !snap.resources.iter().any(|r| r.kind == cat);
                 let payload = json!({
@@ -458,12 +464,26 @@ impl KubernetesPlugin {
                         fetch_namespaces_into_snapshot(p, &cfg, s);
                     }
                     enforce_large_cluster_scope(&mut cfg, s);
-                    fetch_category_into_snapshot(p, &cfg, s, cat);
+                    fetch_category_with_options(
+                        p,
+                        &cfg,
+                        s,
+                        cat,
+                        FetchOptions {
+                            limit: req_limit,
+                            ..FetchOptions::default()
+                        },
+                    );
                     self.post_snapshot(false);
                 }
             }
             "refresh" => {
                 let project = resolve_project(ctx)?;
+                let req_limit = v
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|n| (n as u32).clamp(10, 500))
+                    .unwrap_or(kubectl::DEFAULT_PAGE_LIMIT);
                 if let Some(cat) = v.get("category").and_then(Value::as_str) {
                     if cat == "Workspace" {
                         self.index.built_at = None;
@@ -475,7 +495,16 @@ impl KubernetesPlugin {
                     self.ensure_catalog_loaded(&project, &mut cfg);
                     if let Some(ref mut snap) = self.snapshot {
                         fetch_namespaces_into_snapshot(&project, &cfg, snap);
-                        fetch_category_into_snapshot(&project, &cfg, snap, cat);
+                        fetch_category_with_options(
+                            &project,
+                            &cfg,
+                            snap,
+                            cat,
+                            FetchOptions {
+                                limit: req_limit,
+                                ..FetchOptions::default()
+                            },
+                        );
                     }
                     self.post_snapshot(false);
                 } else {
@@ -526,6 +555,11 @@ impl KubernetesPlugin {
                         cfg.context = c.to_owned();
                         cfg.namespace = default_ns.clone();
                         cfg.all_namespaces = false;
+                        let req_limit = v
+                            .get("limit")
+                            .and_then(Value::as_u64)
+                            .map(|n| (n as u32).clamp(10, 500))
+                            .unwrap_or(kubectl::DEFAULT_PAGE_LIMIT);
                         let mut snap = ClusterSnapshot {
                             connected: false,
                             error: None,
@@ -538,6 +572,7 @@ impl KubernetesPlugin {
                             resources: Vec::new(),
                             events: Vec::new(),
                             helm_releases: Vec::new(),
+                            ..Default::default()
                         };
                         snap.namespaces.sort();
                         snap.namespaces.dedup();
@@ -545,7 +580,16 @@ impl KubernetesPlugin {
                         if let Ok(project) = resolve_project(ctx) {
                             fetch_namespaces_into_snapshot(&project, &cfg, &mut snap);
                             if cat != "ClusterCatalog" && cat != "Workspace" {
-                                fetch_category_into_snapshot(&project, &cfg, &mut snap, cat);
+                                fetch_category_with_options(
+                                    &project,
+                                    &cfg,
+                                    &mut snap,
+                                    cat,
+                                    FetchOptions {
+                                        limit: req_limit,
+                                        ..FetchOptions::default()
+                                    },
+                                );
                             }
                             self.snapshot = Some(snap);
                             self.post_snapshot(false);
@@ -603,6 +647,54 @@ impl KubernetesPlugin {
                         if snap.namespaces.len() <= 3 && !is_poll {
                             fetch_namespaces_into_snapshot(&project, &cfg, snap);
                         }
+                        let existing_pi = snap.page_info.get(cat).cloned();
+                        // When the user appended multiple pages ("Load more"), skip background poll replacement
+                        // so accumulated pages are not wiped out every 5s.
+                        if is_poll
+                            && let Some(ref pi) = existing_pi
+                            && pi.mode == "append"
+                            && pi.loaded_count > u64::from(pi.limit)
+                        {
+                            let elapsed_ms = started.elapsed().as_millis() as u64;
+                            self.post_snapshot_meta(false, Some(elapsed_ms));
+                            return Ok(());
+                        }
+                        let limit = v
+                            .get("limit")
+                            .and_then(Value::as_u64)
+                            .map(|n| (n as u32).clamp(10, 500))
+                            .or_else(|| existing_pi.as_ref().map(|pi| pi.limit))
+                            .unwrap_or(kubectl::DEFAULT_PAGE_LIMIT);
+                        let continue_token = v
+                            .get("continueToken")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                if is_poll {
+                                    existing_pi
+                                        .as_ref()
+                                        .map(|pi| pi.request_token.clone())
+                                        .unwrap_or_default()
+                                } else {
+                                    String::new()
+                                }
+                            });
+                        let append =
+                            !is_poll && v.get("pageMode").and_then(Value::as_str) == Some("append");
+                        let page_index = v
+                            .get("pageIndex")
+                            .and_then(Value::as_u64)
+                            .map(|n| n.max(1) as u32)
+                            .unwrap_or_else(|| {
+                                if is_poll {
+                                    existing_pi
+                                        .as_ref()
+                                        .map(|pi| pi.page_index.max(1))
+                                        .unwrap_or(1)
+                                } else {
+                                    1
+                                }
+                            });
                         fetch_category_with_options(
                             &project,
                             &cfg,
@@ -611,6 +703,10 @@ impl KubernetesPlugin {
                             FetchOptions {
                                 is_background_poll: is_poll,
                                 include_metrics,
+                                limit,
+                                continue_token,
+                                append,
+                                page_index,
                             },
                         );
                     }
@@ -648,6 +744,11 @@ impl KubernetesPlugin {
                 if let Some(ns) = v.get("namespace").and_then(Value::as_str) {
                     let _ = storage::set("namespace", ns);
                     let _ = storage::set("allNamespaces", "false");
+                    let req_limit = v
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .map(|n| (n as u32).clamp(10, 500))
+                        .unwrap_or(kubectl::DEFAULT_PAGE_LIMIT);
                     if let Some(cat) = v.get("category").and_then(Value::as_str)
                         && let Ok(project) = resolve_project(ctx)
                     {
@@ -660,13 +761,21 @@ impl KubernetesPlugin {
                             snap.current_namespace = ns.to_owned();
                             snap.all_namespaces = false;
                             snap.helm_releases.clear();
-                            snap.resources.retain(|r| {
-                                matches!(
-                                    r.kind.as_str(),
-                                    "Namespace" | "Node" | "CustomResourceDefinition"
-                                )
-                            });
-                            fetch_category_into_snapshot(&project, &cfg, snap, cat);
+                            snap.events.clear();
+                            snap.page_info.clear();
+                            snap.overview_counts.retain(|k, _| k == "Namespace");
+                            snap.resources
+                                .retain(|r| r.kind == "CustomResourceDefinition");
+                            fetch_category_with_options(
+                                &project,
+                                &cfg,
+                                snap,
+                                cat,
+                                FetchOptions {
+                                    limit: req_limit,
+                                    ..FetchOptions::default()
+                                },
+                            );
                         }
                         self.post_snapshot(false);
                     } else {
@@ -680,6 +789,11 @@ impl KubernetesPlugin {
             "set-all-namespaces" => {
                 let all = v.get("all").and_then(Value::as_bool).unwrap_or(false);
                 let _ = storage::set("allNamespaces", if all { "true" } else { "false" });
+                let req_limit = v
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|n| (n as u32).clamp(10, 500))
+                    .unwrap_or(kubectl::DEFAULT_PAGE_LIMIT);
                 if let Some(cat) = v.get("category").and_then(Value::as_str)
                     && let Ok(project) = resolve_project(ctx)
                 {
@@ -702,13 +816,21 @@ impl KubernetesPlugin {
                             snap.all_namespaces = all;
                         }
                         snap.helm_releases.clear();
-                        snap.resources.retain(|r| {
-                            matches!(
-                                r.kind.as_str(),
-                                "Namespace" | "Node" | "CustomResourceDefinition"
-                            )
-                        });
-                        fetch_category_into_snapshot(&project, &cfg, snap, cat);
+                        snap.events.clear();
+                        snap.page_info.clear();
+                        snap.overview_counts.retain(|k, _| k == "Namespace");
+                        snap.resources
+                            .retain(|r| r.kind == "CustomResourceDefinition");
+                        fetch_category_with_options(
+                            &project,
+                            &cfg,
+                            snap,
+                            cat,
+                            FetchOptions {
+                                limit: req_limit,
+                                ..FetchOptions::default()
+                            },
+                        );
                     }
                     self.post_snapshot(false);
                 } else {
@@ -2950,5 +3072,187 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
             "rendered HTML must stay well below 4 MiB MAX_HTML without truncating closing script tag (len={})",
             html.len()
         );
+    }
+
+    #[test]
+    fn server_side_limit_and_continue_pagination_works_across_pods_nodes_events_and_crs() {
+        let seen_args = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let host = install_mock_with_kubectl();
+        let seen_clone = seen_args.clone();
+        host.on_process("kubectl", move |args, _stdin| {
+            seen_clone.lock().unwrap().push(args.to_vec());
+            let joined = args.join(" ");
+            let stdout = if joined.contains("config view") {
+                KUBECONFIG_JSON.to_owned()
+            } else if joined.contains("get namespaces --no-headers") {
+                "default Active 30d\nproduction Active 30d\n".to_owned()
+            } else if joined.contains("get crd --no-headers") {
+                "workloads.kueue.x-k8s.io 2025-07-29T21:30:07Z\n".to_owned()
+            } else if joined.contains("--raw /apis/kueue.x-k8s.io/v1beta1/namespaces/production/workloads?limit=50") {
+                r#"{"kind":"WorkloadList","metadata":{"continue":"cr-tok-2","remainingItemCount":450},"items":[{"metadata":{"name":"job-wl-1","namespace":"production","creationTimestamp":"2026-11-11T10:00:00Z"},"status":{"phase":"Admitted"}}]}"#.to_owned()
+            } else if joined.contains("--raw /apis/kueue.x-k8s.io/v1beta1") {
+                r#"{"kind":"APIResourceList","resources":[{"name":"workloads","namespaced":true,"kind":"Workload"}]}"#.to_owned()
+            } else if joined.contains("--raw /apis/kueue.x-k8s.io") {
+                r#"{"kind":"APIGroup","preferredVersion":{"version":"v1beta1"}}"#.to_owned()
+            } else if joined.contains("pods?limit=50&continue=expired-tok") {
+                return Ok(ProcessOutput {
+                    status: Some(1),
+                    stdout: String::new(),
+                    stderr: "Error from server (Gone): 410: continue token is too old (ResourceExpired)".into(),
+                });
+            } else if joined.contains("pods?limit=50&continue=pod-tok-2") {
+                r#"{"kind":"PodList","metadata":{"continue":"pod-tok-3","remainingItemCount":52710},"items":[{"metadata":{"name":"worker-002","namespace":"train","creationTimestamp":"2026-11-11T10:00:00Z"},"spec":{"nodeName":"gpu-02","containers":[{"name":"app"}]},"status":{"phase":"Running","podIP":"10.1.0.2","containerStatuses":[{"name":"app","ready":true,"restartCount":0,"state":{"running":{"startedAt":"2026-11-11T10:00:01Z"}}}]}}]}"#.to_owned()
+            } else if joined.contains("pods?limit=50") {
+                r#"{"kind":"PodList","metadata":{"continue":"pod-tok-2","remainingItemCount":52760},"items":[{"metadata":{"name":"worker-001","namespace":"train","creationTimestamp":"2026-11-11T10:00:00Z"},"spec":{"nodeName":"gpu-01","containers":[{"name":"app"}]},"status":{"phase":"Running","podIP":"10.1.0.1","containerStatuses":[{"name":"app","ready":true,"restartCount":1,"state":{"running":{"startedAt":"2026-11-11T10:00:01Z"}}}]}}]}"#.to_owned()
+            } else if joined.contains("--raw /api/v1/nodes?limit=50") {
+                r#"{"kind":"NodeList","metadata":{"continue":"node-tok-2","remainingItemCount":2123},"items":[{"metadata":{"name":"aks-gpu-001","creationTimestamp":"2026-10-01T00:00:00Z","labels":{"node-role.kubernetes.io/gpu":"","node.kubernetes.io/instance-type":"Standard_ND96amsr_A100_v4","kubernetes.azure.com/agentpool":"gpupool"}},"spec":{"unschedulable":true,"taints":[{"key":"nvidia.com/gpu","value":"present","effect":"NoSchedule"}]},"status":{"allocatable":{"cpu":"96","memory":"1900Gi"},"addresses":[{"type":"InternalIP","address":"10.240.0.4"}],"conditions":[{"type":"Ready","status":"True"}],"nodeInfo":{"kubeletVersion":"v1.31.2","kernelVersion":"6.8.0-1017-azure"}}}]}"#.to_owned()
+            } else if joined.contains("events?limit=50") {
+                r#"{"kind":"EventList","metadata":{"continue":"ev-tok-2","remainingItemCount":133700},"items":[{"metadata":{"namespace":"production","creationTimestamp":"2026-11-11T12:00:00Z"},"involvedObject":{"kind":"Pod","name":"worker-001"},"reason":"Pulled","message":"Successfully pulled image","type":"Normal","count":1}]}"#.to_owned()
+            } else {
+                String::new()
+            };
+            Ok(ProcessOutput {
+                status: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        });
+        host.add_file("k8s/app.yaml", SAMPLE_MANIFEST);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        // 1. All-namespaces Pods page 1 (`limit=50`): returns page 1 + continue token, skips `kubectl top pods` because total > 300
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"set-all-namespaces","all":true,"category":"Pod","limit":50}"#.into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        {
+            let snap = plugin.snapshot.as_ref().unwrap();
+            let pi = snap.page_info.get("Pod").expect("Pod page_info");
+            assert_eq!(pi.continue_token, "pod-tok-2");
+            assert_eq!(pi.remaining_count, Some(52_760));
+            assert_eq!(snap.overview_counts.get("Pod"), Some(&52_761));
+            assert_eq!(snap.resources.iter().filter(|r| r.kind == "Pod").count(), 1);
+            assert!(
+                !seen_args
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a.iter().any(|x| x == "top")),
+                "must skip cluster-wide kubectl top pods when total_pods > 300"
+            );
+        }
+
+        // 2. Append mode ("Load more") appends page 2 without dropping page 1
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"load-category","category":"Pod","limit":50,"continueToken":"pod-tok-2","pageMode":"append","pageIndex":2}"#.into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        {
+            let snap = plugin.snapshot.as_ref().unwrap();
+            let pods: Vec<_> = snap.resources.iter().filter(|r| r.kind == "Pod").collect();
+            assert_eq!(pods.len(), 2);
+            assert_eq!(pods[0].name, "worker-001");
+            assert_eq!(pods[1].name, "worker-002");
+            assert_eq!(snap.page_info["Pod"].continue_token, "pod-tok-3");
+            assert_eq!(snap.page_info["Pod"].mode, "append");
+        }
+
+        // 3. Expired continue token (410 Gone) recovers cleanly back to Page 1
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"load-category","category":"Pod","limit":50,"continueToken":"expired-tok","pageMode":"replace","pageIndex":4}"#.into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        {
+            let snap = plugin.snapshot.as_ref().unwrap();
+            assert_eq!(snap.page_info["Pod"].page_index, 1);
+            assert_eq!(snap.page_info["Pod"].continue_token, "pod-tok-2");
+        }
+
+        // 4. Nodes paged JSON populates full Freelens Node columns
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(r#"{"op":"load-category","category":"Node","limit":50}"#.into()),
+                &host.invocation(),
+            )
+            .unwrap();
+        {
+            let snap = plugin.snapshot.as_ref().unwrap();
+            let node = snap
+                .resources
+                .iter()
+                .find(|r| r.kind == "Node")
+                .expect("Node row");
+            assert_eq!(node.host_ip, "gpu");
+            assert_eq!(node.qos, "False");
+            assert_eq!(node.status, "Ready, SchedulingDisabled");
+            assert_eq!(node.pod_ip, "10.240.0.4");
+            assert_eq!(node.ready, "v1.31.2");
+            assert_eq!(node.node_name, "6.8.0-1017-azure");
+            assert_eq!(node.controlled_by_kind, "Standard_ND96amsr_A100_v4");
+            assert_eq!(node.controlled_by_name, "gpupool");
+            assert_eq!(node.restarts, 1);
+            assert_eq!(node.cpu, "0.00/96.00");
+            assert_eq!(snap.page_info["Node"].remaining_count, Some(2123));
+        }
+
+        // 5. Events & Custom Resources (`CR:*`) paginate via REST API
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"set-namespace","namespace":"production","category":"Event","limit":50}"#.into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        assert_eq!(
+            plugin.snapshot.as_ref().unwrap().page_info["Event"].remaining_count,
+            Some(133_700)
+        );
+
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"load-category","category":"CR:workloads.kueue.x-k8s.io","limit":50}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        {
+            let snap = plugin.snapshot.as_ref().unwrap();
+            let cr = snap
+                .resources
+                .iter()
+                .find(|r| r.kind == "CR:workloads.kueue.x-k8s.io")
+                .expect("CR row");
+            assert_eq!(cr.name, "job-wl-1");
+            assert_eq!(cr.status, "Admitted");
+            assert_eq!(
+                snap.page_info["CR:workloads.kueue.x-k8s.io"].continue_token,
+                "cr-tok-2"
+            );
+        }
     }
 }

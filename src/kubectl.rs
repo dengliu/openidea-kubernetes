@@ -207,6 +207,23 @@ pub struct HelmRelease {
     pub updated: String,
 }
 
+pub const DEFAULT_PAGE_LIMIT: u32 = 100;
+pub const MAX_APPENDED_ITEMS: usize = 2_000;
+
+/// Pagination metadata for a single resource category returned by Kubernetes API `limit` + `continue`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CategoryPageInfo {
+    pub category: String,
+    pub limit: u32,
+    #[serde(default)]
+    pub request_token: String,
+    pub continue_token: String,
+    pub remaining_count: Option<u64>,
+    pub loaded_count: u64,
+    pub page_index: u32,
+    pub mode: String,
+}
+
 /// Snapshot of the cluster state displayed in the Kubernetes tool window.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterSnapshot {
@@ -221,6 +238,10 @@ pub struct ClusterSnapshot {
     pub resources: Vec<ClusterResource>,
     pub events: Vec<ClusterEvent>,
     pub helm_releases: Vec<HelmRelease>,
+    #[serde(default)]
+    pub page_info: BTreeMap<String, CategoryPageInfo>,
+    #[serde(default)]
+    pub overview_counts: BTreeMap<String, u64>,
 }
 
 /// Finds the active `Project` from `ctx` or the first open project in the workspace.
@@ -234,10 +255,14 @@ pub fn resolve_project(ctx: &Invocation) -> Result<Project, Error> {
         .ok_or_else(|| Error::Invalid("open a project to run Kubernetes commands".into()))
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FetchOptions {
     pub is_background_poll: bool,
     pub include_metrics: bool,
+    pub limit: u32,
+    pub continue_token: String,
+    pub append: bool,
+    pub page_index: u32,
 }
 
 impl Default for FetchOptions {
@@ -245,6 +270,10 @@ impl Default for FetchOptions {
         Self {
             is_background_poll: false,
             include_metrics: true,
+            limit: DEFAULT_PAGE_LIMIT,
+            continue_token: String::new(),
+            append: false,
+            page_index: 1,
         }
     }
 }
@@ -721,10 +750,20 @@ pub fn parse_kubeconfig_catalog(
     (current, contexts, active_ns, catalog)
 }
 
+#[derive(Deserialize, Default)]
+struct RawListMetadata {
+    #[serde(default, rename = "continue")]
+    continue_token: Option<String>,
+    #[serde(default, rename = "remainingItemCount")]
+    remaining_item_count: Option<u64>,
+}
+
 #[derive(Deserialize)]
 struct RawResourceList {
     #[serde(default)]
     kind: Option<String>,
+    #[serde(default)]
+    metadata: Option<RawListMetadata>,
     #[serde(default)]
     items: Option<Vec<RawResourceItem>>,
     #[serde(flatten)]
@@ -853,6 +892,20 @@ struct RawSpec {
     capacity: Option<BTreeMap<String, String>>,
     #[serde(default, rename = "persistentVolumeReclaimPolicy")]
     pv_reclaim_policy: Option<String>,
+    #[serde(default)]
+    unschedulable: Option<bool>,
+    #[serde(default)]
+    taints: Option<Vec<RawTaint>>,
+}
+
+#[derive(Deserialize)]
+struct RawTaint {
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    effect: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -942,6 +995,10 @@ struct RawStatus {
     #[serde(default)]
     capacity: Option<BTreeMap<String, String>>,
     #[serde(default)]
+    allocatable: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    addresses: Option<Vec<RawNodeAddress>>,
+    #[serde(default)]
     conditions: Option<Vec<RawCondition>>,
     #[serde(default, rename = "nodeInfo")]
     node_info: Option<RawNodeInfo>,
@@ -1016,20 +1073,55 @@ struct RawCondition {
 }
 
 #[derive(Deserialize)]
+struct RawNodeAddress {
+    #[serde(default, rename = "type")]
+    addr_type: Option<String>,
+    #[serde(default)]
+    address: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct RawNodeInfo {
     #[serde(default, rename = "kubeletVersion")]
     kubelet_version: Option<String>,
+    #[serde(default, rename = "kernelVersion")]
+    kernel_version: Option<String>,
 }
 
 /// Parses a `kubectl get ... -o json` List or single resource into `ClusterResource` items
 /// using typed deserialization so large annotations, `managedFields`, and CRD schemas are skipped without allocation.
 pub fn parse_resource_list_json(json_str: &str) -> Vec<ClusterResource> {
-    let Ok(parsed) = serde_json::from_str::<RawResourceList>(json_str) else {
-        return Vec::new();
-    };
+    parse_paged_resource_list_json(json_str, None)
+        .map(|(items, _, _)| items)
+        .unwrap_or_default()
+}
+
+/// Parses a Kubernetes `List` or single resource JSON into `(items, continue_token, remaining_item_count)`.
+/// When `fallback_kind` is provided (e.g. `"Pod"` or `"CR:workloads.kueue.x-k8s.io"`), items missing `TypeMeta.kind`
+/// in raw REST responses inherit that kind (`CR:*` always overrides so custom resource tables match `activeKind`).
+pub fn parse_paged_resource_list_json(
+    json_str: &str,
+    fallback_kind: Option<&str>,
+) -> Option<(Vec<ClusterResource>, String, Option<u64>)> {
+    let parsed = serde_json::from_str::<RawResourceList>(json_str).ok()?;
+    let list_meta = parsed.metadata.unwrap_or_default();
+    let cont = list_meta.continue_token.unwrap_or_default();
+    let remaining = list_meta.remaining_item_count;
+    let inferred_from_list = parsed
+        .kind
+        .as_deref()
+        .and_then(|k| k.strip_suffix("List"))
+        .filter(|k| !k.is_empty());
+    let force_cr_kind = fallback_kind.filter(|k| k.starts_with("CR:"));
+
     let mut out = Vec::new();
     if let Some(items) = parsed.items {
-        for item in items {
+        for mut item in items {
+            if let Some(cr_k) = force_cr_kind {
+                item.kind = Some(cr_k.to_owned());
+            } else if item.kind.as_deref().is_none_or(str::is_empty) {
+                item.kind = fallback_kind.or(inferred_from_list).map(str::to_owned);
+            }
             if let Some(res) = parse_raw_resource_item(item) {
                 out.push(res);
             }
@@ -1037,14 +1129,16 @@ pub fn parse_resource_list_json(json_str: &str) -> Vec<ClusterResource> {
     } else if parsed.kind.is_some()
         && let Some(mut single) = parsed.single
     {
-        if single.kind.is_none() {
-            single.kind = parsed.kind;
+        if let Some(cr_k) = force_cr_kind {
+            single.kind = Some(cr_k.to_owned());
+        } else if single.kind.is_none() {
+            single.kind = parsed.kind.or_else(|| fallback_kind.map(str::to_owned));
         }
         if let Some(res) = parse_raw_resource_item(single) {
             out.push(res);
         }
     }
-    out
+    Some((out, cont, remaining))
 }
 
 fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
@@ -1082,6 +1176,8 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         controller: None,
         capacity: None,
         pv_reclaim_policy: None,
+        unschedulable: None,
+        taints: None,
     });
     let st = item.status.unwrap_or(RawStatus {
         phase: None,
@@ -1098,6 +1194,8 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         succeeded: None,
         failed: None,
         capacity: None,
+        allocatable: None,
+        addresses: None,
         conditions: None,
         node_info: None,
         current_replicas: None,
@@ -1107,15 +1205,16 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         disruptions_allowed: None,
     });
 
-    let (controlled_by_kind, controlled_by_name) = meta
+    let (mut controlled_by_kind, mut controlled_by_name) = meta
         .owner_references
         .and_then(|mut v| v.pop())
         .map(|o| (o.kind.unwrap_or_default(), o.name.unwrap_or_default()))
         .unwrap_or_default();
-    let labels: Vec<String> = meta
-        .labels
-        .map(|m| m.into_iter().map(|(k, v)| format!("{k}={v}")).collect())
-        .unwrap_or_default();
+    let raw_labels_map = meta.labels.unwrap_or_default();
+    let labels: Vec<String> = raw_labels_map
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
 
     let mut containers = Vec::new();
     let mut container_states = Vec::new();
@@ -1126,9 +1225,11 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
     let mut detail = String::new();
     let mut restarts = 0u64;
     let mut pod_ip = st.pod_ip.clone().unwrap_or_default();
-    let host_ip = st.host_ip.clone().unwrap_or_default();
+    let mut host_ip = st.host_ip.clone().unwrap_or_default();
     let mut node_name = spec.node_name.clone().unwrap_or_default();
-    let qos = st.qos_class.clone().unwrap_or_default();
+    let mut qos = st.qos_class.clone().unwrap_or_default();
+    let mut cpu = String::new();
+    let mut memory = String::new();
 
     let carr = spec.containers.as_ref().or_else(|| {
         spec.template
@@ -1518,20 +1619,97 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
             };
         }
         "Node" => {
-            let is_ready = st.conditions.is_some_and(|arr| {
-                arr.iter().any(|c| {
-                    c.cond_type.as_deref() == Some("Ready") && c.status.as_deref() == Some("True")
-                })
-            });
-            status = if is_ready {
-                "Ready".into()
+            let unsched = spec.unschedulable.unwrap_or(false);
+            qos = if unsched {
+                "False".into()
             } else {
-                "NotReady".into()
+                "True".into()
             };
-            ready = st
-                .node_info
-                .and_then(|n| n.kubelet_version)
+            let mut active_conds: Vec<String> = Vec::new();
+            if let Some(arr) = st.conditions {
+                for c in arr {
+                    if c.status.as_deref() == Some("True")
+                        && let Some(ct) = c.cond_type
+                    {
+                        active_conds.push(ct);
+                    }
+                }
+            }
+            if active_conds.is_empty() {
+                active_conds.push("NotReady".into());
+            }
+            if unsched && !active_conds.iter().any(|c| c == "SchedulingDisabled") {
+                active_conds.push("SchedulingDisabled".into());
+            }
+            status = active_conds.join(", ");
+            if let Some(ni) = st.node_info {
+                ready = ni.kubelet_version.unwrap_or_default();
+                node_name = ni.kernel_version.unwrap_or_default();
+            }
+            if let Some(addrs) = st.addresses
+                && let Some(ip) = addrs
+                    .iter()
+                    .find(|a| a.addr_type.as_deref() == Some("InternalIP"))
+                    .and_then(|a| a.address.clone())
+                    .or_else(|| addrs.first().and_then(|a| a.address.clone()))
+            {
+                pod_ip = ip.clone();
+                detail = ip;
+            }
+            let mut roles: Vec<String> = Vec::new();
+            for (k, v) in &raw_labels_map {
+                if let Some(role) = k.strip_prefix("node-role.kubernetes.io/")
+                    && !role.is_empty()
+                {
+                    roles.push(role.to_owned());
+                } else if k == "kubernetes.io/role" && !v.is_empty() {
+                    roles.push(v.clone());
+                }
+            }
+            roles.sort();
+            roles.dedup();
+            host_ip = roles.join(", ");
+
+            controlled_by_kind = raw_labels_map
+                .get("node.kubernetes.io/instance-type")
+                .or_else(|| raw_labels_map.get("beta.kubernetes.io/instance-type"))
+                .cloned()
                 .unwrap_or_default();
+            controlled_by_name = raw_labels_map
+                .get("kubernetes.azure.com/agentpool")
+                .or_else(|| raw_labels_map.get("eks.amazonaws.com/nodegroup"))
+                .or_else(|| raw_labels_map.get("cloud.google.com/gke-nodepool"))
+                .or_else(|| raw_labels_map.get("karpenter.sh/nodepool"))
+                .cloned()
+                .unwrap_or_default();
+
+            if let Some(taints) = spec.taints {
+                containers = taints
+                    .into_iter()
+                    .filter_map(|t| {
+                        let key = t.key?;
+                        let effect = t.effect.unwrap_or_default();
+                        match (t.value.filter(|v| !v.is_empty()), effect.is_empty()) {
+                            (Some(val), false) => Some(format!("{key}={val}:{effect}")),
+                            (Some(val), true) => Some(format!("{key}={val}")),
+                            (None, false) => Some(format!("{key}:{effect}")),
+                            (None, true) => Some(key),
+                        }
+                    })
+                    .collect();
+                restarts = containers.len() as u64;
+            }
+            let alloc_map = st.allocatable.as_ref().or(st.capacity.as_ref());
+            if let Some(m) = alloc_map {
+                let alloc_cpu = m.get("cpu").map(|v| parse_kube_cores(v)).unwrap_or(0.0);
+                let alloc_mem = m.get("memory").map(|v| parse_kube_gi(v)).unwrap_or(0.0);
+                if alloc_cpu > 0.0 {
+                    cpu = format!("0.00/{alloc_cpu:.2}");
+                }
+                if alloc_mem > 0.0 {
+                    memory = format!("0.0Gi/{alloc_mem:.1}Gi");
+                }
+            }
         }
         "Namespace" => {
             status = st.phase.unwrap_or_else(|| "Active".into());
@@ -1621,6 +1799,23 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
             let cnt = item.secrets.map(|s| s.len()).unwrap_or(0);
             ready = format!("{cnt} secrets");
         }
+        other if other.starts_with("CR:") => {
+            let crd_name = other.strip_prefix("CR:").unwrap_or(other);
+            status = st
+                .phase
+                .or_else(|| {
+                    st.conditions.and_then(|arr| {
+                        arr.into_iter()
+                            .find(|c| c.status.as_deref() == Some("True"))
+                            .and_then(|c| c.cond_type)
+                    })
+                })
+                .unwrap_or_else(|| "Active".into());
+            detail = crd_name.to_owned();
+            if controlled_by_name.is_empty() {
+                controlled_by_name = crd_name.to_owned();
+            }
+        }
         _ => {}
     }
 
@@ -1636,8 +1831,8 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         ports,
         data_keys,
         container_states,
-        cpu: String::new(),
-        memory: String::new(),
+        cpu,
+        memory,
         restarts,
         controlled_by_kind,
         controlled_by_name,
@@ -1651,6 +1846,8 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
 
 #[derive(Deserialize)]
 struct RawEventList {
+    #[serde(default)]
+    metadata: Option<RawListMetadata>,
     #[serde(default)]
     items: Vec<RawEventItem>,
 }
@@ -1685,11 +1882,26 @@ struct RawInvolvedObject {
 
 /// Parses `kubectl get events -o json` output into `ClusterEvent` items.
 pub fn parse_events_json(json_str: &str) -> Vec<ClusterEvent> {
-    let Ok(parsed) = serde_json::from_str::<RawEventList>(json_str) else {
-        return Vec::new();
-    };
+    parse_paged_events_json(json_str, Some(150))
+        .map(|(items, _, _)| items)
+        .unwrap_or_default()
+}
+
+pub fn parse_paged_events_json(
+    json_str: &str,
+    cap: Option<usize>,
+) -> Option<(Vec<ClusterEvent>, String, Option<u64>)> {
+    let parsed = serde_json::from_str::<RawEventList>(json_str).ok()?;
+    let list_meta = parsed.metadata.unwrap_or_default();
+    let cont = list_meta.continue_token.unwrap_or_default();
+    let remaining = list_meta.remaining_item_count;
     let mut out = Vec::new();
-    for item in parsed.items.into_iter().rev().take(150) {
+    let iter: Box<dyn Iterator<Item = RawEventItem>> = if let Some(max_n) = cap {
+        Box::new(parsed.items.into_iter().rev().take(max_n))
+    } else {
+        Box::new(parsed.items.into_iter())
+    };
+    for item in iter {
         let (obj_kind, obj_name) = match item.involved_object {
             Some(inv) => (
                 inv.kind.unwrap_or_else(|| "Resource".into()),
@@ -1716,7 +1928,7 @@ pub fn parse_events_json(json_str: &str) -> Vec<ClusterEvent> {
             last_seen,
         });
     }
-    out
+    Some((out, cont, remaining))
 }
 
 /// Parses `helm list -o json` output into `HelmRelease` items.
@@ -2323,7 +2535,8 @@ pub fn parse_server_table_resources(
     out
 }
 
-/// Fetches `Namespace` rows using fast Server-Side Table output (`kubectl get namespaces --no-headers`).
+/// Populates `snap.namespaces` (`Vec<String>` for the Namespace Picker) using fast Server-Side Table output
+/// without bloating `snap.resources` with thousands of `ClusterResource` structs when viewing other tabs.
 pub fn fetch_namespaces_into_snapshot(
     project: &Project,
     cfg: &KubeConfigState,
@@ -2331,9 +2544,39 @@ pub fn fetch_namespaces_into_snapshot(
 ) {
     let mut ns_args = cfg.base_args(false);
     ns_args.extend(["get".into(), "namespaces".into(), "--no-headers".into()]);
-    if let Ok(out) = run_kubectl(project, &ns_args, None)
+    if let Ok(out) = run_kubectl_timed(project, &ns_args, None, Some(10))
         && out.status == Some(0)
     {
+        let mut names = Vec::new();
+        for line in out.stdout.lines() {
+            if let Some(name) = line.split_whitespace().next()
+                && !name.is_empty()
+            {
+                names.push(name.to_owned());
+            }
+        }
+        if !names.is_empty() {
+            names.sort();
+            names.dedup();
+            snap.overview_counts
+                .insert("Namespace".into(), names.len() as u64);
+            snap.namespaces = names;
+        }
+    }
+}
+
+fn fetch_namespaces_table_fallback(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+) {
+    let mut ns_args = cfg.base_args(false);
+    ns_args.extend(["get".into(), "namespaces".into(), "--no-headers".into()]);
+    if let Ok(out) = run_kubectl_timed(project, &ns_args, None, Some(15))
+        && out.status == Some(0)
+    {
+        snap.connected = true;
+        snap.error = None;
         snap.resources.retain(|r| r.kind != "Namespace");
         let mut names = Vec::new();
         for line in out.stdout.lines() {
@@ -2353,8 +2596,29 @@ pub fn fetch_namespaces_into_snapshot(
         }
         if !names.is_empty() {
             names.sort();
+            names.dedup();
+            snap.overview_counts
+                .insert("Namespace".into(), names.len() as u64);
             snap.namespaces = names;
         }
+        let loaded = snap
+            .resources
+            .iter()
+            .filter(|r| r.kind == "Namespace")
+            .count() as u64;
+        snap.page_info.insert(
+            "Namespace".into(),
+            CategoryPageInfo {
+                category: "Namespace".into(),
+                limit: loaded as u32,
+                request_token: String::new(),
+                continue_token: String::new(),
+                remaining_count: None,
+                loaded_count: loaded,
+                page_index: 1,
+                mode: "replace".into(),
+            },
+        );
     }
 }
 
@@ -3062,6 +3326,421 @@ pub fn kubectl_resource_info(kind: &str) -> (&'static str, bool, bool) {
     }
 }
 
+/// Percent-encodes a URL path segment or query parameter value per RFC 3986.
+pub fn url_encode_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Maps a built-in Kubernetes resource `Kind` to `(api_prefix, plural, is_cluster_scoped)`.
+pub fn k8s_api_endpoint_info(kind: &str) -> Option<(&'static str, &'static str, bool)> {
+    match kind {
+        "Pod" => Some(("/api/v1", "pods", false)),
+        "ReplicationController" => Some(("/api/v1", "replicationcontrollers", false)),
+        "Service" => Some(("/api/v1", "services", false)),
+        "Endpoints" => Some(("/api/v1", "endpoints", false)),
+        "ConfigMap" => Some(("/api/v1", "configmaps", false)),
+        "Secret" => Some(("/api/v1", "secrets", false)),
+        "ResourceQuota" => Some(("/api/v1", "resourcequotas", false)),
+        "LimitRange" => Some(("/api/v1", "limitranges", false)),
+        "PersistentVolumeClaim" => Some(("/api/v1", "persistentvolumeclaims", false)),
+        "PersistentVolume" => Some(("/api/v1", "persistentvolumes", true)),
+        "Namespace" => Some(("/api/v1", "namespaces", true)),
+        "Node" => Some(("/api/v1", "nodes", true)),
+        "Event" => Some(("/api/v1", "events", false)),
+        "ServiceAccount" => Some(("/api/v1", "serviceaccounts", false)),
+        "Deployment" => Some(("/apis/apps/v1", "deployments", false)),
+        "StatefulSet" => Some(("/apis/apps/v1", "statefulsets", false)),
+        "DaemonSet" => Some(("/apis/apps/v1", "daemonsets", false)),
+        "ReplicaSet" => Some(("/apis/apps/v1", "replicasets", false)),
+        "Job" => Some(("/apis/batch/v1", "jobs", false)),
+        "CronJob" => Some(("/apis/batch/v1", "cronjobs", false)),
+        "EndpointSlice" => Some(("/apis/discovery.k8s.io/v1", "endpointslices", false)),
+        "Ingress" => Some(("/apis/networking.k8s.io/v1", "ingresses", false)),
+        "IngressClass" => Some(("/apis/networking.k8s.io/v1", "ingressclasses", true)),
+        "NetworkPolicy" => Some(("/apis/networking.k8s.io/v1", "networkpolicies", false)),
+        "HorizontalPodAutoscaler" => {
+            Some(("/apis/autoscaling/v2", "horizontalpodautoscalers", false))
+        }
+        "PodDisruptionBudget" => Some(("/apis/policy/v1", "poddisruptionbudgets", false)),
+        "PriorityClass" => Some(("/apis/scheduling.k8s.io/v1", "priorityclasses", true)),
+        "RuntimeClass" => Some(("/apis/node.k8s.io/v1", "runtimeclasses", true)),
+        "Lease" => Some(("/apis/coordination.k8s.io/v1", "leases", false)),
+        "MutatingWebhookConfiguration" => Some((
+            "/apis/admissionregistration.k8s.io/v1",
+            "mutatingwebhookconfigurations",
+            true,
+        )),
+        "ValidatingWebhookConfiguration" => Some((
+            "/apis/admissionregistration.k8s.io/v1",
+            "validatingwebhookconfigurations",
+            true,
+        )),
+        "StorageClass" => Some(("/apis/storage.k8s.io/v1", "storageclasses", true)),
+        "ClusterRole" => Some(("/apis/rbac.authorization.k8s.io/v1", "clusterroles", true)),
+        "Role" => Some(("/apis/rbac.authorization.k8s.io/v1", "roles", false)),
+        "ClusterRoleBinding" => Some((
+            "/apis/rbac.authorization.k8s.io/v1",
+            "clusterrolebindings",
+            true,
+        )),
+        "RoleBinding" => Some(("/apis/rbac.authorization.k8s.io/v1", "rolebindings", false)),
+        _ => None,
+    }
+}
+
+pub fn build_paged_raw_uri(
+    api_prefix: &str,
+    plural: &str,
+    cluster_scoped: bool,
+    cfg: &KubeConfigState,
+    limit: u32,
+    continue_token: &str,
+) -> String {
+    let base = if cluster_scoped || cfg.all_namespaces || cfg.namespace.trim().is_empty() {
+        format!("{api_prefix}/{plural}")
+    } else {
+        let ns = url_encode_component(cfg.namespace.trim());
+        format!("{api_prefix}/namespaces/{ns}/{plural}")
+    };
+    let clamped = limit.clamp(1, 500);
+    if continue_token.trim().is_empty() {
+        format!("{base}?limit={clamped}")
+    } else {
+        let enc_cont = url_encode_component(continue_token.trim());
+        format!("{base}?limit={clamped}&continue={enc_cont}")
+    }
+}
+
+#[derive(Deserialize)]
+struct RawApiGroupDiscovery {
+    #[serde(default, rename = "preferredVersion")]
+    preferred_version: Option<RawApiGroupVersion>,
+    #[serde(default)]
+    versions: Vec<RawApiGroupVersion>,
+}
+
+#[derive(Deserialize)]
+struct RawApiGroupVersion {
+    #[serde(default)]
+    version: String,
+}
+
+#[derive(Deserialize)]
+struct RawApiResourceListDiscovery {
+    #[serde(default)]
+    resources: Vec<RawApiResourceEntry>,
+}
+
+#[derive(Deserialize)]
+struct RawApiResourceEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    namespaced: bool,
+}
+
+fn resolve_crd_api_endpoint(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+    crd_name: &str,
+    req_timeout: Option<u32>,
+) -> Option<(String, String, bool)> {
+    let (plural, group) = crd_name.split_once('.')?;
+    if plural.is_empty() || group.is_empty() {
+        return None;
+    }
+    if let Some(existing) = snap
+        .resources
+        .iter()
+        .find(|r| r.kind == "CustomResourceDefinition" && r.name == crd_name)
+        && existing.labels.iter().any(|l| l == "discovered=true")
+        && !existing.ready.is_empty()
+    {
+        let api_prefix = format!("/apis/{group}/{}", existing.ready);
+        let is_cluster = existing.status.eq_ignore_ascii_case("Cluster");
+        return Some((api_prefix, plural.to_owned(), is_cluster));
+    }
+
+    let mut grp_args = cfg.base_args(false);
+    grp_args.extend(["get".into(), "--raw".into(), format!("/apis/{group}")]);
+    let grp_out = run_kubectl_timed(project, &grp_args, None, req_timeout).ok()?;
+    if grp_out.status != Some(0) || !grp_out.stdout.trim_start().starts_with('{') {
+        return None;
+    }
+    let grp_disc = serde_json::from_str::<RawApiGroupDiscovery>(&grp_out.stdout).ok()?;
+    let version = grp_disc
+        .preferred_version
+        .map(|pv| pv.version)
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            grp_disc
+                .versions
+                .into_iter()
+                .map(|v| v.version)
+                .find(|v| !v.is_empty())
+        })?;
+
+    let mut res_args = cfg.base_args(false);
+    res_args.extend([
+        "get".into(),
+        "--raw".into(),
+        format!("/apis/{group}/{version}"),
+    ]);
+    let mut is_cluster = false;
+    if let Ok(res_out) = run_kubectl_timed(project, &res_args, None, req_timeout)
+        && res_out.status == Some(0)
+        && let Ok(list_disc) = serde_json::from_str::<RawApiResourceListDiscovery>(&res_out.stdout)
+        && let Some(entry) = list_disc.resources.iter().find(|e| e.name == plural)
+    {
+        is_cluster = !entry.namespaced;
+    }
+
+    // Cache discovered version + scope across all CRDs in this API group so subsequent pages cost 0 extra calls.
+    for r in snap
+        .resources
+        .iter_mut()
+        .filter(|r| r.kind == "CustomResourceDefinition" && r.name == crd_name)
+    {
+        r.ready = version.clone();
+        r.status = if is_cluster {
+            "Cluster".into()
+        } else {
+            "Namespaced".into()
+        };
+        if !r.labels.iter().any(|l| l == "discovered=true") {
+            r.labels.push("discovered=true".into());
+        }
+    }
+
+    Some((
+        format!("/apis/{group}/{version}"),
+        plural.to_owned(),
+        is_cluster,
+    ))
+}
+
+struct FetchedPage<T> {
+    items: Vec<T>,
+    request_token: String,
+    continue_token: String,
+    remaining_count: Option<u64>,
+    page_index: u32,
+    append: bool,
+    used_limit: u32,
+}
+
+enum RawPageOutcome<T> {
+    Page(FetchedPage<T>),
+    Unsupported,
+    Failed(String),
+}
+
+fn fetch_raw_paged_json(
+    project: &Project,
+    cfg: &KubeConfigState,
+    endpoint: (&str, &str, bool),
+    opts: &FetchOptions,
+    req_timeout: Option<u32>,
+) -> Result<(String, String, u32, bool, u32), RawPageOutcome<ClusterResource>> {
+    let (api_prefix, plural, cluster_scoped) = endpoint;
+    let mut limit = opts.limit.clamp(10, 500);
+    let mut req_tok = opts.continue_token.trim().to_owned();
+    let mut page_idx = opts.page_index.max(1);
+    let mut append = opts.append;
+
+    for attempt in 0..2 {
+        let uri = build_paged_raw_uri(api_prefix, plural, cluster_scoped, cfg, limit, &req_tok);
+        let mut args = cfg.base_args(false);
+        args.extend(["get".into(), "--raw".into(), uri]);
+        match run_kubectl_timed(project, &args, None, req_timeout) {
+            Ok(out) if out.status == Some(0) => {
+                if !out.stdout.trim_start().starts_with('{') {
+                    return Err(RawPageOutcome::Unsupported);
+                }
+                return Ok((out.stdout, req_tok, page_idx, append, limit));
+            }
+            Ok(out) => {
+                let combined = format!("{}\n{}", out.stderr, out.stdout);
+                // Expired Kubernetes `continue` token (`410 Gone` / `ResourceExpired`): reset cleanly to page 1.
+                if attempt == 0
+                    && !req_tok.is_empty()
+                    && (combined.contains("continue")
+                        || combined.contains("410")
+                        || combined.contains("ResourceExpired")
+                        || combined.contains("expired"))
+                {
+                    req_tok.clear();
+                    page_idx = 1;
+                    append = false;
+                    continue;
+                }
+                if out.stderr.trim().is_empty() && out.stdout.trim().is_empty() {
+                    return Err(RawPageOutcome::Unsupported);
+                }
+                return Err(RawPageOutcome::Failed(first_line_or(
+                    &out.stderr,
+                    "kubectl raw list request failed",
+                )));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if attempt == 0 && limit > 25 && msg.contains("exceeded") {
+                    limit = 25;
+                    continue;
+                }
+                return Err(RawPageOutcome::Failed(msg));
+            }
+        }
+    }
+    Err(RawPageOutcome::Unsupported)
+}
+
+fn fetch_raw_paged_resources(
+    project: &Project,
+    cfg: &KubeConfigState,
+    category: &str,
+    endpoint: (&str, &str, bool),
+    opts: &FetchOptions,
+    req_timeout: Option<u32>,
+) -> RawPageOutcome<ClusterResource> {
+    match fetch_raw_paged_json(project, cfg, endpoint, opts, req_timeout) {
+        Ok((stdout, req_tok, page_idx, append, used_limit)) => {
+            if let Some((items, cont, rem)) =
+                parse_paged_resource_list_json(&stdout, Some(category))
+            {
+                RawPageOutcome::Page(FetchedPage {
+                    items,
+                    request_token: req_tok,
+                    continue_token: cont,
+                    remaining_count: rem,
+                    page_index: page_idx,
+                    append,
+                    used_limit,
+                })
+            } else {
+                RawPageOutcome::Unsupported
+            }
+        }
+        Err(outcome) => outcome,
+    }
+}
+
+fn fetch_raw_paged_events(
+    project: &Project,
+    cfg: &KubeConfigState,
+    opts: &FetchOptions,
+    req_timeout: Option<u32>,
+) -> RawPageOutcome<ClusterEvent> {
+    match fetch_raw_paged_json(
+        project,
+        cfg,
+        ("/api/v1", "events", false),
+        opts,
+        req_timeout,
+    ) {
+        Ok((stdout, req_tok, page_idx, append, used_limit)) => {
+            if let Some((items, cont, rem)) = parse_paged_events_json(&stdout, None) {
+                RawPageOutcome::Page(FetchedPage {
+                    items,
+                    request_token: req_tok,
+                    continue_token: cont,
+                    remaining_count: rem,
+                    page_index: page_idx,
+                    append,
+                    used_limit,
+                })
+            } else {
+                RawPageOutcome::Unsupported
+            }
+        }
+        Err(outcome) => match outcome {
+            RawPageOutcome::Unsupported => RawPageOutcome::Unsupported,
+            RawPageOutcome::Failed(msg) => RawPageOutcome::Failed(msg),
+            RawPageOutcome::Page(_) => RawPageOutcome::Unsupported,
+        },
+    }
+}
+
+fn apply_resource_page_to_snapshot(
+    snap: &mut ClusterSnapshot,
+    category: &str,
+    page: FetchedPage<ClusterResource>,
+) {
+    let FetchedPage {
+        items,
+        request_token,
+        continue_token,
+        remaining_count,
+        page_index,
+        append,
+        used_limit,
+    } = page;
+    let page_len = items.len() as u64;
+    if request_token.is_empty() {
+        snap.overview_counts
+            .insert(category.to_owned(), page_len + remaining_count.unwrap_or(0));
+    }
+    if append {
+        let existing_keys: std::collections::BTreeSet<(String, String)> = snap
+            .resources
+            .iter()
+            .filter(|r| r.kind == category)
+            .map(|r| (r.namespace.clone(), r.name.clone()))
+            .collect();
+        let mut current_cat_cnt = existing_keys.len();
+        for item in items {
+            if current_cat_cnt >= MAX_APPENDED_ITEMS {
+                break;
+            }
+            if !existing_keys.contains(&(item.namespace.clone(), item.name.clone())) {
+                snap.resources.push(item);
+                current_cat_cnt += 1;
+            }
+        }
+        snap.page_info.insert(
+            category.to_owned(),
+            CategoryPageInfo {
+                category: category.to_owned(),
+                limit: used_limit,
+                request_token,
+                continue_token,
+                remaining_count,
+                loaded_count: current_cat_cnt as u64,
+                page_index,
+                mode: "append".into(),
+            },
+        );
+    } else {
+        snap.resources.retain(|r| {
+            r.kind == "CustomResourceDefinition" && category != "CustomResourceDefinition"
+        });
+        snap.resources.extend(items);
+        let loaded = snap.resources.iter().filter(|r| r.kind == category).count() as u64;
+        snap.page_info.insert(
+            category.to_owned(),
+            CategoryPageInfo {
+                category: category.to_owned(),
+                limit: used_limit,
+                request_token,
+                continue_token,
+                remaining_count,
+                loaded_count: loaded,
+                page_index,
+                mode: "replace".into(),
+            },
+        );
+    }
+}
+
 /// Fetches a single category on demand (used for instant ~200ms hotbar context switching and lazy sidebar tabs).
 pub fn fetch_category_into_snapshot(
     project: &Project,
@@ -3086,17 +3765,79 @@ pub fn fetch_category_with_options(
     };
     let started = std::time::Instant::now();
     match category {
-        "Namespace" => fetch_namespaces_into_snapshot(project, cfg, snap),
-        "Node" => fetch_nodes_with_options(project, cfg, snap, opts),
-        "CustomResourceDefinition" => fetch_crds_into_snapshot(project, cfg, snap),
-        "Secret" => fetch_secrets_into_snapshot(project, cfg, snap),
-        "Event" => fetch_events_into_snapshot(project, cfg, snap),
+        "CustomResourceDefinition" => {
+            fetch_crds_into_snapshot(project, cfg, snap);
+            let loaded = snap
+                .resources
+                .iter()
+                .filter(|r| r.kind == "CustomResourceDefinition")
+                .count() as u64;
+            snap.overview_counts
+                .insert("CustomResourceDefinition".into(), loaded);
+            snap.page_info.insert(
+                "CustomResourceDefinition".into(),
+                CategoryPageInfo {
+                    category: "CustomResourceDefinition".into(),
+                    limit: loaded.max(DEFAULT_PAGE_LIMIT as u64) as u32,
+                    request_token: String::new(),
+                    continue_token: String::new(),
+                    remaining_count: None,
+                    loaded_count: loaded,
+                    page_index: 1,
+                    mode: "replace".into(),
+                },
+            );
+        }
         "HelmRelease" => fetch_helm_into_snapshot(project, cfg, snap),
         "ClusterOverview" | "WorkloadsOverview" => {
             fetch_workloads_into_snapshot(project, cfg, snap);
             fetch_secrets_into_snapshot(project, cfg, snap);
         }
         "ClusterCatalog" | "Workspace" => {}
+        "Event" => match fetch_raw_paged_events(project, cfg, &opts, req_timeout) {
+            RawPageOutcome::Page(page) => {
+                snap.connected = true;
+                snap.error = None;
+                let page_len = page.items.len() as u64;
+                if page.request_token.is_empty() {
+                    snap.overview_counts
+                        .insert("Event".into(), page_len + page.remaining_count.unwrap_or(0));
+                }
+                if page.append {
+                    let room = MAX_APPENDED_ITEMS.saturating_sub(snap.events.len());
+                    snap.events.extend(page.items.into_iter().take(room));
+                } else {
+                    snap.events = page.items;
+                }
+                let loaded = snap.events.len() as u64;
+                snap.page_info.insert(
+                    "Event".into(),
+                    CategoryPageInfo {
+                        category: "Event".into(),
+                        limit: page.used_limit,
+                        request_token: page.request_token,
+                        continue_token: page.continue_token,
+                        remaining_count: page.remaining_count,
+                        loaded_count: loaded,
+                        page_index: page.page_index,
+                        mode: if page.append {
+                            "append".into()
+                        } else {
+                            "replace".into()
+                        },
+                    },
+                );
+            }
+            RawPageOutcome::Unsupported => fetch_events_into_snapshot(project, cfg, snap),
+            RawPageOutcome::Failed(err) => {
+                if !opts.is_background_poll {
+                    fetch_events_into_snapshot(project, cfg, snap);
+                    if snap.events.is_empty() {
+                        snap.error = Some(err);
+                    }
+                }
+            }
+        },
         kind if kind.starts_with("CR:") => {
             let crd_name = kind.strip_prefix("CR:").unwrap_or(kind);
             if !snap
@@ -3105,6 +3846,26 @@ pub fn fetch_category_with_options(
                 .any(|r| r.kind == "CustomResourceDefinition")
             {
                 fetch_crds_into_snapshot(project, cfg, snap);
+            }
+            if let Some((api_prefix, plural, is_cluster_scoped)) =
+                resolve_crd_api_endpoint(project, cfg, snap, crd_name, req_timeout)
+            {
+                match fetch_raw_paged_resources(
+                    project,
+                    cfg,
+                    kind,
+                    (&api_prefix, &plural, is_cluster_scoped),
+                    &opts,
+                    req_timeout,
+                ) {
+                    RawPageOutcome::Page(page) => {
+                        snap.connected = true;
+                        snap.error = None;
+                        apply_resource_page_to_snapshot(snap, kind, page);
+                        return;
+                    }
+                    RawPageOutcome::Unsupported | RawPageOutcome::Failed(_) => {}
+                }
             }
             let is_cluster_scoped = snap
                 .resources
@@ -3150,6 +3911,144 @@ pub fn fetch_category_with_options(
             } else {
                 BTreeMap::new()
             };
+            let prev_node_metrics: BTreeMap<String, (String, String)> = if kind == "Node" {
+                snap.resources
+                    .iter()
+                    .filter(|r| r.kind == "Node" && (!r.cpu.is_empty() || !r.memory.is_empty()))
+                    .map(|r| (r.name.clone(), (r.cpu.clone(), r.memory.clone())))
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+
+            if let Some(endpoint) = k8s_api_endpoint_info(kind) {
+                match fetch_raw_paged_resources(project, cfg, kind, endpoint, &opts, req_timeout) {
+                    RawPageOutcome::Page(mut page) => {
+                        snap.connected = true;
+                        snap.error = None;
+                        let est_total =
+                            (page.items.len() as u64) + page.remaining_count.unwrap_or(0);
+
+                        if kind == "Pod" {
+                            let finished_debuggers: Vec<(String, String)> = page
+                                .items
+                                .iter()
+                                .filter(|r| {
+                                    (r.name.starts_with("node-debugger-")
+                                        || r.name.starts_with("node-dbg-watch-"))
+                                        && matches!(
+                                            r.status.as_str(),
+                                            "Succeeded" | "Completed" | "Failed"
+                                        )
+                                })
+                                .map(|r| (r.namespace.clone(), r.name.clone()))
+                                .collect();
+                            if !finished_debuggers.is_empty() && !opts.is_background_poll {
+                                for (ns, name) in &finished_debuggers {
+                                    let _ = delete_cluster_resource(project, cfg, "Pod", ns, name);
+                                }
+                            }
+                            page.items.retain(|r| {
+                                !(r.name.starts_with("node-dbg-watch-")
+                                    || (r.name.starts_with("node-debugger-")
+                                        && matches!(
+                                            r.status.as_str(),
+                                            "Succeeded" | "Completed" | "Failed"
+                                        )))
+                            });
+                        }
+
+                        apply_resource_page_to_snapshot(snap, kind, page);
+
+                        if kind == "Pod" {
+                            let allow_metrics = opts.include_metrics
+                                && est_total <= 300
+                                && (!opts.is_background_poll
+                                    || started.elapsed() < std::time::Duration::from_millis(1200));
+                            if allow_metrics {
+                                enrich_pod_metrics(project, cfg, snap);
+                            } else if !prev_pod_metrics.is_empty() {
+                                for r in snap.resources.iter_mut().filter(|r| r.kind == "Pod") {
+                                    if let Some((cpu, mem)) =
+                                        prev_pod_metrics.get(&(r.namespace.clone(), r.name.clone()))
+                                    {
+                                        r.cpu = cpu.clone();
+                                        r.memory = mem.clone();
+                                    }
+                                }
+                            }
+                        } else if kind == "Node" {
+                            let allow_node_top = opts.include_metrics
+                                && est_total <= 80
+                                && (!opts.is_background_poll
+                                    || started.elapsed() < std::time::Duration::from_millis(1200));
+                            if allow_node_top {
+                                let mut top_args = cfg.base_args(false);
+                                top_args.extend([
+                                    "top".into(),
+                                    "nodes".into(),
+                                    "--no-headers".into(),
+                                ]);
+                                if let Ok(top_out) =
+                                    run_kubectl_timed(project, &top_args, None, Some(3))
+                                    && top_out.status == Some(0)
+                                {
+                                    let mut top_map: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+                                    for line in top_out.stdout.lines() {
+                                        let cols: Vec<&str> = line.split_whitespace().collect();
+                                        if cols.len() >= 4 {
+                                            top_map.insert(
+                                                cols[0].to_owned(),
+                                                (parse_kube_cores(cols[1]), parse_kube_gi(cols[3])),
+                                            );
+                                        }
+                                    }
+                                    for r in snap.resources.iter_mut().filter(|r| r.kind == "Node")
+                                    {
+                                        if let Some(&(u_cpu, u_mem)) = top_map.get(&r.name) {
+                                            if let Some((_, a_cpu)) = r.cpu.split_once('/') {
+                                                r.cpu = format!("{u_cpu:.2}/{a_cpu}");
+                                            }
+                                            if let Some((_, a_mem)) = r.memory.split_once('/') {
+                                                r.memory = format!("{u_mem:.1}Gi/{a_mem}");
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if !prev_node_metrics.is_empty() {
+                                for r in snap.resources.iter_mut().filter(|r| r.kind == "Node") {
+                                    if let Some((p_cpu, p_mem)) = prev_node_metrics.get(&r.name) {
+                                        r.cpu = p_cpu.clone();
+                                        r.memory = p_mem.clone();
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    RawPageOutcome::Unsupported => {}
+                    RawPageOutcome::Failed(err) => {
+                        if opts.is_background_poll {
+                            snap.error = Some(err);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if kind == "Namespace" {
+                fetch_namespaces_table_fallback(project, cfg, snap);
+                return;
+            }
+            if kind == "Node" {
+                fetch_nodes_with_options(project, cfg, snap, opts);
+                return;
+            }
+            if kind == "Secret" {
+                fetch_secrets_into_snapshot(project, cfg, snap);
+                return;
+            }
+
             let (kubectl_type, cluster_scoped, _) = kubectl_resource_info(kind);
             let use_server_table = cfg.all_namespaces && !cluster_scoped;
             let mut res_args = cfg.base_args(!cluster_scoped);
@@ -3215,9 +4114,9 @@ pub fn fetch_category_with_options(
                         });
                         let pod_cnt = snap.resources.iter().filter(|r| r.kind == "Pod").count();
                         let allow_metrics = opts.include_metrics
+                            && pod_cnt <= 300
                             && (!opts.is_background_poll
-                                || (pod_cnt <= 300
-                                    && started.elapsed() < std::time::Duration::from_millis(1200)));
+                                || started.elapsed() < std::time::Duration::from_millis(1200));
                         if allow_metrics {
                             enrich_pod_metrics(project, cfg, snap);
                         } else if !prev_pod_metrics.is_empty() {
@@ -3286,6 +4185,7 @@ pub fn fetch_cluster_snapshot(project: &Project, cfg: &mut KubeConfigState) -> C
         resources: Vec::new(),
         events: Vec::new(),
         helm_releases: Vec::new(),
+        ..Default::default()
     };
 
     match fetch_kubeconfig_overview(project, cfg) {
