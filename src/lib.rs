@@ -24,16 +24,17 @@ use intelligence::{
     normalize_slashes, project_of,
 };
 use kubectl::{
-    ClusterSnapshot, FetchOptions, KubeConfigState, apply_or_diff_manifest, build_kustomize,
-    cordon_node, delete_cluster_resource_opts, drain_node, enforce_large_cluster_scope,
-    exec_pod_command, fetch_category_into_snapshot, fetch_category_with_options,
+    ActiveWatchStream, ClusterSnapshot, FetchOptions, KubeConfigState, ParsedWatchFrame,
+    WatchManager, WatchSpec, apply_or_diff_manifest, build_kustomize, cordon_node,
+    delete_cluster_resource_opts, drain_node, enforce_large_cluster_scope, exec_pod_command,
+    extract_object_resource_version, fetch_category_into_snapshot, fetch_category_with_options,
     fetch_cluster_snapshot, fetch_helm_release_detail, fetch_kubeconfig_overview,
     fetch_namespaces_into_snapshot, fetch_nodes_into_snapshot, fetch_pod_logs,
     fetch_resource_extras, inspect_cluster_resource, inspect_cluster_resource_json,
     open_debug_terminal, open_exec_or_debug_terminal, open_exec_terminal,
     open_follow_logs_terminal, open_node_shell_terminal, open_port_forward_terminal,
-    render_helm_template, resolve_project, rollout_restart, scale_workload, suspend_cronjob,
-    trigger_cronjob, workspace_manifests_json,
+    render_helm_template, resolve_project, resolve_watch_endpoint, rollout_restart, scale_workload,
+    suspend_cronjob, trigger_cronjob, workspace_manifests_json,
 };
 use manifest::{parse_yaml, utf16_len};
 use openidea_plugin::host::{self, storage};
@@ -92,6 +93,7 @@ pub struct KubernetesPlugin {
     pub index: ProjectIndex,
     pub snapshot: Option<ClusterSnapshot>,
     pub content_tabs: std::collections::HashMap<String, ContentTabTarget>,
+    pub watches: WatchManager,
 }
 
 impl KubernetesPlugin {
@@ -337,6 +339,395 @@ impl KubernetesPlugin {
         let _ = host::post_view_message(VIEW_ID, &msg.to_string());
     }
 
+    /// Starts or replaces the active category `watch=true` stream when `snap.page_info[cat].watch_supported` is true,
+    /// or stops any existing category watch when switching to a large (`> 1,000` item) paginated scope.
+    fn sync_category_watch(&mut self, project: &Project, cfg: &KubeConfigState, cat: &str) {
+        let Some(ref mut snap) = self.snapshot else {
+            self.watches.stop_category();
+            return;
+        };
+        let Some(pi) = snap.page_info.get(cat).cloned() else {
+            self.watches.stop_category();
+            return;
+        };
+        if !pi.watch_supported || pi.resource_version.is_empty() {
+            self.watches.stop_category();
+            return;
+        }
+        let Some((api_prefix, plural, cluster_scoped)) =
+            resolve_watch_endpoint(project, cfg, snap, cat)
+        else {
+            self.watches.stop_category();
+            return;
+        };
+        let spec = WatchSpec {
+            context: snap.current_context.clone(),
+            kubeconfig: cfg.kubeconfig.clone(),
+            namespace: snap.current_namespace.clone(),
+            all_namespaces: snap.all_namespaces,
+            kind: cat.to_owned(),
+            api_prefix,
+            plural,
+            cluster_scoped,
+            field_selector_name: None,
+        };
+        if let Some(ref cur) = self.watches.category_stream
+            && cur.spec == spec
+        {
+            return;
+        }
+        self.watches.stop_category();
+        if let Ok(stream) = ActiveWatchStream::start(project, cfg, spec, pi.resource_version) {
+            self.watches.category_stream = Some(stream);
+        } else if let Some(entry) = snap.page_info.get_mut(cat) {
+            entry.watch_supported = false;
+        }
+    }
+
+    /// Starts or replaces the single-object `fieldSelector=metadata.name=<name>` watch for the open Drawer.
+    fn sync_drawer_watch(
+        &mut self,
+        project: &Project,
+        cfg: &KubeConfigState,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+        resource_version: String,
+    ) {
+        if name.trim().is_empty() || kind == "HelmRelease" || kind == "Event" {
+            self.watches.stop_drawer();
+            return;
+        }
+        let Some(ref mut snap) = self.snapshot else {
+            self.watches.stop_drawer();
+            return;
+        };
+        let Some((api_prefix, plural, cluster_scoped)) =
+            resolve_watch_endpoint(project, cfg, snap, kind)
+        else {
+            self.watches.stop_drawer();
+            return;
+        };
+        let target_ns = if cluster_scoped {
+            String::new()
+        } else if !namespace.trim().is_empty() {
+            namespace.trim().to_owned()
+        } else {
+            cfg.namespace.clone()
+        };
+        let spec = WatchSpec {
+            context: snap.current_context.clone(),
+            kubeconfig: cfg.kubeconfig.clone(),
+            namespace: target_ns,
+            all_namespaces: false,
+            kind: kind.to_owned(),
+            api_prefix,
+            plural,
+            cluster_scoped,
+            field_selector_name: Some(name.trim().to_owned()),
+        };
+        if let Some(ref cur) = self.watches.drawer_stream
+            && cur.spec == spec
+        {
+            return;
+        }
+        self.watches.stop_drawer();
+        if let Ok(stream) = ActiveWatchStream::start(project, cfg, spec, resource_version) {
+            self.watches.drawer_stream = Some(stream);
+        }
+    }
+
+    /// Drains non-blocking frames from both active category and drawer watch streams, updates `self.snapshot`,
+    /// and posts compact `{ "op": "watch-delta", ... }` updates to the web view.
+    fn poll_active_watches(
+        &mut self,
+        project: &Project,
+        cfg: &KubeConfigState,
+        active_cat: &str,
+        drawer_target: Option<(&str, &str, &str)>,
+        refresh_metrics: bool,
+    ) {
+        if let Some((dk, dns, dname)) = drawer_target {
+            let matches_existing = self.watches.drawer_stream.as_ref().is_some_and(|s| {
+                s.spec.kind == dk
+                    && s.spec.field_selector_name.as_deref() == Some(dname)
+                    && (s.spec.cluster_scoped || s.spec.namespace == dns || dns.is_empty())
+            });
+            if !matches_existing {
+                self.sync_drawer_watch(project, cfg, dk, dns, dname, String::new());
+            }
+        } else {
+            self.watches.stop_drawer();
+        }
+
+        let mut upserts: Vec<kubectl::ClusterResource> = Vec::new();
+        let mut deleted: Vec<Value> = Vec::new();
+        let mut event_upserts: Vec<kubectl::ClusterEvent> = Vec::new();
+        let mut drawer_json_update: Option<(String, String, String, String)> = None;
+        let mut drawer_deleted: Option<(String, String, String)> = None;
+        let mut category_resync_needed = false;
+
+        // 1. Drain category watch stream if active for `active_cat`
+        if self
+            .watches
+            .category_stream
+            .as_ref()
+            .is_some_and(|s| s.spec.kind != active_cat)
+        {
+            self.watches.stop_category();
+        }
+        if let Some(mut stream) = self.watches.category_stream.take() {
+            let (frames, ended, gone) = stream.drain_frames();
+            if let Some(ref mut snap) = self.snapshot {
+                for frame in frames {
+                    match frame {
+                        ParsedWatchFrame::ResourceUpsert { mut resource, .. } => {
+                            if resource.kind == "Pod"
+                                && (resource.name.starts_with("node-dbg-watch-")
+                                    || (resource.name.starts_with("node-debugger-")
+                                        && matches!(
+                                            resource.status.as_str(),
+                                            "Succeeded" | "Completed" | "Failed"
+                                        )))
+                            {
+                                continue;
+                            }
+                            if let Some(existing) = snap.resources.iter_mut().find(|r| {
+                                r.kind == resource.kind
+                                    && r.namespace == resource.namespace
+                                    && r.name == resource.name
+                            }) {
+                                if resource.cpu.is_empty() && !existing.cpu.is_empty() {
+                                    resource.cpu = existing.cpu.clone();
+                                }
+                                if resource.memory.is_empty() && !existing.memory.is_empty() {
+                                    resource.memory = existing.memory.clone();
+                                }
+                                *existing = (*resource).clone();
+                            } else {
+                                snap.resources.push((*resource).clone());
+                            }
+                            if resource.kind == "Namespace"
+                                && !snap.namespaces.contains(&resource.name)
+                            {
+                                snap.namespaces.push(resource.name.clone());
+                                snap.namespaces.sort();
+                            }
+                            upserts.push(*resource);
+                        }
+                        ParsedWatchFrame::ResourceDeleted {
+                            kind,
+                            namespace,
+                            name,
+                            ..
+                        } => {
+                            snap.resources.retain(|r| {
+                                !(r.kind == kind && r.namespace == namespace && r.name == name)
+                            });
+                            if kind == "Namespace" {
+                                snap.namespaces.retain(|n| n != &name);
+                            }
+                            deleted.push(json!({
+                                "kind": kind,
+                                "namespace": namespace,
+                                "name": name,
+                            }));
+                        }
+                        ParsedWatchFrame::EventUpsert { event, .. } => {
+                            if let Some(existing) = snap.events.iter_mut().find(|e| {
+                                e.namespace == event.namespace
+                                    && e.object == event.object
+                                    && e.reason == event.reason
+                            }) {
+                                *existing = event.clone();
+                            } else {
+                                if snap.events.len() >= kubectl::MAX_APPENDED_ITEMS {
+                                    snap.events.remove(0);
+                                }
+                                snap.events.push(event.clone());
+                            }
+                            event_upserts.push(event);
+                        }
+                        ParsedWatchFrame::Bookmark { .. } => {}
+                        ParsedWatchFrame::Expired { .. } => {
+                            category_resync_needed = true;
+                        }
+                        ParsedWatchFrame::Ignored | ParsedWatchFrame::Malformed => {}
+                    }
+                }
+                let cat_cnt = if active_cat == "Event" {
+                    snap.events.len() as u64
+                } else {
+                    snap.resources
+                        .iter()
+                        .filter(|r| r.kind == active_cat)
+                        .count() as u64
+                };
+                snap.overview_counts.insert(active_cat.to_owned(), cat_cnt);
+                if let Some(pi) = snap.page_info.get_mut(active_cat) {
+                    pi.loaded_count = cat_cnt;
+                    if !stream.resource_version.is_empty() {
+                        pi.resource_version = stream.resource_version.clone();
+                    }
+                }
+            }
+
+            if gone || category_resync_needed {
+                stream.stop();
+                category_resync_needed = true;
+            } else if ended {
+                let rv = stream.resource_version.clone();
+                let spec = stream.spec.clone();
+                stream.stop();
+                if let Ok(reopened) = ActiveWatchStream::start(project, cfg, spec, rv) {
+                    self.watches.category_stream = Some(reopened);
+                } else {
+                    category_resync_needed = true;
+                }
+            } else {
+                self.watches.category_stream = Some(stream);
+            }
+        }
+
+        // Optional lightweight `kubectl top pods` refresh on small watched Pod scopes
+        if refresh_metrics
+            && !category_resync_needed
+            && active_cat == "Pod"
+            && self.watches.category_stream.is_some()
+            && let Some(ref mut snap) = self.snapshot
+        {
+            let pod_cnt = snap.resources.iter().filter(|r| r.kind == "Pod").count();
+            if pod_cnt > 0 && pod_cnt <= 300 {
+                kubectl::enrich_pod_metrics(project, cfg, snap);
+                upserts = snap
+                    .resources
+                    .iter()
+                    .filter(|r| r.kind == "Pod")
+                    .cloned()
+                    .collect();
+            }
+        }
+
+        // 2. Drain single-resource Drawer watch stream
+        if let Some(mut dstream) = self.watches.drawer_stream.take() {
+            let (frames, ended, gone) = dstream.drain_frames();
+            for frame in frames {
+                match frame {
+                    ParsedWatchFrame::ResourceUpsert {
+                        resource,
+                        raw_object_json,
+                        ..
+                    } => {
+                        if let Some(ref mut snap) = self.snapshot
+                            && let Some(existing) = snap.resources.iter_mut().find(|r| {
+                                r.kind == resource.kind
+                                    && r.namespace == resource.namespace
+                                    && r.name == resource.name
+                            })
+                        {
+                            let prev_cpu = existing.cpu.clone();
+                            let prev_mem = existing.memory.clone();
+                            *existing = (*resource).clone();
+                            if existing.cpu.is_empty() {
+                                existing.cpu = prev_cpu;
+                            }
+                            if existing.memory.is_empty() {
+                                existing.memory = prev_mem;
+                            }
+                        }
+                        if !upserts.iter().any(|u| {
+                            u.kind == resource.kind
+                                && u.namespace == resource.namespace
+                                && u.name == resource.name
+                        }) {
+                            upserts.push((*resource).clone());
+                        }
+                        drawer_json_update = Some((
+                            resource.kind.clone(),
+                            resource.namespace.clone(),
+                            resource.name.clone(),
+                            raw_object_json,
+                        ));
+                    }
+                    ParsedWatchFrame::ResourceDeleted {
+                        kind,
+                        namespace,
+                        name,
+                        ..
+                    } => {
+                        drawer_deleted = Some((kind, namespace, name));
+                    }
+                    _ => {}
+                }
+            }
+            if gone || drawer_deleted.is_some() {
+                dstream.stop();
+            } else if ended {
+                let rv = dstream.resource_version.clone();
+                let spec = dstream.spec.clone();
+                dstream.stop();
+                if let Ok(reopened) = ActiveWatchStream::start(project, cfg, spec, rv) {
+                    self.watches.drawer_stream = Some(reopened);
+                }
+            } else {
+                self.watches.drawer_stream = Some(dstream);
+            }
+        }
+
+        if category_resync_needed {
+            if let Some(ref mut snap) = self.snapshot {
+                let limit = snap
+                    .page_info
+                    .get(active_cat)
+                    .map(|pi| pi.limit)
+                    .unwrap_or(kubectl::DEFAULT_PAGE_LIMIT);
+                fetch_category_with_options(
+                    project,
+                    cfg,
+                    snap,
+                    active_cat,
+                    FetchOptions {
+                        is_background_poll: true,
+                        include_metrics: false,
+                        limit,
+                        ..FetchOptions::default()
+                    },
+                );
+            }
+            self.sync_category_watch(project, cfg, active_cat);
+            self.post_snapshot_meta(false, Some(0));
+            return;
+        }
+
+        let cat_watching = self.watches.category_stream.is_some();
+        let drawer_watching = self.watches.drawer_stream.is_some();
+        let mut msg = json!({
+            "op": "watch-delta",
+            "category": active_cat,
+            "categoryWatching": cat_watching,
+            "drawerWatching": drawer_watching,
+            "upserts": upserts,
+            "deleted": deleted,
+            "eventUpserts": event_upserts,
+        });
+        if let Some((dk, dns, dname, raw_json)) = drawer_json_update {
+            msg["drawerResource"] = json!({
+                "kind": dk,
+                "namespace": dns,
+                "name": dname,
+                "json": raw_json,
+            });
+        }
+        if let Some((dk, dns, dname)) = drawer_deleted {
+            msg["drawerDeleted"] = json!({
+                "kind": dk,
+                "namespace": dns,
+                "name": dname,
+            });
+        }
+        Self::send_view_payload(msg);
+    }
+
     /// Runs static inspections (and optional `kubectl --dry-run=client`) on `path` and publishes diagnostics.
     pub fn check_and_publish(
         &mut self,
@@ -424,7 +815,8 @@ impl KubernetesPlugin {
     fn handle_page_message(&mut self, raw: &str, ctx: &Invocation) -> Result<(), Error> {
         let v: Value = serde_json::from_str(raw).map_err(|e| Error::Invalid(e.to_string()))?;
         let op = v.get("op").and_then(Value::as_str).unwrap_or("");
-        let _task = (op != "poll-category").then(|| host::begin_task("Kubernetes", false));
+        let _task = (!matches!(op, "poll-category" | "poll-watch" | "stop-drawer-watch"))
+            .then(|| host::begin_task("Kubernetes", false));
         match op {
             "init" => {
                 let project = resolve_project(ctx).ok();
@@ -474,7 +866,12 @@ impl KubernetesPlugin {
                             ..FetchOptions::default()
                         },
                     );
-                    self.post_snapshot(false);
+                }
+                if let Some(ref p) = project {
+                    self.sync_category_watch(p, &cfg, cat);
+                    if needs_fetch {
+                        self.post_snapshot(false);
+                    }
                 }
             }
             "refresh" => {
@@ -486,6 +883,7 @@ impl KubernetesPlugin {
                     .unwrap_or(kubectl::DEFAULT_PAGE_LIMIT);
                 if let Some(cat) = v.get("category").and_then(Value::as_str) {
                     if cat == "Workspace" {
+                        self.watches.stop_category();
                         self.index.built_at = None;
                         self.index.ensure(Some(&project), None);
                         self.post_state(ctx);
@@ -493,6 +891,7 @@ impl KubernetesPlugin {
                     }
                     let mut cfg = KubeConfigState::load();
                     self.ensure_catalog_loaded(&project, &mut cfg);
+                    self.watches.stop_category();
                     if let Some(ref mut snap) = self.snapshot {
                         fetch_namespaces_into_snapshot(&project, &cfg, snap);
                         fetch_category_with_options(
@@ -506,8 +905,10 @@ impl KubernetesPlugin {
                             },
                         );
                     }
+                    self.sync_category_watch(&project, &cfg, cat);
                     self.post_snapshot(false);
                 } else {
+                    self.watches.stop_all();
                     self.index.built_at = None;
                     self.refresh_cluster(&project);
                     self.post_state(ctx);
@@ -526,6 +927,7 @@ impl KubernetesPlugin {
                 }
             }
             "set-context" => {
+                self.watches.stop_all();
                 if let Some(c) = v.get("context").and_then(Value::as_str) {
                     if let Ok(project) = resolve_project(ctx) {
                         let mut cfg = KubeConfigState::load();
@@ -592,6 +994,9 @@ impl KubernetesPlugin {
                                 );
                             }
                             self.snapshot = Some(snap);
+                            if cat != "ClusterCatalog" && cat != "Workspace" {
+                                self.sync_category_watch(&project, &cfg, cat);
+                            }
                             self.post_snapshot(false);
                         } else {
                             self.snapshot = Some(snap);
@@ -636,12 +1041,17 @@ impl KubernetesPlugin {
                 self.ensure_catalog_loaded(&project, &mut cfg);
                 if let Some(cat) = v.get("category").and_then(Value::as_str) {
                     if cat == "Workspace" {
+                        self.watches.stop_category();
                         self.index.ensure(Some(&project), None);
                         self.post_state(ctx);
                         return Ok(());
                     }
                     if cat == "ClusterCatalog" {
+                        self.watches.stop_category();
                         return Ok(());
+                    }
+                    if !is_poll {
+                        self.watches.stop_category();
                     }
                     if let Some(ref mut snap) = self.snapshot {
                         if snap.namespaces.len() <= 3 && !is_poll {
@@ -710,11 +1120,13 @@ impl KubernetesPlugin {
                             },
                         );
                     }
+                    self.sync_category_watch(&project, &cfg, cat);
                 }
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 self.post_snapshot_meta(false, is_poll.then_some(elapsed_ms));
-                let allow_drawer_refresh =
-                    !is_poll || started.elapsed() < std::time::Duration::from_millis(1200);
+                let allow_drawer_refresh = !is_poll
+                    || (self.watches.drawer_stream.is_none()
+                        && started.elapsed() < std::time::Duration::from_millis(1200));
                 if allow_drawer_refresh
                     && let Some("Pod") = v.get("inspectKind").and_then(Value::as_str)
                     && let Some(ins_name) = v
@@ -740,7 +1152,36 @@ impl KubernetesPlugin {
                     }
                 }
             }
+            "poll-watch" => {
+                let project = resolve_project(ctx)?;
+                let mut cfg = KubeConfigState::load();
+                self.ensure_catalog_loaded(&project, &mut cfg);
+                let cat = v.get("category").and_then(Value::as_str).unwrap_or("Pod");
+                let refresh_metrics = v
+                    .get("refreshMetrics")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let drawer_target = match (
+                    v.get("inspectKind")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty()),
+                    v.get("inspectName")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty()),
+                ) {
+                    (Some(dk), Some(dname)) => {
+                        let dns = v.get("inspectNs").and_then(Value::as_str).unwrap_or("");
+                        Some((dk, dns, dname))
+                    }
+                    _ => None,
+                };
+                self.poll_active_watches(&project, &cfg, cat, drawer_target, refresh_metrics);
+            }
+            "stop-drawer-watch" => {
+                self.watches.stop_drawer();
+            }
             "set-namespace" => {
+                self.watches.stop_all();
                 if let Some(ns) = v.get("namespace").and_then(Value::as_str) {
                     let _ = storage::set("namespace", ns);
                     let _ = storage::set("allNamespaces", "false");
@@ -777,6 +1218,7 @@ impl KubernetesPlugin {
                                 },
                             );
                         }
+                        self.sync_category_watch(&project, &cfg, cat);
                         self.post_snapshot(false);
                     } else {
                         if let Ok(project) = resolve_project(ctx) {
@@ -787,6 +1229,7 @@ impl KubernetesPlugin {
                 }
             }
             "set-all-namespaces" => {
+                self.watches.stop_all();
                 let all = v.get("all").and_then(Value::as_bool).unwrap_or(false);
                 let _ = storage::set("allNamespaces", if all { "true" } else { "false" });
                 let req_limit = v
@@ -832,6 +1275,7 @@ impl KubernetesPlugin {
                             },
                         );
                     }
+                    self.sync_category_watch(&project, &cfg, cat);
                     self.post_snapshot(false);
                 } else {
                     if let Ok(project) = resolve_project(ctx) {
@@ -854,24 +1298,31 @@ impl KubernetesPlugin {
             }
             "inspect-json" => {
                 let project = resolve_project(ctx)?;
-                let cfg = KubeConfigState::load();
+                let mut cfg = KubeConfigState::load();
+                self.ensure_catalog_loaded(&project, &mut cfg);
                 let kind = v.get("kind").and_then(Value::as_str).unwrap_or("Pod");
                 let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 match inspect_cluster_resource_json(&project, &cfg, kind, ns, name) {
                     Ok(out) => {
+                        let rv = extract_object_resource_version(&out);
+                        self.sync_drawer_watch(&project, &cfg, kind, ns, name, rv);
                         let msg = json!({
                             "op": "resource-json",
                             "kind": kind,
                             "namespace": ns,
                             "name": name,
                             "json": out,
+                            "drawerWatching": self.watches.drawer_stream.is_some(),
                         });
                         let _ = host::post_view_message(VIEW_ID, &msg.to_string());
                         let extras = fetch_resource_extras(&project, &cfg, kind, ns, name, &out);
                         let _ = host::post_view_message(VIEW_ID, &extras.to_string());
                     }
-                    Err(e) => Self::post_detail(e.to_string(), Some(e.to_string()), true),
+                    Err(e) => {
+                        self.watches.stop_drawer();
+                        Self::post_detail(e.to_string(), Some(e.to_string()), true);
+                    }
                 }
             }
             "pod-logs" => {
@@ -1646,6 +2097,10 @@ impl Plugin for KubernetesPlugin {
         let cfg = KubeConfigState::load();
         self.update_status_bar(&cfg);
         Ok(())
+    }
+
+    fn deactivate(&mut self) {
+        self.watches.stop_all();
     }
 
     fn run_command(
@@ -3254,5 +3709,148 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
                 "cr-tok-2"
             );
         }
+    }
+
+    #[test]
+    fn hybrid_watch_pipeline_parses_frames_and_switches_by_scope_size() {
+        // 1. Verify frame parsing for ADDED, MODIFIED, DELETED, BOOKMARK, and 410 ERROR
+        let mod_line = r#"{"type":"MODIFIED","object":{"kind":"Pod","metadata":{"name":"api-0","namespace":"production","resourceVersion":"9002","creationTimestamp":"2026-11-11T10:00:00Z"},"spec":{"nodeName":"node-1","containers":[{"name":"web"}]},"status":{"phase":"Running","podIP":"10.2.0.9","containerStatuses":[{"name":"web","ready":true,"restartCount":2,"state":{"running":{"startedAt":"2026-11-11T10:01:00Z"}}}]}}}"#;
+        match kubectl::parse_watch_frame_line(mod_line, "Pod") {
+            ParsedWatchFrame::ResourceUpsert {
+                resource,
+                resource_version,
+                ..
+            } => {
+                assert_eq!(resource_version, "9002");
+                assert_eq!(resource.name, "api-0");
+                assert_eq!(resource.namespace, "production");
+                assert_eq!(resource.restarts, 2);
+                assert_eq!(resource.pod_ip, "10.2.0.9");
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+
+        let del_line = r#"{"type":"DELETED","object":{"metadata":{"name":"api-0","namespace":"production","resourceVersion":"9003"}}}"#;
+        assert_eq!(
+            kubectl::parse_watch_frame_line(del_line, "Pod"),
+            ParsedWatchFrame::ResourceDeleted {
+                kind: "Pod".into(),
+                namespace: "production".into(),
+                name: "api-0".into(),
+                resource_version: "9003".into(),
+            }
+        );
+
+        let bmk_line =
+            r#"{"type":"BOOKMARK","object":{"kind":"Pod","metadata":{"resourceVersion":"9050"}}}"#;
+        assert_eq!(
+            kubectl::parse_watch_frame_line(bmk_line, "Pod"),
+            ParsedWatchFrame::Bookmark {
+                resource_version: "9050".into()
+            }
+        );
+
+        let gone_line = r#"{"type":"ERROR","object":{"kind":"Status","code":410,"reason":"Expired","message":"too old resource version: 8000 (9050)"}}"#;
+        assert!(matches!(
+            kubectl::parse_watch_frame_line(gone_line, "Pod"),
+            ParsedWatchFrame::Expired { .. }
+        ));
+
+        // 2. Verify hybrid eligibility: single-namespace <= 1,000 items starts category watch,
+        //    while > 1,000 items disables category watch yet keeps single-object Drawer watch active.
+        let host = install_mock_with_kubectl();
+        host.on_process("kubectl", move |args, _stdin| {
+            let joined = args.join(" ");
+            let stdout = if joined.contains("config view") {
+                KUBECONFIG_JSON.to_owned()
+            } else if joined.contains("get namespaces --no-headers") {
+                "default Active 30d\nproduction Active 30d\n".to_owned()
+            } else if joined.contains("/api/v1/namespaces/production/pods?limit=100") {
+                r#"{"kind":"PodList","metadata":{"resourceVersion":"7701"},"items":[{"metadata":{"name":"web-0","namespace":"production","resourceVersion":"7700","creationTimestamp":"2026-11-11T10:00:00Z"},"spec":{"containers":[{"name":"app"}]},"status":{"phase":"Running"}}]}"#.to_owned()
+            } else if joined.contains("/api/v1/pods?limit=100") {
+                r#"{"kind":"PodList","metadata":{"resourceVersion":"8801","continue":"tok-2","remainingItemCount":52000},"items":[{"metadata":{"name":"huge-0","namespace":"ns1","creationTimestamp":"2026-11-11T10:00:00Z"},"status":{"phase":"Running"}}]}"#.to_owned()
+            } else if joined.contains("get pod huge-0 -o json") {
+                r#"{"kind":"Pod","metadata":{"name":"huge-0","namespace":"ns1","resourceVersion":"8805"},"status":{"phase":"Running"}}"#.to_owned()
+            } else {
+                String::new()
+            };
+            Ok(ProcessOutput {
+                status: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        });
+        host.add_file("k8s/app.yaml", SAMPLE_MANIFEST);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        // Small single-namespace scope (`production`): `watch_supported == true` and category watch stream is started
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"set-namespace","namespace":"production","category":"Pod","limit":100}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        assert!(plugin.snapshot.as_ref().unwrap().page_info["Pod"].watch_supported);
+        assert!(plugin.watches.category_stream.is_some());
+
+        // Switching to All Namespaces (52,001 pods > 1,000): stops category watch & uses paged LIST
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"set-all-namespaces","all":true,"category":"Pod","limit":100}"#.into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        assert!(!plugin.snapshot.as_ref().unwrap().page_info["Pod"].watch_supported);
+        assert!(plugin.watches.category_stream.is_none());
+
+        // Inspecting one Pod in the Drawer starts a single-object fieldSelector watch even on the 52k cluster
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"inspect-json","kind":"Pod","namespace":"ns1","name":"huge-0"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        assert!(plugin.watches.drawer_stream.is_some());
+        assert_eq!(
+            plugin
+                .watches
+                .drawer_stream
+                .as_ref()
+                .unwrap()
+                .spec
+                .field_selector_name
+                .as_deref(),
+            Some("huge-0")
+        );
+
+        // `poll-watch` emits a `watch-delta` message without stopping the drawer stream
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"poll-watch","category":"Pod","inspectKind":"Pod","inspectNs":"ns1","inspectName":"huge-0"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        assert!(host.view_messages().iter().any(|(v, m)| v == VIEW_ID
+            && m.contains(r#""op":"watch-delta""#)
+            && m.contains(r#""drawerWatching":true"#)));
     }
 }

@@ -209,8 +209,11 @@ pub struct HelmRelease {
 
 pub const DEFAULT_PAGE_LIMIT: u32 = 100;
 pub const MAX_APPENDED_ITEMS: usize = 2_000;
+/// Maximum total items in a category scope where live `watch=true` delta streaming is enabled.
+/// Scopes larger than this (e.g. 53k Pods or 115k Events across All Namespaces) keep using bounded `limit` + `continue` pagination.
+pub const WATCH_ELIGIBLE_MAX_ITEMS: u64 = 1_000;
 
-/// Pagination metadata for a single resource category returned by Kubernetes API `limit` + `continue`.
+/// Pagination & watch metadata for a single resource category returned by Kubernetes API `limit` + `continue`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CategoryPageInfo {
     pub category: String,
@@ -222,6 +225,10 @@ pub struct CategoryPageInfo {
     pub loaded_count: u64,
     pub page_index: u32,
     pub mode: String,
+    #[serde(default)]
+    pub resource_version: String,
+    #[serde(default)]
+    pub watch_supported: bool,
 }
 
 /// Snapshot of the cluster state displayed in the Kubernetes tool window.
@@ -752,6 +759,8 @@ pub fn parse_kubeconfig_catalog(
 
 #[derive(Deserialize, Default)]
 struct RawListMetadata {
+    #[serde(default, rename = "resourceVersion")]
+    resource_version: Option<String>,
     #[serde(default, rename = "continue")]
     continue_token: Option<String>,
     #[serde(default, rename = "remainingItemCount")]
@@ -826,6 +835,8 @@ struct RawMetadata {
     name: Option<String>,
     #[serde(default)]
     namespace: Option<String>,
+    #[serde(default, rename = "resourceVersion")]
+    resource_version: Option<String>,
     #[serde(default, rename = "creationTimestamp")]
     creation_timestamp: Option<String>,
     #[serde(default, rename = "ownerReferences")]
@@ -1091,22 +1102,30 @@ struct RawNodeInfo {
 /// Parses a `kubectl get ... -o json` List or single resource into `ClusterResource` items
 /// using typed deserialization so large annotations, `managedFields`, and CRD schemas are skipped without allocation.
 pub fn parse_resource_list_json(json_str: &str) -> Vec<ClusterResource> {
-    parse_paged_resource_list_json(json_str, None)
-        .map(|(items, _, _)| items)
+    parse_paged_resource_list_json_with_rv(json_str, None)
+        .map(|(items, _, _, _)| items)
         .unwrap_or_default()
 }
 
 /// Parses a Kubernetes `List` or single resource JSON into `(items, continue_token, remaining_item_count)`.
-/// When `fallback_kind` is provided (e.g. `"Pod"` or `"CR:workloads.kueue.x-k8s.io"`), items missing `TypeMeta.kind`
-/// in raw REST responses inherit that kind (`CR:*` always overrides so custom resource tables match `activeKind`).
 pub fn parse_paged_resource_list_json(
     json_str: &str,
     fallback_kind: Option<&str>,
 ) -> Option<(Vec<ClusterResource>, String, Option<u64>)> {
+    parse_paged_resource_list_json_with_rv(json_str, fallback_kind)
+        .map(|(items, cont, rem, _)| (items, cont, rem))
+}
+
+/// Parses a Kubernetes `List` or single resource JSON into `(items, continue_token, remaining_item_count, resource_version)`.
+pub fn parse_paged_resource_list_json_with_rv(
+    json_str: &str,
+    fallback_kind: Option<&str>,
+) -> Option<(Vec<ClusterResource>, String, Option<u64>, String)> {
     let parsed = serde_json::from_str::<RawResourceList>(json_str).ok()?;
     let list_meta = parsed.metadata.unwrap_or_default();
     let cont = list_meta.continue_token.unwrap_or_default();
     let remaining = list_meta.remaining_item_count;
+    let mut rv = list_meta.resource_version.unwrap_or_default();
     let inferred_from_list = parsed
         .kind
         .as_deref()
@@ -1129,6 +1148,12 @@ pub fn parse_paged_resource_list_json(
     } else if parsed.kind.is_some()
         && let Some(mut single) = parsed.single
     {
+        if rv.is_empty()
+            && let Some(ref m) = single.metadata
+            && let Some(ref srv) = m.resource_version
+        {
+            rv = srv.clone();
+        }
         if let Some(cr_k) = force_cr_kind {
             single.kind = Some(cr_k.to_owned());
         } else if single.kind.is_none() {
@@ -1138,7 +1163,7 @@ pub fn parse_paged_resource_list_json(
             out.push(res);
         }
     }
-    Some((out, cont, remaining))
+    Some((out, cont, remaining, rv))
 }
 
 fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
@@ -1891,10 +1916,18 @@ pub fn parse_paged_events_json(
     json_str: &str,
     cap: Option<usize>,
 ) -> Option<(Vec<ClusterEvent>, String, Option<u64>)> {
+    parse_paged_events_json_with_rv(json_str, cap).map(|(items, cont, rem, _)| (items, cont, rem))
+}
+
+pub fn parse_paged_events_json_with_rv(
+    json_str: &str,
+    cap: Option<usize>,
+) -> Option<(Vec<ClusterEvent>, String, Option<u64>, String)> {
     let parsed = serde_json::from_str::<RawEventList>(json_str).ok()?;
     let list_meta = parsed.metadata.unwrap_or_default();
     let cont = list_meta.continue_token.unwrap_or_default();
     let remaining = list_meta.remaining_item_count;
+    let rv = list_meta.resource_version.unwrap_or_default();
     let mut out = Vec::new();
     let iter: Box<dyn Iterator<Item = RawEventItem>> = if let Some(max_n) = cap {
         Box::new(parsed.items.into_iter().rev().take(max_n))
@@ -1928,7 +1961,7 @@ pub fn parse_paged_events_json(
             last_seen,
         });
     }
-    Some((out, cont, remaining))
+    Some((out, cont, remaining, rv))
 }
 
 /// Parses `helm list -o json` output into `HelmRelease` items.
@@ -2617,6 +2650,8 @@ fn fetch_namespaces_table_fallback(
                 loaded_count: loaded,
                 page_index: 1,
                 mode: "replace".into(),
+                resource_version: String::new(),
+                watch_supported: false,
             },
         );
     }
@@ -3533,13 +3568,14 @@ struct FetchedPage<T> {
     request_token: String,
     continue_token: String,
     remaining_count: Option<u64>,
+    resource_version: String,
     page_index: u32,
     append: bool,
     used_limit: u32,
 }
 
 enum RawPageOutcome<T> {
-    Page(FetchedPage<T>),
+    Page(Box<FetchedPage<T>>),
     Unsupported,
     Failed(String),
 }
@@ -3614,18 +3650,19 @@ fn fetch_raw_paged_resources(
 ) -> RawPageOutcome<ClusterResource> {
     match fetch_raw_paged_json(project, cfg, endpoint, opts, req_timeout) {
         Ok((stdout, req_tok, page_idx, append, used_limit)) => {
-            if let Some((items, cont, rem)) =
-                parse_paged_resource_list_json(&stdout, Some(category))
+            if let Some((items, cont, rem, rv)) =
+                parse_paged_resource_list_json_with_rv(&stdout, Some(category))
             {
-                RawPageOutcome::Page(FetchedPage {
+                RawPageOutcome::Page(Box::new(FetchedPage {
                     items,
                     request_token: req_tok,
                     continue_token: cont,
                     remaining_count: rem,
+                    resource_version: rv,
                     page_index: page_idx,
                     append,
                     used_limit,
-                })
+                }))
             } else {
                 RawPageOutcome::Unsupported
             }
@@ -3648,16 +3685,17 @@ fn fetch_raw_paged_events(
         req_timeout,
     ) {
         Ok((stdout, req_tok, page_idx, append, used_limit)) => {
-            if let Some((items, cont, rem)) = parse_paged_events_json(&stdout, None) {
-                RawPageOutcome::Page(FetchedPage {
+            if let Some((items, cont, rem, rv)) = parse_paged_events_json_with_rv(&stdout, None) {
+                RawPageOutcome::Page(Box::new(FetchedPage {
                     items,
                     request_token: req_tok,
                     continue_token: cont,
                     remaining_count: rem,
+                    resource_version: rv,
                     page_index: page_idx,
                     append,
                     used_limit,
-                })
+                }))
             } else {
                 RawPageOutcome::Unsupported
             }
@@ -3680,15 +3718,22 @@ fn apply_resource_page_to_snapshot(
         request_token,
         continue_token,
         remaining_count,
+        resource_version,
         page_index,
         append,
         used_limit,
     } = page;
     let page_len = items.len() as u64;
-    if request_token.is_empty() {
+    let est_total = if request_token.is_empty() {
+        let total = page_len + remaining_count.unwrap_or(0);
+        snap.overview_counts.insert(category.to_owned(), total);
+        total
+    } else {
         snap.overview_counts
-            .insert(category.to_owned(), page_len + remaining_count.unwrap_or(0));
-    }
+            .get(category)
+            .copied()
+            .unwrap_or(page_len + remaining_count.unwrap_or(0))
+    };
     if append {
         let existing_keys: std::collections::BTreeSet<(String, String)> = snap
             .resources
@@ -3706,6 +3751,9 @@ fn apply_resource_page_to_snapshot(
                 current_cat_cnt += 1;
             }
         }
+        let watch_supported = !resource_version.is_empty()
+            && continue_token.is_empty()
+            && est_total <= WATCH_ELIGIBLE_MAX_ITEMS;
         snap.page_info.insert(
             category.to_owned(),
             CategoryPageInfo {
@@ -3717,6 +3765,8 @@ fn apply_resource_page_to_snapshot(
                 loaded_count: current_cat_cnt as u64,
                 page_index,
                 mode: "append".into(),
+                resource_version,
+                watch_supported,
             },
         );
     } else {
@@ -3725,6 +3775,10 @@ fn apply_resource_page_to_snapshot(
         });
         snap.resources.extend(items);
         let loaded = snap.resources.iter().filter(|r| r.kind == category).count() as u64;
+        let watch_supported = !resource_version.is_empty()
+            && page_index <= 1
+            && continue_token.is_empty()
+            && est_total <= WATCH_ELIGIBLE_MAX_ITEMS;
         snap.page_info.insert(
             category.to_owned(),
             CategoryPageInfo {
@@ -3736,6 +3790,8 @@ fn apply_resource_page_to_snapshot(
                 loaded_count: loaded,
                 page_index,
                 mode: "replace".into(),
+                resource_version,
+                watch_supported,
             },
         );
     }
@@ -3785,6 +3841,8 @@ pub fn fetch_category_with_options(
                     loaded_count: loaded,
                     page_index: 1,
                     mode: "replace".into(),
+                    resource_version: String::new(),
+                    watch_supported: false,
                 },
             );
         }
@@ -3799,9 +3857,9 @@ pub fn fetch_category_with_options(
                 snap.connected = true;
                 snap.error = None;
                 let page_len = page.items.len() as u64;
+                let est_total = page_len + page.remaining_count.unwrap_or(0);
                 if page.request_token.is_empty() {
-                    snap.overview_counts
-                        .insert("Event".into(), page_len + page.remaining_count.unwrap_or(0));
+                    snap.overview_counts.insert("Event".into(), est_total);
                 }
                 if page.append {
                     let room = MAX_APPENDED_ITEMS.saturating_sub(snap.events.len());
@@ -3810,6 +3868,10 @@ pub fn fetch_category_with_options(
                     snap.events = page.items;
                 }
                 let loaded = snap.events.len() as u64;
+                let watch_supported = !page.resource_version.is_empty()
+                    && page.page_index <= 1
+                    && page.continue_token.is_empty()
+                    && est_total <= WATCH_ELIGIBLE_MAX_ITEMS;
                 snap.page_info.insert(
                     "Event".into(),
                     CategoryPageInfo {
@@ -3825,6 +3887,8 @@ pub fn fetch_category_with_options(
                         } else {
                             "replace".into()
                         },
+                        resource_version: page.resource_version,
+                        watch_supported,
                     },
                 );
             }
@@ -3861,7 +3925,7 @@ pub fn fetch_category_with_options(
                     RawPageOutcome::Page(page) => {
                         snap.connected = true;
                         snap.error = None;
-                        apply_resource_page_to_snapshot(snap, kind, page);
+                        apply_resource_page_to_snapshot(snap, kind, *page);
                         return;
                     }
                     RawPageOutcome::Unsupported | RawPageOutcome::Failed(_) => {}
@@ -3958,7 +4022,7 @@ pub fn fetch_category_with_options(
                             });
                         }
 
-                        apply_resource_page_to_snapshot(snap, kind, page);
+                        apply_resource_page_to_snapshot(snap, kind, *page);
 
                         if kind == "Pod" {
                             let allow_metrics = opts.include_metrics
@@ -5790,4 +5854,401 @@ fn first_line_or(stderr: &str, fallback: &str) -> String {
         .find(|l| !l.trim().is_empty())
         .map(|l| l.trim().to_owned())
         .unwrap_or_else(|| fallback.to_owned())
+}
+
+// ============================================================================
+// Hybrid Kubernetes Watch Stream (`kubectl get --raw ...?watch=true`)
+// ============================================================================
+
+/// Builds the raw URI for a Kubernetes `watch=true` stream starting at `resource_version`.
+pub fn build_watch_raw_uri(
+    api_prefix: &str,
+    plural: &str,
+    cluster_scoped: bool,
+    cfg: &KubeConfigState,
+    resource_version: &str,
+    field_selector_name: Option<&str>,
+) -> String {
+    let base = if cluster_scoped || cfg.all_namespaces || cfg.namespace.trim().is_empty() {
+        format!("{api_prefix}/{plural}")
+    } else {
+        let ns = url_encode_component(cfg.namespace.trim());
+        format!("{api_prefix}/namespaces/{ns}/{plural}")
+    };
+    let mut query = vec![
+        "watch=true".to_owned(),
+        "allowWatchBookmarks=true".to_owned(),
+        "timeoutSeconds=295".to_owned(),
+    ];
+    if !resource_version.trim().is_empty() {
+        query.push(format!(
+            "resourceVersion={}",
+            url_encode_component(resource_version.trim())
+        ));
+    }
+    if let Some(name) = field_selector_name.filter(|s| !s.trim().is_empty()) {
+        let sel = format!("metadata.name={}", name.trim());
+        query.push(format!("fieldSelector={}", url_encode_component(&sel)));
+    }
+    format!("{base}?{}", query.join("&"))
+}
+
+/// Resolves the REST `(api_prefix, plural, is_cluster_scoped)` tuple for built-in kinds or `CR:<crd>`.
+pub fn resolve_watch_endpoint(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+    kind: &str,
+) -> Option<(String, String, bool)> {
+    if let Some((api_prefix, plural, cluster_scoped)) = k8s_api_endpoint_info(kind) {
+        return Some((api_prefix.to_owned(), plural.to_owned(), cluster_scoped));
+    }
+    if let Some(crd_name) = kind.strip_prefix("CR:") {
+        if !snap
+            .resources
+            .iter()
+            .any(|r| r.kind == "CustomResourceDefinition")
+        {
+            fetch_crds_into_snapshot(project, cfg, snap);
+        }
+        return resolve_crd_api_endpoint(project, cfg, snap, crd_name, Some(4));
+    }
+    None
+}
+
+/// Parsed single line from a Kubernetes newline-delimited JSON `WatchEvent` stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParsedWatchFrame {
+    ResourceUpsert {
+        resource: Box<ClusterResource>,
+        raw_object_json: String,
+        resource_version: String,
+    },
+    ResourceDeleted {
+        kind: String,
+        namespace: String,
+        name: String,
+        resource_version: String,
+    },
+    EventUpsert {
+        event: ClusterEvent,
+        resource_version: String,
+    },
+    Bookmark {
+        resource_version: String,
+    },
+    Expired {
+        message: String,
+    },
+    Ignored,
+    Malformed,
+}
+
+#[derive(Deserialize)]
+struct RawWatchEnvelope<'a> {
+    #[serde(default, rename = "type")]
+    event_type: String,
+    #[serde(borrow)]
+    object: &'a serde_json::value::RawValue,
+}
+
+#[derive(Deserialize)]
+struct RawWatchBookmarkMeta {
+    #[serde(default)]
+    metadata: Option<RawMetadata>,
+    #[serde(default)]
+    code: Option<u16>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Extracts a resource's `metadata.resourceVersion` from a single-object JSON string.
+pub fn extract_object_resource_version(raw_json: &str) -> String {
+    serde_json::from_str::<RawWatchBookmarkMeta>(raw_json)
+        .ok()
+        .and_then(|m| m.metadata)
+        .and_then(|m| m.resource_version)
+        .unwrap_or_default()
+}
+
+/// Parses one JSON line emitted by `kubectl get --raw "...?watch=true"`.
+pub fn parse_watch_frame_line(line: &str, expected_kind: &str) -> ParsedWatchFrame {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with("started:") {
+        return ParsedWatchFrame::Ignored;
+    }
+    let Ok(env) = serde_json::from_str::<RawWatchEnvelope<'_>>(trimmed) else {
+        return ParsedWatchFrame::Malformed;
+    };
+    let obj_raw = env.object.get();
+    match env.event_type.as_str() {
+        "BOOKMARK" => {
+            let rv = extract_object_resource_version(obj_raw);
+            if rv.is_empty() {
+                ParsedWatchFrame::Ignored
+            } else {
+                ParsedWatchFrame::Bookmark {
+                    resource_version: rv,
+                }
+            }
+        }
+        "ERROR" => {
+            if let Ok(st) = serde_json::from_str::<RawWatchBookmarkMeta>(obj_raw) {
+                let reason = st.reason.unwrap_or_default();
+                let msg = st.message.unwrap_or_else(|| "watch stream error".into());
+                if st.code == Some(410)
+                    || reason.contains("Expired")
+                    || reason.contains("Gone")
+                    || msg.contains("too old")
+                {
+                    return ParsedWatchFrame::Expired { message: msg };
+                }
+            }
+            ParsedWatchFrame::Expired {
+                message: "watch stream closed by apiserver".into(),
+            }
+        }
+        "ADDED" | "MODIFIED" | "DELETED" => {
+            if expected_kind == "Event" {
+                let Ok(ev_item) = serde_json::from_str::<RawEventItem>(obj_raw) else {
+                    return ParsedWatchFrame::Malformed;
+                };
+                let rv = ev_item
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.resource_version.clone())
+                    .unwrap_or_default();
+                if env.event_type == "DELETED" {
+                    return ParsedWatchFrame::Bookmark {
+                        resource_version: rv,
+                    };
+                }
+                let (obj_kind, obj_name) = match ev_item.involved_object {
+                    Some(inv) => (
+                        inv.kind.unwrap_or_else(|| "Resource".into()),
+                        inv.name.unwrap_or_default(),
+                    ),
+                    None => ("Resource".into(), String::new()),
+                };
+                let (namespace, created) = match ev_item.metadata {
+                    Some(m) => (
+                        m.namespace.unwrap_or_else(|| "default".into()),
+                        m.creation_timestamp.unwrap_or_default(),
+                    ),
+                    None => ("default".into(), String::new()),
+                };
+                let last_seen = ev_item
+                    .last_timestamp
+                    .or(ev_item.event_time)
+                    .unwrap_or(created);
+                return ParsedWatchFrame::EventUpsert {
+                    event: ClusterEvent {
+                        kind: obj_kind,
+                        object: obj_name,
+                        namespace,
+                        reason: ev_item.reason.unwrap_or_default(),
+                        message: ev_item.message.unwrap_or_default(),
+                        event_type: ev_item.event_type.unwrap_or_else(|| "Normal".into()),
+                        count: ev_item.count.unwrap_or(1),
+                        last_seen,
+                    },
+                    resource_version: rv,
+                };
+            }
+
+            let Ok(mut raw_item) = serde_json::from_str::<RawResourceItem>(obj_raw) else {
+                return ParsedWatchFrame::Malformed;
+            };
+            let rv = raw_item
+                .metadata
+                .as_ref()
+                .and_then(|m| m.resource_version.clone())
+                .unwrap_or_default();
+            if expected_kind.starts_with("CR:")
+                || raw_item.kind.as_deref().is_none_or(str::is_empty)
+            {
+                raw_item.kind = Some(expected_kind.to_owned());
+            }
+            if env.event_type == "DELETED" {
+                let Some(meta) = raw_item.metadata else {
+                    return ParsedWatchFrame::Ignored;
+                };
+                let Some(name) = meta.name else {
+                    return ParsedWatchFrame::Ignored;
+                };
+                return ParsedWatchFrame::ResourceDeleted {
+                    kind: expected_kind.to_owned(),
+                    namespace: meta.namespace.unwrap_or_default(),
+                    name,
+                    resource_version: rv,
+                };
+            }
+            let Some(res) = parse_raw_resource_item(raw_item) else {
+                return ParsedWatchFrame::Ignored;
+            };
+            ParsedWatchFrame::ResourceUpsert {
+                resource: Box::new(res),
+                raw_object_json: obj_raw.to_owned(),
+                resource_version: rv,
+            }
+        }
+        _ => ParsedWatchFrame::Ignored,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchSpec {
+    pub context: String,
+    pub kubeconfig: String,
+    pub namespace: String,
+    pub all_namespaces: bool,
+    pub kind: String,
+    pub api_prefix: String,
+    pub plural: String,
+    pub cluster_scoped: bool,
+    pub field_selector_name: Option<String>,
+}
+
+pub struct ActiveWatchStream {
+    pub spec: WatchSpec,
+    pub resource_version: String,
+    pub child: host::Child,
+    pub remainder: String,
+}
+
+impl ActiveWatchStream {
+    pub fn start(
+        project: &Project,
+        cfg: &KubeConfigState,
+        spec: WatchSpec,
+        resource_version: String,
+    ) -> Result<Self, Error> {
+        let mut eff_cfg = cfg.clone();
+        eff_cfg.context = spec.context.clone();
+        eff_cfg.kubeconfig = spec.kubeconfig.clone();
+        eff_cfg.namespace = spec.namespace.clone();
+        eff_cfg.all_namespaces = spec.all_namespaces;
+
+        let uri = build_watch_raw_uri(
+            &spec.api_prefix,
+            &spec.plural,
+            spec.cluster_scoped,
+            &eff_cfg,
+            &resource_version,
+            spec.field_selector_name.as_deref(),
+        );
+        let mut args = eff_cfg.base_args(false);
+        args.extend(["get".into(), "--raw".into(), uri]);
+        let cmd = host::Command::new("kubectl").args(args);
+        let child = host::start(&cmd, Some(project))?;
+        Ok(Self {
+            spec,
+            resource_version,
+            child,
+            remainder: String::new(),
+        })
+    }
+
+    /// Drains available newline-delimited JSON frames without blocking.
+    /// Returns `(frames, stream_ended, overflow_or_gone)`.
+    pub fn drain_frames(&mut self) -> (Vec<ParsedWatchFrame>, bool, bool) {
+        let mut frames = Vec::new();
+        let Ok(chunk) = self.child.poll(512 * 1024) else {
+            return (frames, true, true);
+        };
+        let ended = chunk.status.is_some();
+        let mut gone = chunk.stderr.contains("410")
+            || chunk.stderr.contains("Expired")
+            || chunk.stderr.contains("too old");
+
+        if !chunk.stdout.is_empty() {
+            // Guard against 1 MiB host ring-buffer overwrite dropping bytes mid-line.
+            if chunk.stdout.len() >= 950 * 1024 {
+                return (frames, true, true);
+            }
+            self.remainder.push_str(&chunk.stdout);
+            if self.remainder.len() > 2 * 1024 * 1024 {
+                self.remainder.clear();
+                return (frames, true, true);
+            }
+            while let Some(nl) = self.remainder.find('\n') {
+                let line: String = self.remainder.drain(..=nl).collect();
+                let parsed = parse_watch_frame_line(&line, &self.spec.kind);
+                match &parsed {
+                    ParsedWatchFrame::ResourceUpsert {
+                        resource_version, ..
+                    }
+                    | ParsedWatchFrame::ResourceDeleted {
+                        resource_version, ..
+                    }
+                    | ParsedWatchFrame::EventUpsert {
+                        resource_version, ..
+                    }
+                    | ParsedWatchFrame::Bookmark {
+                        resource_version, ..
+                    } => {
+                        if !resource_version.is_empty() {
+                            self.resource_version = resource_version.clone();
+                        }
+                    }
+                    ParsedWatchFrame::Expired { .. } | ParsedWatchFrame::Malformed => {
+                        gone = true;
+                    }
+                    ParsedWatchFrame::Ignored => {}
+                }
+                if !matches!(
+                    parsed,
+                    ParsedWatchFrame::Ignored | ParsedWatchFrame::Malformed
+                ) {
+                    frames.push(parsed);
+                }
+                if gone {
+                    break;
+                }
+            }
+        }
+        if ended && chunk.status != Some(0) && frames.is_empty() && !chunk.stderr.trim().is_empty()
+        {
+            gone = true;
+        }
+        (frames, ended, gone)
+    }
+
+    pub fn stop(self) {
+        let _ = self.child.kill();
+    }
+}
+
+/// Manages at most 2 concurrent `kubectl --raw ?watch=true` child processes
+/// (1 for the active table category when `total <= 1,000` and 1 for the open Drawer resource),
+/// staying well within OpenIDEA's 8-child-per-plugin cap.
+#[derive(Default)]
+pub struct WatchManager {
+    pub category_stream: Option<ActiveWatchStream>,
+    pub drawer_stream: Option<ActiveWatchStream>,
+}
+
+impl WatchManager {
+    pub fn stop_all(&mut self) {
+        if let Some(s) = self.category_stream.take() {
+            s.stop();
+        }
+        if let Some(s) = self.drawer_stream.take() {
+            s.stop();
+        }
+    }
+
+    pub fn stop_category(&mut self) {
+        if let Some(s) = self.category_stream.take() {
+            s.stop();
+        }
+    }
+
+    pub fn stop_drawer(&mut self) {
+        if let Some(s) = self.drawer_stream.take() {
+            s.stop();
+        }
+    }
 }
