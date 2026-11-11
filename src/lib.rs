@@ -25,14 +25,15 @@ use intelligence::{
 };
 use kubectl::{
     ClusterSnapshot, FetchOptions, KubeConfigState, apply_or_diff_manifest, build_kustomize,
-    cordon_node, delete_cluster_resource_opts, drain_node, exec_pod_command,
-    fetch_category_into_snapshot, fetch_category_with_options, fetch_cluster_snapshot,
-    fetch_helm_release_detail, fetch_kubeconfig_overview, fetch_namespaces_into_snapshot,
-    fetch_nodes_into_snapshot, fetch_pod_logs, fetch_resource_extras, inspect_cluster_resource,
-    inspect_cluster_resource_json, open_debug_terminal, open_exec_or_debug_terminal,
-    open_exec_terminal, open_follow_logs_terminal, open_node_shell_terminal,
-    open_port_forward_terminal, render_helm_template, resolve_project, rollout_restart,
-    scale_workload, suspend_cronjob, trigger_cronjob, workspace_manifests_json,
+    cordon_node, delete_cluster_resource_opts, drain_node, enforce_large_cluster_scope,
+    exec_pod_command, fetch_category_into_snapshot, fetch_category_with_options,
+    fetch_cluster_snapshot, fetch_helm_release_detail, fetch_kubeconfig_overview,
+    fetch_namespaces_into_snapshot, fetch_nodes_into_snapshot, fetch_pod_logs,
+    fetch_resource_extras, inspect_cluster_resource, inspect_cluster_resource_json,
+    open_debug_terminal, open_exec_or_debug_terminal, open_exec_terminal,
+    open_follow_logs_terminal, open_node_shell_terminal, open_port_forward_terminal,
+    render_helm_template, resolve_project, rollout_restart, scale_workload, suspend_cronjob,
+    trigger_cronjob, workspace_manifests_json,
 };
 use manifest::{parse_yaml, utf16_len};
 use openidea_plugin::host::{self, storage};
@@ -49,6 +50,10 @@ use serde_json::{Value, json};
 pub const VIEW_ID: &str = "kubernetes";
 pub const STATUS_ID: &str = "context";
 const PAGE_HTML: &str = include_str!("page.html");
+/// Safe ceiling below OpenIDEA's 8 MiB `MAX_VIEW_MESSAGE` bridge limit.
+const MAX_SAFE_VIEW_BYTES: usize = 6 * 1024 * 1024;
+/// Maximum cached resources embedded in initial `Body::Html` so `PAGE_HTML` never exceeds `MAX_HTML` (4 MiB).
+const MAX_INITIAL_HTML_RESOURCES: usize = 500;
 
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -245,9 +250,57 @@ impl KubernetesPlugin {
         })
     }
 
+    fn send_view_payload(mut payload: Value) {
+        let mut serialized = payload.to_string();
+        if serialized.len() > MAX_SAFE_VIEW_BYTES {
+            let orig = payload
+                .pointer("/snapshot/resources")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            while serialized.len() > MAX_SAFE_VIEW_BYTES {
+                let Some(cur_len) = payload
+                    .pointer("/snapshot/resources")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                else {
+                    break;
+                };
+                if cur_len <= 500 {
+                    break;
+                }
+                let next_len = ((cur_len * 2) / 3).max(500);
+                if let Some(res_arr) = payload
+                    .pointer_mut("/snapshot/resources")
+                    .and_then(Value::as_array_mut)
+                {
+                    res_arr.truncate(next_len);
+                }
+                if let Some(snap_obj) = payload.get_mut("snapshot").and_then(Value::as_object_mut) {
+                    snap_obj.insert(
+                        "error".into(),
+                        Value::String(format!(
+                            "Showing first {next_len} of {orig} resources to stay within view message limits; filter by namespace or search to narrow."
+                        )),
+                    );
+                }
+                serialized = payload.to_string();
+            }
+        }
+        if let Err(e) = host::post_view_message(VIEW_ID, &serialized) {
+            let fallback = json!({
+                "op": "detail",
+                "text": "",
+                "banner": format!("Failed to update Kubernetes view: {e}"),
+                "error": true,
+            });
+            let _ = host::post_view_message(VIEW_ID, &fallback.to_string());
+        }
+    }
+
     fn post_state(&mut self, ctx: &Invocation) {
         let payload = self.state_payload(ctx);
-        let _ = host::post_view_message(VIEW_ID, &payload.to_string());
+        Self::send_view_payload(payload);
         let cfg = KubeConfigState::load();
         self.update_status_bar(&cfg);
     }
@@ -269,7 +322,7 @@ impl KubernetesPlugin {
             payload["pollCompleted"] = Value::Bool(true);
             payload["pollDurationMs"] = Value::Number(ms.into());
         }
-        let _ = host::post_view_message(VIEW_ID, &payload.to_string());
+        Self::send_view_payload(payload);
         self.update_status_bar(&cfg);
     }
 
@@ -396,7 +449,7 @@ impl KubernetesPlugin {
                     "debuggerImage": cfg.debugger_image,
                     "hotbarItems": Self::stored_hotbar_items(),
                 });
-                let _ = host::post_view_message(VIEW_ID, &payload.to_string());
+                Self::send_view_payload(payload);
                 if needs_fetch
                     && let Some(ref p) = project
                     && let Some(ref mut s) = self.snapshot
@@ -404,6 +457,7 @@ impl KubernetesPlugin {
                     if s.namespaces.len() <= 3 {
                         fetch_namespaces_into_snapshot(p, &cfg, s);
                     }
+                    enforce_large_cluster_scope(&mut cfg, s);
                     fetch_category_into_snapshot(p, &cfg, s, cat);
                     self.post_snapshot(false);
                 }
@@ -635,7 +689,18 @@ impl KubernetesPlugin {
                         if snap.namespaces.len() <= 3 {
                             fetch_namespaces_into_snapshot(&project, &cfg, snap);
                         }
-                        snap.all_namespaces = all;
+                        if all
+                            && matches!(cat, "ClusterOverview" | "WorkloadsOverview")
+                            && enforce_large_cluster_scope(&mut cfg, snap)
+                        {
+                            snap.error = Some(format!(
+                                "Cluster has {} namespaces; Overview is scoped to '{}' for responsiveness (select an individual resource tab to query All Namespaces).",
+                                snap.namespaces.len(),
+                                cfg.namespace
+                            ));
+                        } else {
+                            snap.all_namespaces = all;
+                        }
                         snap.helm_releases.clear();
                         snap.resources.retain(|r| {
                             matches!(
@@ -2029,10 +2094,14 @@ impl Views for KubernetesPlugin {
         }
         self.update_status_bar(&cfg);
         let snap = self.snapshot.clone().unwrap_or_default();
+        let mut initial_snap = snap.clone();
+        if initial_snap.resources.len() > MAX_INITIAL_HTML_RESOURCES {
+            initial_snap.resources.truncate(MAX_INITIAL_HTML_RESOURCES);
+        }
         let ws = workspace_manifests_json(&self.index.files, &root);
         let initial = json!({
             "op": "state",
-            "snapshot": snap,
+            "snapshot": initial_snap,
             "workspace": ws,
             "needsClusterFetch": snap.resources.is_empty() && snap.error.is_none(),
         });
@@ -2832,6 +2901,54 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
                 .filter(|r| r.kind == "Node")
                 .count(),
             120
+        );
+    }
+
+    #[test]
+    fn enforces_large_cluster_scope_and_caps_initial_html_payload() {
+        let host = install_mock_with_kubectl();
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        let namespaces: Vec<String> = (0..220).map(|i| format!("team-ns-{i:03}")).collect();
+        let resources: Vec<kubectl::ClusterResource> = (0..1200)
+            .map(|i| kubectl::ClusterResource {
+                kind: "Pod".into(),
+                name: format!("pod-{i:04}"),
+                namespace: "team-ns-001".into(),
+                status: "Running".into(),
+                ready: "1/1".into(),
+                ..Default::default()
+            })
+            .collect();
+        let mut snap = ClusterSnapshot {
+            connected: true,
+            current_context: "prod-east".into(),
+            current_namespace: "team-ns-001".into(),
+            all_namespaces: true,
+            namespaces,
+            resources,
+            ..Default::default()
+        };
+        let mut cfg = KubeConfigState {
+            all_namespaces: true,
+            namespace: "team-ns-001".into(),
+            ..Default::default()
+        };
+        assert!(kubectl::enforce_large_cluster_scope(&mut cfg, &mut snap));
+        assert!(!cfg.all_namespaces && !snap.all_namespaces);
+
+        plugin.snapshot = Some(snap);
+        let view = plugin.render(VIEW_ID, None, &host.invocation()).unwrap();
+        let Body::Html(html) = &view.body else {
+            panic!("expected Html view");
+        };
+        assert!(
+            html.len() < 3 * 1024 * 1024 && html.trim_end().ends_with("</script>"),
+            "rendered HTML must stay well below 4 MiB MAX_HTML without truncating closing script tag (len={})",
+            html.len()
         );
     }
 }

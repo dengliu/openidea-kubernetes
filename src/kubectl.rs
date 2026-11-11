@@ -2949,26 +2949,47 @@ pub fn enrich_pod_metrics(project: &Project, cfg: &KubeConfigState, snap: &mut C
     }
 }
 
+pub const LARGE_CLUSTER_NAMESPACE_THRESHOLD: usize = 150;
+
+/// Scopes `cfg` and `snap` back to the active namespace when a cluster has more than
+/// `LARGE_CLUSTER_NAMESPACE_THRESHOLD` namespaces during startup or multi-kind overview queries.
+pub fn enforce_large_cluster_scope(cfg: &mut KubeConfigState, snap: &mut ClusterSnapshot) -> bool {
+    if cfg.all_namespaces && snap.namespaces.len() > LARGE_CLUSTER_NAMESPACE_THRESHOLD {
+        cfg.all_namespaces = false;
+        snap.all_namespaces = false;
+        let _ = storage::set("allNamespaces", "false");
+        true
+    } else {
+        false
+    }
+}
+
 /// Fetches the 10 namespaced workload/network/config resource kinds into `snap`.
 pub fn fetch_workloads_into_snapshot(
     project: &Project,
     cfg: &KubeConfigState,
     snap: &mut ClusterSnapshot,
 ) {
-    let mut res_args = cfg.base_args(true);
+    let mut eff_cfg = cfg.clone();
+    if eff_cfg.all_namespaces && snap.namespaces.len() > LARGE_CLUSTER_NAMESPACE_THRESHOLD {
+        eff_cfg.all_namespaces = false;
+        snap.all_namespaces = false;
+        let _ = storage::set("allNamespaces", "false");
+    }
+    let mut res_args = eff_cfg.base_args(true);
     res_args.extend([
         "get".into(),
         "pods,deployments,statefulsets,daemonsets,replicasets,jobs,cronjobs,services,ingresses,configmaps,pvc".into(),
     ]);
-    cfg.push_scope_flags(&mut res_args);
-    if cfg.all_namespaces {
+    eff_cfg.push_scope_flags(&mut res_args);
+    if eff_cfg.all_namespaces {
         res_args.extend([
             "-o".into(),
             CUSTOM_COLUMNS_SPEC.into(),
             "--no-headers".into(),
         ]);
     } else {
-        res_args.extend(["-o".into(), "json".into()]);
+        res_args.extend(["-o".into(), "json".into(), "--chunk-size=500".into()]);
     }
     match run_kubectl(project, &res_args, None) {
         Ok(out) if out.status == Some(0) => {
@@ -2986,7 +3007,7 @@ pub fn fetch_workloads_into_snapshot(
                 snap.resources
                     .extend(parse_custom_columns_resources(&out.stdout));
             }
-            enrich_pod_metrics(project, cfg, snap);
+            enrich_pod_metrics(project, &eff_cfg, snap);
         }
         Ok(out) => {
             snap.error = Some(first_line_or(&out.stderr, "kubectl get resources failed"));
@@ -3300,13 +3321,7 @@ pub fn fetch_cluster_snapshot(project: &Project, cfg: &mut KubeConfigState) -> C
     }
 
     fetch_namespaces_into_snapshot(project, cfg, &mut snap);
-    // On massive shared clusters (>150 namespaces, e.g. 950+ user namespaces), `--all-namespaces`
-    // paginates across 25,000+ pods and hits the 30s host process timeout; scope to the active namespace.
-    if cfg.all_namespaces && snap.namespaces.len() > 150 {
-        cfg.all_namespaces = false;
-        snap.all_namespaces = false;
-        let _ = storage::set("allNamespaces", "false");
-    }
+    enforce_large_cluster_scope(cfg, &mut snap);
     fetch_workloads_into_snapshot(project, cfg, &mut snap);
     fetch_secrets_into_snapshot(project, cfg, &mut snap);
 
