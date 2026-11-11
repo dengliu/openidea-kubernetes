@@ -1,12 +1,12 @@
 id = "dengliu.kubernetes"
 name = "Kubernetes"
-version = "0.3.1"
+version = "0.3.2"
 icon = "icons/kubernetes-logo.svg"
 description = "Manage Kubernetes clusters, Helm releases and Kustomize overlays: cluster explorer with live Pod logs, shell and port-forward, YAML completion, cross-resource navigation, gutter markers and manifest inspections."
 authors = ["Deng Liu"]
 homepage = "https://github.com/dengliu/openidea-kubernetes"
 license = "Apache-2.0"
-change-notes = "0.3.1 — add custom Kubernetes Blue plugin icon (icons/kubernetes-logo.svg), set secondary = true for Right Bottom default tool-window layout, and fix Helm v4 'helm list -A' flag compatibility under All Namespaces."
+change-notes = "0.3.2 — scale smoothly on large clusters (hundreds of nodes/namespaces, thousands of pods): replace overlapping polling with adaptive non-overlapping backoff and bounded kubectl request timeouts, use server-side Table queries instead of full JSON dumps, virtualize resource tables and namespace picker, throttle age ticker, and enforce large-cluster namespace/payload safeguards."
 categories = ["tools", "frameworks"]
 engines.openidea = "^1.3"
 wasm = "dist/plugin.wasm"
