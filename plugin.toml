@@ -1,12 +1,12 @@
 id = "dengliu.kubernetes"
 name = "Kubernetes"
-version = "0.3.3"
+version = "0.3.4"
 icon = "icons/kubernetes-logo.svg"
 description = "Manage Kubernetes clusters, Helm releases and Kustomize overlays: cluster explorer with live Pod logs, shell and port-forward, YAML completion, cross-resource navigation, gutter markers and manifest inspections."
 authors = ["Deng Liu"]
 homepage = "https://github.com/dengliu/openidea-kubernetes"
 license = "Apache-2.0"
-change-notes = "0.3.3 — add Kubernetes API server-side limit + continue pagination (First/Prev/Next, Load more, configurable page size 50–500, and exact total counts) across Pods, Nodes, Namespaces, Events, Workloads, Config, Network, Storage, RBAC, and Custom Resources, and virtualize the Namespace Picker dropdown for smooth scrolling across 1,000+ namespaces."
+change-notes = "0.3.4 — add hybrid LIST + Kubernetes Watch delta pipeline: persistent HTTP/2 watch streams (ADDED / MODIFIED / DELETED / BOOKMARK + automatic 410 resync) with sub-second UI delta updates for scopes <= 1,000 items and open Detail Drawers, paired with server-side limit + continue pagination for 50k+ pod / 100k+ event scopes."
 categories = ["tools", "frameworks"]
 engines.openidea = "^1.3"
 wasm = "dist/plugin.wasm"
