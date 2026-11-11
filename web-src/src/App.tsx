@@ -580,6 +580,12 @@ function statusClass(status: string): "ok" | "warn" | "err" {
   return "ok";
 }
 
+export function computePollDelayMs(durationMs: number, itemCount: number): number {
+  if (durationMs >= 2000 || itemCount >= 1500) return 15000;
+  if (durationMs >= 800 || itemCount >= 400) return 10000;
+  return 5000;
+}
+
 function sendToBackend(payload: Record<string, unknown>) {
   if (typeof window !== "undefined" && window.openidea) {
     window.openidea.postMessage(JSON.stringify(payload));
@@ -924,6 +930,10 @@ export function App() {
   const [, setAgeTick] = useState<number>(0);
 
   const loadedLazyRef = useRef<Record<string, boolean>>({});
+  const pollInFlightSinceRef = useRef<number>(0);
+  const lastPollDurationMsRef = useRef<number>(0);
+  const pollTickSeqRef = useRef<number>(0);
+  const [pollTrigger, setPollTrigger] = useState<number>(0);
 
   // Live 1-second Age ticker so relative ages ("12s", "1m", "2m") update continuously
   useEffect(() => {
@@ -958,10 +968,18 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  // Live 5-second background category poll so resource status, metrics, and deleted pods stay fresh
+  // Non-overlapping adaptive background category poll so slow large clusters never queue overlapping requests
   useEffect(() => {
     if (!snapshot.connected || activeKind === "ClusterCatalog" || activeKind === "Workspace") return;
-    const id = window.setInterval(() => {
+    const itemCount = (snapshot.resources || []).length;
+    const delay = computePollDelayMs(lastPollDurationMsRef.current, itemCount);
+    const id = window.setTimeout(() => {
+      const now = Date.now();
+      const inFlightElapsed = now - pollInFlightSinceRef.current;
+      if (pollInFlightSinceRef.current > 0 && inFlightElapsed < 15000) {
+        setPollTrigger((n) => (n + 1) % 1_000_000);
+        return;
+      }
       if (document.visibilityState === "visible") {
         let inspectKind: string | null = null;
         let inspectNs: string | null = null;
@@ -975,24 +993,32 @@ export function App() {
             inspectName = selectedRowKey.slice(slashIdx + 1);
           }
         }
+        pollInFlightSinceRef.current = now;
+        const seq = ++pollTickSeqRef.current;
+        const includeMetrics = itemCount < 400 || seq % 2 === 0;
         sendToBackend({
           op: "poll-category",
           category: activeKind,
           inspectKind,
           inspectNs,
           inspectName,
+          includeMetrics,
         });
+      } else {
+        setPollTrigger((n) => (n + 1) % 1_000_000);
       }
-    }, 5000);
-    return () => window.clearInterval(id);
+    }, delay);
+    return () => window.clearTimeout(id);
   }, [
     snapshot.connected,
     snapshot.current_context,
     snapshot.current_namespace,
     snapshot.all_namespaces,
+    snapshot.resources.length,
     activeKind,
     drawerOpen,
     selectedRowKey,
+    pollTrigger,
   ]);
 
   useEffect(() => {
@@ -1027,6 +1053,13 @@ export function App() {
           return;
         }
         if (m.op === "state") {
+          pollInFlightSinceRef.current = 0;
+          if (typeof m.pollDurationMs === "number" && Number.isFinite(m.pollDurationMs)) {
+            lastPollDurationMsRef.current = m.pollDurationMs;
+          }
+          if (m.pollCompleted) {
+            setPollTrigger((n) => (n + 1) % 1_000_000);
+          }
           if (typeof m.debuggerImage === "string" && m.debuggerImage.trim()) {
             setDebuggerImage(m.debuggerImage.trim());
           }

@@ -20,24 +20,29 @@ pub mod kubectl;
 pub mod manifest;
 
 use intelligence::{
-    ProjectIndex, completions_at, definitions_at, inspect_document, line_markers_for, normalize_slashes, project_of,
+    ProjectIndex, completions_at, definitions_at, inspect_document, line_markers_for,
+    normalize_slashes, project_of,
 };
 use kubectl::{
-    ClusterSnapshot, KubeConfigState, apply_or_diff_manifest, build_kustomize, cordon_node,
-    delete_cluster_resource_opts, drain_node, exec_pod_command, fetch_category_into_snapshot, fetch_cluster_snapshot, fetch_helm_release_detail,
-    fetch_kubeconfig_overview, fetch_namespaces_into_snapshot, fetch_nodes_into_snapshot, fetch_pod_logs,
-    fetch_resource_extras, inspect_cluster_resource, inspect_cluster_resource_json, open_debug_terminal,
-    open_exec_or_debug_terminal, open_exec_terminal, open_follow_logs_terminal, open_node_shell_terminal,
-    open_port_forward_terminal, render_helm_template, resolve_project, rollout_restart, scale_workload,
-    suspend_cronjob, trigger_cronjob, workspace_manifests_json,
+    ClusterSnapshot, FetchOptions, KubeConfigState, apply_or_diff_manifest, build_kustomize,
+    cordon_node, delete_cluster_resource_opts, drain_node, exec_pod_command,
+    fetch_category_into_snapshot, fetch_category_with_options, fetch_cluster_snapshot,
+    fetch_helm_release_detail, fetch_kubeconfig_overview, fetch_namespaces_into_snapshot,
+    fetch_nodes_into_snapshot, fetch_pod_logs, fetch_resource_extras, inspect_cluster_resource,
+    inspect_cluster_resource_json, open_debug_terminal, open_exec_or_debug_terminal,
+    open_exec_terminal, open_follow_logs_terminal, open_node_shell_terminal,
+    open_port_forward_terminal, render_helm_template, resolve_project, rollout_restart,
+    scale_workload, suspend_cronjob, trigger_cronjob, workspace_manifests_json,
 };
 use manifest::{parse_yaml, utf16_len};
 use openidea_plugin::host::{self, storage};
-use openidea_plugin::providers::{CodeAction, CompletionItem, CompletionKind, Document, LineMarker, Providers};
+use openidea_plugin::providers::{
+    CodeAction, CompletionItem, CompletionKind, Document, LineMarker, Providers,
+};
 use openidea_plugin::views::{Body, Button, View, ViewEvent, Viewport, Views};
 use openidea_plugin::{
-    Context, Diagnostic, Error, Event, Invocation, Location, NotificationLevel, Plugin, Position, Project, Range,
-    Severity, StatusItem, register_plugin,
+    Context, Diagnostic, Error, Event, Invocation, Location, NotificationLevel, Plugin, Position,
+    Project, Range, Severity, StatusItem, register_plugin,
 };
 use serde_json::{Value, json};
 
@@ -98,7 +103,12 @@ impl KubernetesPlugin {
         if kind.is_empty() || name.is_empty() {
             return None;
         }
-        Some(ContentTabTarget { context, namespace, kind, name })
+        Some(ContentTabTarget {
+            context,
+            namespace,
+            kind,
+            name,
+        })
     }
     fn update_status_bar(&self, cfg: &KubeConfigState) {
         let ctx_name = if let Some(ref snap) = self.snapshot
@@ -135,8 +145,10 @@ impl KubernetesPlugin {
     }
 
     fn ensure_catalog_loaded(&mut self, project: &Project, cfg: &mut KubeConfigState) {
-        let needs_catalog =
-            self.snapshot.as_ref().is_none_or(|s| s.cluster_catalog.is_empty() || s.contexts.is_empty());
+        let needs_catalog = self
+            .snapshot
+            .as_ref()
+            .is_none_or(|s| s.cluster_catalog.is_empty() || s.contexts.is_empty());
         if !needs_catalog {
             if let Some(ref mut snap) = self.snapshot {
                 if cfg.context.is_empty() && !snap.current_context.is_empty() {
@@ -176,7 +188,11 @@ impl KubernetesPlugin {
                     cfg.namespace = ns.clone();
                     let _ = storage::set("namespace", &ns);
                 }
-                snap.current_context = if cfg.context.is_empty() { current_ctx } else { cfg.context.clone() };
+                snap.current_context = if cfg.context.is_empty() {
+                    current_ctx
+                } else {
+                    cfg.context.clone()
+                };
                 snap.contexts = contexts;
                 snap.cluster_catalog = catalog;
                 snap.current_namespace = cfg.namespace.clone();
@@ -208,7 +224,10 @@ impl KubernetesPlugin {
 
     fn state_payload(&mut self, ctx: &Invocation) -> Value {
         let project = resolve_project(ctx).ok();
-        let root = project.as_ref().and_then(|p| p.root().ok()).unwrap_or_default();
+        let root = project
+            .as_ref()
+            .and_then(|p| p.root().ok())
+            .unwrap_or_default();
         self.index.ensure(project.as_ref(), None);
         if self.snapshot.is_none()
             && let Some(ref p) = project
@@ -234,14 +253,22 @@ impl KubernetesPlugin {
     }
 
     fn post_snapshot(&mut self, needs_bg_sync: bool) {
+        self.post_snapshot_meta(needs_bg_sync, None);
+    }
+
+    fn post_snapshot_meta(&mut self, needs_bg_sync: bool, poll_duration_ms: Option<u64>) {
         let cfg = KubeConfigState::load();
-        let payload = json!({
+        let mut payload = json!({
             "op": "state",
             "snapshot": self.snapshot.clone().unwrap_or_default(),
             "needsBackgroundSync": needs_bg_sync,
             "debuggerImage": cfg.debugger_image,
             "hotbarItems": Self::stored_hotbar_items(),
         });
+        if let Some(ms) = poll_duration_ms {
+            payload["pollCompleted"] = Value::Bool(true);
+            payload["pollDurationMs"] = Value::Number(ms.into());
+        }
         let _ = host::post_view_message(VIEW_ID, &payload.to_string());
         self.update_status_bar(&cfg);
     }
@@ -257,7 +284,11 @@ impl KubernetesPlugin {
     }
 
     /// Runs static inspections (and optional `kubectl --dry-run=client`) on `path` and publishes diagnostics.
-    pub fn check_and_publish(&mut self, path: &str, run_dry_run_override: bool) -> Result<usize, Error> {
+    pub fn check_and_publish(
+        &mut self,
+        path: &str,
+        run_dry_run_override: bool,
+    ) -> Result<usize, Error> {
         if !(path.ends_with(".yaml") || path.ends_with(".yml")) {
             return Ok(0);
         }
@@ -268,7 +299,12 @@ impl KubernetesPlugin {
             return Ok(0);
         };
         self.index.ensure(Some(&project), Some((path, &text)));
-        let parsed = self.index.files.get(&normalize_slashes(path)).cloned().unwrap_or_else(|| parse_yaml(&text));
+        let parsed = self
+            .index
+            .files
+            .get(&normalize_slashes(path))
+            .cloned()
+            .unwrap_or_else(|| parse_yaml(&text));
 
         if parsed.marked_non_k8s || parsed.docs.is_empty() {
             host::publish_diagnostics(path, &[])?;
@@ -277,7 +313,14 @@ impl KubernetesPlugin {
 
         let warn_latest = host::setting_bool("warnLatestTag").unwrap_or(true);
         let warn_resources = host::setting_bool("warnMissingResources").unwrap_or(true);
-        let issues = inspect_document(&self.index, path, &text, &parsed, warn_latest, warn_resources);
+        let issues = inspect_document(
+            &self.index,
+            path,
+            &text,
+            &parsed,
+            warn_latest,
+            warn_resources,
+        );
         let mut diagnostics: Vec<Diagnostic> = issues.into_iter().map(|i| i.diagnostic).collect();
 
         let dry_run = run_dry_run_override || host::setting_bool("dryRunOnSave").unwrap_or(false);
@@ -285,7 +328,8 @@ impl KubernetesPlugin {
             let cfg = KubeConfigState::load();
             if let Err(e) = apply_or_diff_manifest(&project, &cfg, &text, "dry-run") {
                 let first_line = text.lines().next().unwrap_or("");
-                let range = Range::new(Position::new(0, 0), Position::new(0, utf16_len(first_line)));
+                let range =
+                    Range::new(Position::new(0, 0), Position::new(0, utf16_len(first_line)));
                 diagnostics.push(intelligence::diag_with_source(
                     range,
                     Severity::Error,
@@ -317,7 +361,8 @@ impl KubernetesPlugin {
                 total_issues += n;
             }
         }
-        let summary = format!("Inspected {total_files} YAML file(s): {total_issues} issue(s) reported");
+        let summary =
+            format!("Inspected {total_files} YAML file(s): {total_issues} issue(s) reported");
         host::notify(NotificationLevel::Info, "Kubernetes Inspection", &summary);
         Ok(summary)
     }
@@ -329,7 +374,10 @@ impl KubernetesPlugin {
         match op {
             "init" => {
                 let project = resolve_project(ctx).ok();
-                let root = project.as_ref().and_then(|p| p.root().ok()).unwrap_or_default();
+                let root = project
+                    .as_ref()
+                    .and_then(|p| p.root().ok())
+                    .unwrap_or_default();
                 let mut cfg = KubeConfigState::load();
                 if let Some(ref p) = project {
                     self.ensure_catalog_loaded(p, &mut cfg);
@@ -338,7 +386,8 @@ impl KubernetesPlugin {
                 let snap = self.snapshot.clone().unwrap_or_default();
                 let ws = workspace_manifests_json(&self.index.files, &root);
                 let cat = v.get("category").and_then(Value::as_str).unwrap_or("Pod");
-                let needs_fetch = snap.namespaces.len() <= 3 || !snap.resources.iter().any(|r| r.kind == cat);
+                let needs_fetch =
+                    snap.namespaces.len() <= 3 || !snap.resources.iter().any(|r| r.kind == cat);
                 let payload = json!({
                     "op": "state",
                     "snapshot": snap,
@@ -383,7 +432,11 @@ impl KubernetesPlugin {
             }
             "set-hotbar" => {
                 if let Some(items) = v.get("items").and_then(Value::as_array) {
-                    let names: Vec<String> = items.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+                    let names: Vec<String> = items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect();
                     if let Ok(serialized) = serde_json::to_string(&names) {
                         let _ = storage::set("hotbarItems", &serialized);
                     }
@@ -395,8 +448,16 @@ impl KubernetesPlugin {
                         let mut cfg = KubeConfigState::load();
                         self.ensure_catalog_loaded(&project, &mut cfg);
                     }
-                    let prev_catalog = self.snapshot.as_ref().map(|s| s.cluster_catalog.clone()).unwrap_or_default();
-                    let prev_contexts = self.snapshot.as_ref().map(|s| s.contexts.clone()).unwrap_or_default();
+                    let prev_catalog = self
+                        .snapshot
+                        .as_ref()
+                        .map(|s| s.cluster_catalog.clone())
+                        .unwrap_or_default();
+                    let prev_contexts = self
+                        .snapshot
+                        .as_ref()
+                        .map(|s| s.contexts.clone())
+                        .unwrap_or_default();
                     let default_ns = prev_catalog
                         .iter()
                         .find(|item| item.name == c && !item.namespace.is_empty())
@@ -466,6 +527,12 @@ impl KubernetesPlugin {
                 self.post_snapshot(false);
             }
             "load-category" | "poll-category" => {
+                let is_poll = op == "poll-category";
+                let started = std::time::Instant::now();
+                let include_metrics = v
+                    .get("includeMetrics")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
                 let project = resolve_project(ctx)?;
                 let mut cfg = KubeConfigState::load();
                 self.ensure_catalog_loaded(&project, &mut cfg);
@@ -479,18 +546,39 @@ impl KubernetesPlugin {
                         return Ok(());
                     }
                     if let Some(ref mut snap) = self.snapshot {
-                        if snap.namespaces.len() <= 3 {
+                        if snap.namespaces.len() <= 3 && !is_poll {
                             fetch_namespaces_into_snapshot(&project, &cfg, snap);
                         }
-                        fetch_category_into_snapshot(&project, &cfg, snap, cat);
+                        fetch_category_with_options(
+                            &project,
+                            &cfg,
+                            snap,
+                            cat,
+                            FetchOptions {
+                                is_background_poll: is_poll,
+                                include_metrics,
+                            },
+                        );
                     }
                 }
-                self.post_snapshot(false);
-                if let Some("Pod") = v.get("inspectKind").and_then(Value::as_str)
-                    && let Some(ins_name) = v.get("inspectName").and_then(Value::as_str).filter(|s| !s.is_empty())
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                self.post_snapshot_meta(false, is_poll.then_some(elapsed_ms));
+                let allow_drawer_refresh =
+                    !is_poll || started.elapsed() < std::time::Duration::from_millis(1200);
+                if allow_drawer_refresh
+                    && let Some("Pod") = v.get("inspectKind").and_then(Value::as_str)
+                    && let Some(ins_name) = v
+                        .get("inspectName")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
                 {
-                    let ins_ns = v.get("inspectNs").and_then(Value::as_str).unwrap_or("default");
-                    if let Ok(out) = inspect_cluster_resource_json(&project, &cfg, "Pod", ins_ns, ins_name) {
+                    let ins_ns = v
+                        .get("inspectNs")
+                        .and_then(Value::as_str)
+                        .unwrap_or("default");
+                    if let Ok(out) =
+                        inspect_cluster_resource_json(&project, &cfg, "Pod", ins_ns, ins_name)
+                    {
                         let msg = json!({
                             "op": "resource-json",
                             "kind": "Pod",
@@ -519,7 +607,10 @@ impl KubernetesPlugin {
                             snap.all_namespaces = false;
                             snap.helm_releases.clear();
                             snap.resources.retain(|r| {
-                                matches!(r.kind.as_str(), "Namespace" | "Node" | "CustomResourceDefinition")
+                                matches!(
+                                    r.kind.as_str(),
+                                    "Namespace" | "Node" | "CustomResourceDefinition"
+                                )
                             });
                             fetch_category_into_snapshot(&project, &cfg, snap, cat);
                         }
@@ -546,8 +637,12 @@ impl KubernetesPlugin {
                         }
                         snap.all_namespaces = all;
                         snap.helm_releases.clear();
-                        snap.resources
-                            .retain(|r| matches!(r.kind.as_str(), "Namespace" | "Node" | "CustomResourceDefinition"));
+                        snap.resources.retain(|r| {
+                            matches!(
+                                r.kind.as_str(),
+                                "Namespace" | "Node" | "CustomResourceDefinition"
+                            )
+                        });
                         fetch_category_into_snapshot(&project, &cfg, snap, cat);
                     }
                     self.post_snapshot(false);
@@ -595,7 +690,10 @@ impl KubernetesPlugin {
             "pod-logs" => {
                 let project = resolve_project(ctx)?;
                 let cfg = KubeConfigState::load();
-                let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
+                let ns = v
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let container = v.get("container").and_then(Value::as_str);
                 let previous = v.get("previous").and_then(Value::as_bool).unwrap_or(false);
@@ -606,21 +704,33 @@ impl KubernetesPlugin {
             }
             "follow-logs" => {
                 let cfg = KubeConfigState::load();
-                let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
+                let ns = v
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let container = v.get("container").and_then(Value::as_str);
                 open_follow_logs_terminal(&cfg, ns, name, container)?;
             }
             "exec-shell" => {
                 let mut cfg = KubeConfigState::load();
-                if let Some(c) = v.get("context").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                if let Some(c) = v
+                    .get("context")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
                     cfg.context = c.to_owned();
                 }
-                let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
+                let ns = v
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let container = v.get("container").and_then(Value::as_str);
                 let project = resolve_project(ctx).ok();
-                if let Err(e) = open_exec_or_debug_terminal(project.as_ref(), &cfg, ns, name, container) {
+                if let Err(e) =
+                    open_exec_or_debug_terminal(project.as_ref(), &cfg, ns, name, container)
+                {
                     let msg = e.to_string();
                     host::notify(NotificationLevel::Error, "Kubernetes Pod Shell", &msg);
                     Self::post_detail(msg.clone(), Some(msg), true);
@@ -628,10 +738,17 @@ impl KubernetesPlugin {
             }
             "debug-shell" => {
                 let mut cfg = KubeConfigState::load();
-                if let Some(c) = v.get("context").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                if let Some(c) = v
+                    .get("context")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
                     cfg.context = c.to_owned();
                 }
-                let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
+                let ns = v
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let container = v.get("container").and_then(Value::as_str);
                 let image = v.get("image").and_then(Value::as_str);
@@ -656,7 +773,11 @@ impl KubernetesPlugin {
             }
             "node-shell" => {
                 let mut cfg = KubeConfigState::load();
-                if let Some(c) = v.get("context").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                if let Some(c) = v
+                    .get("context")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
                     cfg.context = c.to_owned();
                 }
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
@@ -667,7 +788,10 @@ impl KubernetesPlugin {
             "pod-exec" => {
                 let project = resolve_project(ctx)?;
                 let cfg = KubeConfigState::load();
-                let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
+                let ns = v
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let container = v.get("container").and_then(Value::as_str);
                 let cmd = v.get("command").and_then(Value::as_str).unwrap_or("pwd");
@@ -677,24 +801,50 @@ impl KubernetesPlugin {
             }
             "port-forward" => {
                 let mut cfg = KubeConfigState::load();
-                if let Some(c) = v.get("context").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                if let Some(c) = v
+                    .get("context")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
                     cfg.context = c.to_owned();
                 }
                 let kind = v.get("kind").and_then(Value::as_str).unwrap_or("Pod");
-                let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
+                let ns = v
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let port = v.get("port").and_then(Value::as_str).unwrap_or("8080");
                 let local_port = v.get("localPort").and_then(Value::as_str);
                 let address = v.get("address").and_then(Value::as_str);
                 let https = v.get("https").and_then(Value::as_bool).unwrap_or(false);
-                let open_in_browser = v.get("openInBrowser").and_then(Value::as_bool).unwrap_or(false);
-                open_port_forward_terminal(&cfg, kind, ns, name, port, local_port, address, https, open_in_browser)?;
+                let open_in_browser = v
+                    .get("openInBrowser")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                open_port_forward_terminal(
+                    &cfg,
+                    kind,
+                    ns,
+                    name,
+                    port,
+                    local_port,
+                    address,
+                    https,
+                    open_in_browser,
+                )?;
             }
             "scale" => {
                 let project = resolve_project(ctx)?;
                 let cfg = KubeConfigState::load();
-                let kind = v.get("kind").and_then(Value::as_str).unwrap_or("Deployment");
-                let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
+                let kind = v
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Deployment");
+                let ns = v
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let replicas = v.get("replicas").and_then(Value::as_u64).unwrap_or(1) as u32;
                 match scale_workload(&project, &cfg, kind, ns, name, replicas) {
@@ -709,8 +859,14 @@ impl KubernetesPlugin {
             "restart" => {
                 let project = resolve_project(ctx)?;
                 let cfg = KubeConfigState::load();
-                let kind = v.get("kind").and_then(Value::as_str).unwrap_or("Deployment");
-                let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
+                let kind = v
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Deployment");
+                let ns = v
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 match rollout_restart(&project, &cfg, kind, ns, name) {
                     Ok(msg) => {
@@ -729,7 +885,11 @@ impl KubernetesPlugin {
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let yaml = inspect_cluster_resource(&project, &cfg, kind, ns, name, true)?;
                 host::copy_to_clipboard(&yaml)?;
-                Self::post_detail(yaml, Some(format!("Copied {kind}/{name} YAML to clipboard")), false);
+                Self::post_detail(
+                    yaml,
+                    Some(format!("Copied {kind}/{name} YAML to clipboard")),
+                    false,
+                );
             }
             "apply-yaml" | "diff-yaml" => {
                 let project = resolve_project(ctx)?;
@@ -746,7 +906,11 @@ impl KubernetesPlugin {
                                 "Kubernetes Apply",
                                 out.lines().next().unwrap_or("Applied"),
                             );
-                            Self::post_detail(yaml_text, Some(format!("Applied to cluster: {out}")), false);
+                            Self::post_detail(
+                                yaml_text,
+                                Some(format!("Applied to cluster: {out}")),
+                                false,
+                            );
                         } else {
                             Self::post_detail(out, Some("Diff against live cluster".into()), false);
                         }
@@ -765,9 +929,12 @@ impl KubernetesPlugin {
                 match delete_cluster_resource_opts(&project, &cfg, kind, ns, name, force) {
                     Ok(msg) => {
                         if let Some(ref mut snap) = self.snapshot {
-                            snap.resources.retain(|r| !(r.kind == kind && r.namespace == ns && r.name == name));
+                            snap.resources.retain(|r| {
+                                !(r.kind == kind && r.namespace == ns && r.name == name)
+                            });
                             if kind == "HelmRelease" {
-                                snap.helm_releases.retain(|r| !(r.namespace == ns && r.name == name));
+                                snap.helm_releases
+                                    .retain(|r| !(r.namespace == ns && r.name == name));
                             }
                             fetch_category_into_snapshot(&project, &cfg, snap, kind);
                         }
@@ -782,7 +949,11 @@ impl KubernetesPlugin {
                 let mut cfg = KubeConfigState::load();
                 self.ensure_catalog_loaded(&project, &mut cfg);
                 let force = v.get("force").and_then(Value::as_bool).unwrap_or(false);
-                let items = v.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+                let items = v
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 if items.is_empty() {
                     return Ok(());
                 }
@@ -815,9 +986,11 @@ impl KubernetesPlugin {
                 }
                 if let Some(ref mut snap) = self.snapshot {
                     for (k, ns, n) in &deleted_keys {
-                        snap.resources.retain(|r| !(r.kind == *k && r.namespace == *ns && r.name == *n));
+                        snap.resources
+                            .retain(|r| !(r.kind == *k && r.namespace == *ns && r.name == *n));
                         if k == "HelmRelease" {
-                            snap.helm_releases.retain(|r| !(r.namespace == *ns && r.name == *n));
+                            snap.helm_releases
+                                .retain(|r| !(r.namespace == *ns && r.name == *n));
                         }
                     }
                     for kind in &touched_kinds {
@@ -850,7 +1023,9 @@ impl KubernetesPlugin {
                             fetch_nodes_into_snapshot(&project, &cfg, snap);
                         }
                         self.post_snapshot(false);
-                        if let Ok(json_str) = inspect_cluster_resource_json(&project, &cfg, "Node", "", name) {
+                        if let Ok(json_str) =
+                            inspect_cluster_resource_json(&project, &cfg, "Node", "", name)
+                        {
                             let jmsg = json!({
                                 "op": "resource-json",
                                 "kind": "Node",
@@ -877,7 +1052,9 @@ impl KubernetesPlugin {
                             fetch_nodes_into_snapshot(&project, &cfg, snap);
                         }
                         self.post_snapshot(false);
-                        if let Ok(json_str) = inspect_cluster_resource_json(&project, &cfg, "Node", "", name) {
+                        if let Ok(json_str) =
+                            inspect_cluster_resource_json(&project, &cfg, "Node", "", name)
+                        {
                             let jmsg = json!({
                                 "op": "resource-json",
                                 "kind": "Node",
@@ -897,7 +1074,10 @@ impl KubernetesPlugin {
                 let project = resolve_project(ctx)?;
                 let mut cfg = KubeConfigState::load();
                 self.ensure_catalog_loaded(&project, &mut cfg);
-                let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
+                let ns = v
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 match trigger_cronjob(&project, &cfg, ns, name) {
                     Ok(msg) => {
@@ -906,8 +1086,12 @@ impl KubernetesPlugin {
                             fetch_category_into_snapshot(&project, &cfg, snap, "Job");
                         }
                         self.post_snapshot(false);
-                        if let Ok(json_str) = inspect_cluster_resource_json(&project, &cfg, "CronJob", ns, name) {
-                            let extras = fetch_resource_extras(&project, &cfg, "CronJob", ns, name, &json_str);
+                        if let Ok(json_str) =
+                            inspect_cluster_resource_json(&project, &cfg, "CronJob", ns, name)
+                        {
+                            let extras = fetch_resource_extras(
+                                &project, &cfg, "CronJob", ns, name, &json_str,
+                            );
                             let _ = host::post_view_message(VIEW_ID, &extras.to_string());
                         }
                         host::notify(NotificationLevel::Info, "Kubernetes CronJob", &msg);
@@ -920,7 +1104,10 @@ impl KubernetesPlugin {
                 let project = resolve_project(ctx)?;
                 let mut cfg = KubeConfigState::load();
                 self.ensure_catalog_loaded(&project, &mut cfg);
-                let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
+                let ns = v
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let suspend = v.get("suspend").and_then(Value::as_bool).unwrap_or(true);
                 match suspend_cronjob(&project, &cfg, ns, name, suspend) {
@@ -929,7 +1116,9 @@ impl KubernetesPlugin {
                             fetch_category_into_snapshot(&project, &cfg, snap, "CronJob");
                         }
                         self.post_snapshot(false);
-                        if let Ok(json_str) = inspect_cluster_resource_json(&project, &cfg, "CronJob", ns, name) {
+                        if let Ok(json_str) =
+                            inspect_cluster_resource_json(&project, &cfg, "CronJob", ns, name)
+                        {
                             let jmsg = json!({
                                 "op": "resource-json",
                                 "kind": "CronJob",
@@ -948,7 +1137,10 @@ impl KubernetesPlugin {
             "helm-detail" => {
                 let project = resolve_project(ctx)?;
                 let cfg = KubeConfigState::load();
-                let ns = v.get("namespace").and_then(Value::as_str).unwrap_or("default");
+                let ns = v
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
                 let name = v.get("name").and_then(Value::as_str).unwrap_or("");
                 let sub = v.get("sub").and_then(Value::as_str).unwrap_or("values");
                 match fetch_helm_release_detail(&project, &cfg, ns, name, sub) {
@@ -972,7 +1164,11 @@ impl KubernetesPlugin {
                             self.refresh_cluster(&project);
                             self.post_state(ctx);
                         }
-                        Self::post_detail(out.clone(), Some(format!("kubectl {act} succeeded")), false);
+                        Self::post_detail(
+                            out.clone(),
+                            Some(format!("kubectl {act} succeeded")),
+                            false,
+                        );
                     }
                     Err(e) => Self::post_detail(e.to_string(), Some(e.to_string()), true),
                 }
@@ -982,7 +1178,9 @@ impl KubernetesPlugin {
                 Err(e) => Self::post_detail(e.to_string(), Some(e.to_string()), true),
             },
             "helm-template" => match self.run_helm_template_command(ctx, None) {
-                Ok(out) => Self::post_detail(out, Some("Rendered Helm chart templates".into()), false),
+                Ok(out) => {
+                    Self::post_detail(out, Some("Rendered Helm chart templates".into()), false)
+                }
                 Err(e) => Self::post_detail(e.to_string(), Some(e.to_string()), true),
             },
             "open-resource-yaml" => {
@@ -1029,7 +1227,11 @@ impl KubernetesPlugin {
                 }
             }
             "content-tab-action" => {
-                let request_id = v.get("requestId").and_then(Value::as_str).unwrap_or("").to_owned();
+                let request_id = v
+                    .get("requestId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
                 let key = v.get("key").and_then(Value::as_str).unwrap_or("");
                 let action = v.get("action").and_then(Value::as_str).unwrap_or("");
                 let content = v.get("content").and_then(Value::as_str).unwrap_or("");
@@ -1074,7 +1276,11 @@ impl KubernetesPlugin {
                             ) {
                                 Ok(live_yaml) => {
                                     let identical = live_yaml.trim() == content.trim();
-                                    let ctx_label = if cfg.context.is_empty() { "current" } else { cfg.context.as_str() };
+                                    let ctx_label = if cfg.context.is_empty() {
+                                        "current"
+                                    } else {
+                                        cfg.context.as_str()
+                                    };
                                     json!({
                                         "op": "content-tab-reply",
                                         "requestId": request_id,
@@ -1098,41 +1304,53 @@ impl KubernetesPlugin {
                                     "error": e.to_string(),
                                 }),
                             },
-                            "save" | "apply" => match apply_or_diff_manifest(&project, &cfg, content, "apply") {
-                                Ok(out) => {
-                                    if let Some(ref mut snap) = self.snapshot {
-                                        fetch_category_into_snapshot(&project, &cfg, snap, &target.kind);
-                                        self.post_snapshot(false);
+                            "save" | "apply" => {
+                                match apply_or_diff_manifest(&project, &cfg, content, "apply") {
+                                    Ok(out) => {
+                                        if let Some(ref mut snap) = self.snapshot {
+                                            fetch_category_into_snapshot(
+                                                &project,
+                                                &cfg,
+                                                snap,
+                                                &target.kind,
+                                            );
+                                            self.post_snapshot(false);
+                                        }
+                                        let refreshed = inspect_cluster_resource(
+                                            &project,
+                                            &cfg,
+                                            &target.kind,
+                                            &target.namespace,
+                                            &target.name,
+                                            true,
+                                        )
+                                        .ok();
+                                        let preview =
+                                            out.lines().next().unwrap_or("Applied").to_string();
+                                        host::notify(
+                                            NotificationLevel::Info,
+                                            "Kubernetes Apply",
+                                            &preview,
+                                        );
+                                        let mut rep = json!({
+                                            "op": "content-tab-reply",
+                                            "requestId": request_id,
+                                            "saved": true,
+                                            "status": format!("Applied {}/{}: {preview}", target.kind, target.name),
+                                        });
+                                        if let Some(updated_yaml) = refreshed {
+                                            rep["content"] = Value::String(updated_yaml);
+                                        }
+                                        rep
                                     }
-                                    let refreshed = inspect_cluster_resource(
-                                        &project,
-                                        &cfg,
-                                        &target.kind,
-                                        &target.namespace,
-                                        &target.name,
-                                        true,
-                                    )
-                                    .ok();
-                                    let preview = out.lines().next().unwrap_or("Applied").to_string();
-                                    host::notify(NotificationLevel::Info, "Kubernetes Apply", &preview);
-                                    let mut rep = json!({
+                                    Err(e) => json!({
                                         "op": "content-tab-reply",
                                         "requestId": request_id,
-                                        "saved": true,
-                                        "status": format!("Applied {}/{}: {preview}", target.kind, target.name),
-                                    });
-                                    if let Some(updated_yaml) = refreshed {
-                                        rep["content"] = Value::String(updated_yaml);
-                                    }
-                                    rep
+                                        "saved": false,
+                                        "error": e.to_string(),
+                                    }),
                                 }
-                                Err(e) => json!({
-                                    "op": "content-tab-reply",
-                                    "requestId": request_id,
-                                    "saved": false,
-                                    "error": e.to_string(),
-                                }),
-                            },
+                            }
                             other => json!({
                                 "op": "content-tab-reply",
                                 "requestId": request_id,
@@ -1160,9 +1378,14 @@ impl KubernetesPlugin {
         Ok(())
     }
 
-    fn run_manifest_command(&mut self, subcommand: &str, ctx: &Invocation) -> Result<String, Error> {
-        let editor =
-            ctx.editor().ok_or_else(|| Error::Invalid("focus a Kubernetes YAML file in the editor first".into()))?;
+    fn run_manifest_command(
+        &mut self,
+        subcommand: &str,
+        ctx: &Invocation,
+    ) -> Result<String, Error> {
+        let editor = ctx.editor().ok_or_else(|| {
+            Error::Invalid("focus a Kubernetes YAML file in the editor first".into())
+        })?;
         let doc = editor.document()?;
         let project = resolve_project(ctx)?;
         let cfg = KubeConfigState::load();
@@ -1187,8 +1410,15 @@ impl KubernetesPlugin {
             .or_else(|| {
                 ctx.editor().map(|e| {
                     let p = normalize_slashes(&e.path());
-                    let root = project.root().ok().map(|r| normalize_slashes(&r)).unwrap_or_default();
-                    let rel = p.strip_prefix(&root).map(|r| r.trim_start_matches('/')).unwrap_or(&p);
+                    let root = project
+                        .root()
+                        .ok()
+                        .map(|r| normalize_slashes(&r))
+                        .unwrap_or_default();
+                    let rel = p
+                        .strip_prefix(&root)
+                        .map(|r| r.trim_start_matches('/'))
+                        .unwrap_or(&p);
                     match rel.rfind('/') {
                         Some(i) => rel[..i].to_owned(),
                         None => ".".into(),
@@ -1198,16 +1428,28 @@ impl KubernetesPlugin {
             .unwrap_or_else(|| ".".into());
         let out = build_kustomize(&project, &dir)?;
         let lines = out.lines().count();
-        host::notify(NotificationLevel::Info, "Kustomize Build", &format!("Rendered {lines} lines from '{dir}'"));
+        host::notify(
+            NotificationLevel::Info,
+            "Kustomize Build",
+            &format!("Rendered {lines} lines from '{dir}'"),
+        );
         Ok(out)
     }
 
-    fn run_helm_template_command(&self, ctx: &Invocation, arg: Option<&str>) -> Result<String, Error> {
+    fn run_helm_template_command(
+        &self,
+        ctx: &Invocation,
+        arg: Option<&str>,
+    ) -> Result<String, Error> {
         let project = resolve_project(ctx)?;
         let dir = arg.filter(|s| !s.is_empty()).unwrap_or(".");
         let out = render_helm_template(&project, dir)?;
         let lines = out.lines().count();
-        host::notify(NotificationLevel::Info, "Helm Template", &format!("Rendered {lines} lines from chart '{dir}'"));
+        host::notify(
+            NotificationLevel::Info,
+            "Helm Template",
+            &format!("Rendered {lines} lines from chart '{dir}'"),
+        );
         Ok(out)
     }
 }
@@ -1219,7 +1461,12 @@ impl Plugin for KubernetesPlugin {
         Ok(())
     }
 
-    fn run_command(&mut self, id: &str, ctx: &Invocation, arg: Option<&str>) -> Result<Option<String>, Error> {
+    fn run_command(
+        &mut self,
+        id: &str,
+        ctx: &Invocation,
+        arg: Option<&str>,
+    ) -> Result<Option<String>, Error> {
         match id {
             "refresh" => {
                 let project = resolve_project(ctx)?;
@@ -1232,7 +1479,11 @@ impl Plugin for KubernetesPlugin {
                 let msg = format!(
                     "Context '{}' ({}): {} resources loaded",
                     snap.current_context,
-                    if snap.all_namespaces { "all namespaces" } else { snap.current_namespace.as_str() },
+                    if snap.all_namespaces {
+                        "all namespaces"
+                    } else {
+                        snap.current_namespace.as_str()
+                    },
                     snap.resources.len()
                 );
                 host::notify(NotificationLevel::Info, "Kubernetes", &msg);
@@ -1257,7 +1508,11 @@ impl Plugin for KubernetesPlugin {
                 self.update_status_bar(&updated);
                 self.refresh_cluster(&project);
                 self.post_state(ctx);
-                host::notify(NotificationLevel::Info, "Kubernetes Context", &format!("Active context set to '{next}'"));
+                host::notify(
+                    NotificationLevel::Info,
+                    "Kubernetes Context",
+                    &format!("Active context set to '{next}'"),
+                );
                 Ok(Some(next))
             }
             "switch-namespace" => {
@@ -1301,7 +1556,9 @@ impl Plugin for KubernetesPlugin {
                 self.run_manifest_command("dry-run", ctx).map(Some)
             }
             "inspect" => {
-                let editor = ctx.editor().ok_or_else(|| Error::Invalid("focus a YAML file first".into()))?;
+                let editor = ctx
+                    .editor()
+                    .ok_or_else(|| Error::Invalid("focus a YAML file first".into()))?;
                 let path = editor.path();
                 let count = self.check_and_publish(&path, false)?;
                 let msg = format!("{count} issue(s) found");
@@ -1324,7 +1581,9 @@ impl Plugin for KubernetesPlugin {
             "port-forward" => {
                 let cfg = KubeConfigState::load();
                 let (kind, ns, name, port) = self.resolve_port_forward_target(ctx, arg, &cfg)?;
-                open_port_forward_terminal(&cfg, &kind, &ns, &name, &port, None, None, false, false)?;
+                open_port_forward_terminal(
+                    &cfg, &kind, &ns, &name, &port, None, None, false, false,
+                )?;
                 Ok(Some(format!("{kind}/{name}:{port}")))
             }
             "scale" => {
@@ -1387,11 +1646,20 @@ impl KubernetesPlugin {
             && let Ok(doc) = editor.document()
         {
             let parsed = parse_yaml(&doc.text);
-            if let Some(kdoc) = parsed.docs.iter().find(|d| d.kind.as_ref().is_some_and(|k| k.value == "Pod"))
+            if let Some(kdoc) = parsed
+                .docs
+                .iter()
+                .find(|d| d.kind.as_ref().is_some_and(|k| k.value == "Pod"))
                 && let Some(ref n) = kdoc.name
             {
-                let ns = kdoc.namespace.as_ref().map_or_else(|| cfg.namespace.clone(), |s| s.value.clone());
-                let c = kdoc.containers.first().and_then(|c| c.name.as_ref().map(|s| s.value.clone()));
+                let ns = kdoc
+                    .namespace
+                    .as_ref()
+                    .map_or_else(|| cfg.namespace.clone(), |s| s.value.clone());
+                let c = kdoc
+                    .containers
+                    .first()
+                    .and_then(|c| c.name.as_ref().map(|s| s.value.clone()));
                 return Ok((ns, n.value.clone(), c));
             }
         }
@@ -1403,10 +1671,16 @@ impl KubernetesPlugin {
         if let Some(ref snap) = self.snapshot
             && let Some(pod) = snap.resources.iter().find(|r| r.kind == "Pod")
         {
-            let ns = if pod.namespace.is_empty() { cfg.namespace.clone() } else { pod.namespace.clone() };
+            let ns = if pod.namespace.is_empty() {
+                cfg.namespace.clone()
+            } else {
+                pod.namespace.clone()
+            };
             return Ok((ns, pod.name.clone(), pod.containers.first().cloned()));
         }
-        Err(Error::NotFound("no Pod found in active editor or cluster".into()))
+        Err(Error::NotFound(
+            "no Pod found in active editor or cluster".into(),
+        ))
     }
 
     fn resolve_port_forward_target(
@@ -1420,10 +1694,30 @@ impl KubernetesPlugin {
             let (target, port) = a.trim().split_once(':').unwrap_or((a.trim(), "8080"));
             let parts: Vec<&str> = target.split('/').collect();
             return Ok(match parts.as_slice() {
-                [name] => ("Pod".into(), cfg.namespace.clone(), (*name).to_owned(), port.to_owned()),
-                [kind, name] => ((*kind).to_owned(), cfg.namespace.clone(), (*name).to_owned(), port.to_owned()),
-                [kind, ns, name, ..] => ((*kind).to_owned(), (*ns).to_owned(), (*name).to_owned(), port.to_owned()),
-                _ => ("Pod".into(), cfg.namespace.clone(), target.to_owned(), port.to_owned()),
+                [name] => (
+                    "Pod".into(),
+                    cfg.namespace.clone(),
+                    (*name).to_owned(),
+                    port.to_owned(),
+                ),
+                [kind, name] => (
+                    (*kind).to_owned(),
+                    cfg.namespace.clone(),
+                    (*name).to_owned(),
+                    port.to_owned(),
+                ),
+                [kind, ns, name, ..] => (
+                    (*kind).to_owned(),
+                    (*ns).to_owned(),
+                    (*name).to_owned(),
+                    port.to_owned(),
+                ),
+                _ => (
+                    "Pod".into(),
+                    cfg.namespace.clone(),
+                    target.to_owned(),
+                    port.to_owned(),
+                ),
             });
         }
         if let Some(editor) = ctx.editor()
@@ -1433,12 +1727,19 @@ impl KubernetesPlugin {
             if let Some(kdoc) = parsed.docs.first()
                 && let (Some(kind), Some(name)) = (&kdoc.kind, &kdoc.name)
             {
-                let ns = kdoc.namespace.as_ref().map_or_else(|| cfg.namespace.clone(), |s| s.value.clone());
+                let ns = kdoc
+                    .namespace
+                    .as_ref()
+                    .map_or_else(|| cfg.namespace.clone(), |s| s.value.clone());
                 let port = kdoc
                     .service_ports
                     .first()
                     .and_then(|p| p.port.as_ref().map(|s| s.value.clone()))
-                    .or_else(|| kdoc.containers.first().and_then(|c| c.ports.first().map(|p| p.value.clone())))
+                    .or_else(|| {
+                        kdoc.containers
+                            .first()
+                            .and_then(|c| c.ports.first().map(|p| p.value.clone()))
+                    })
                     .unwrap_or_else(|| "8080".into());
                 return Ok((kind.value.clone(), ns, name.value.clone(), port));
             }
@@ -1456,10 +1757,22 @@ impl KubernetesPlugin {
         if let Some(a) = arg.filter(|s| !s.trim().is_empty()) {
             let parts: Vec<&str> = a.trim().split('/').collect();
             return Ok(match parts.as_slice() {
-                [name] => ("Deployment".into(), cfg.namespace.clone(), (*name).to_owned()),
-                [kind, name] => ((*kind).to_owned(), cfg.namespace.clone(), (*name).to_owned()),
+                [name] => (
+                    "Deployment".into(),
+                    cfg.namespace.clone(),
+                    (*name).to_owned(),
+                ),
+                [kind, name] => (
+                    (*kind).to_owned(),
+                    cfg.namespace.clone(),
+                    (*name).to_owned(),
+                ),
                 [kind, ns, name, ..] => ((*kind).to_owned(), (*ns).to_owned(), (*name).to_owned()),
-                _ => ("Deployment".into(), cfg.namespace.clone(), a.trim().to_owned()),
+                _ => (
+                    "Deployment".into(),
+                    cfg.namespace.clone(),
+                    a.trim().to_owned(),
+                ),
             });
         }
         if let Some(editor) = ctx.editor()
@@ -1469,7 +1782,10 @@ impl KubernetesPlugin {
             if let Some(kdoc) = parsed.docs.iter().find(|d| d.is_workload())
                 && let (Some(kind), Some(name)) = (&kdoc.kind, &kdoc.name)
             {
-                let ns = kdoc.namespace.as_ref().map_or_else(|| cfg.namespace.clone(), |s| s.value.clone());
+                let ns = kdoc
+                    .namespace
+                    .as_ref()
+                    .map_or_else(|| cfg.namespace.clone(), |s| s.value.clone());
                 return Ok((kind.value.clone(), ns, name.value.clone()));
             }
         }
@@ -1479,12 +1795,16 @@ impl KubernetesPlugin {
             self.refresh_cluster(&project);
         }
         if let Some(ref snap) = self.snapshot
-            && let Some(w) =
-                snap.resources.iter().find(|r| matches!(r.kind.as_str(), "Deployment" | "StatefulSet" | "DaemonSet"))
+            && let Some(w) = snap
+                .resources
+                .iter()
+                .find(|r| matches!(r.kind.as_str(), "Deployment" | "StatefulSet" | "DaemonSet"))
         {
             return Ok((w.kind.clone(), w.namespace.clone(), w.name.clone()));
         }
-        Err(Error::NotFound("no Deployment/StatefulSet/DaemonSet found".into()))
+        Err(Error::NotFound(
+            "no Deployment/StatefulSet/DaemonSet found".into(),
+        ))
     }
 
     fn resolve_scale_target(
@@ -1496,8 +1816,9 @@ impl KubernetesPlugin {
         if let Some(a) = arg.filter(|s| !s.trim().is_empty())
             && let Some((target, rep_str)) = a.trim().split_once('=')
         {
-            let replicas =
-                rep_str.parse::<u32>().map_err(|_| Error::Invalid(format!("invalid replica count: {rep_str}")))?;
+            let replicas = rep_str
+                .parse::<u32>()
+                .map_err(|_| Error::Invalid(format!("invalid replica count: {rep_str}")))?;
             let (kind, ns, name) = self.resolve_workload_target(ctx, Some(target), cfg)?;
             return Ok((kind, ns, name, replicas));
         }
@@ -1506,7 +1827,10 @@ impl KubernetesPlugin {
             .editor()
             .and_then(|e| e.document().ok())
             .and_then(|d| {
-                parse_yaml(&d.text).docs.into_iter().find_map(|k| k.replicas.and_then(|r| r.value.parse::<u32>().ok()))
+                parse_yaml(&d.text)
+                    .docs
+                    .into_iter()
+                    .find_map(|k| k.replicas.and_then(|r| r.value.parse::<u32>().ok()))
             })
             .unwrap_or(1);
         Ok((kind, ns, name, replicas))
@@ -1514,11 +1838,21 @@ impl KubernetesPlugin {
 }
 
 impl Providers for KubernetesPlugin {
-    fn completion(&mut self, doc: &Document, at: Position, _trigger: Option<&str>) -> Vec<CompletionItem> {
+    fn completion(
+        &mut self,
+        doc: &Document,
+        at: Position,
+        _trigger: Option<&str>,
+    ) -> Vec<CompletionItem> {
         let proj = project_of(&doc.path);
-        self.index.ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
-        let parsed =
-            self.index.files.get(&normalize_slashes(&doc.path)).cloned().unwrap_or_else(|| parse_yaml(&doc.text));
+        self.index
+            .ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
+        let parsed = self
+            .index
+            .files
+            .get(&normalize_slashes(&doc.path))
+            .cloned()
+            .unwrap_or_else(|| parse_yaml(&doc.text));
         let mut items = completions_at(&self.index, doc, at, &parsed);
 
         // Enrich ConfigMap/Secret/Service/ServiceAccount/PVC/CRD completions from the cached live cluster snapshot!
@@ -1530,7 +1864,11 @@ impl Providers for KubernetesPlugin {
                 let raw_val = trimmed[colon + 1..].trim_start();
                 let start_col = at.character.saturating_sub(utf16_len(raw_val));
                 let replace = Range::new(Position::new(at.line, start_col), at);
-                let full_key = if parent_path.is_empty() { key.to_owned() } else { format!("{parent_path}.{key}") };
+                let full_key = if parent_path.is_empty() {
+                    key.to_owned()
+                } else {
+                    format!("{parent_path}.{key}")
+                };
 
                 let target_kind = if full_key.contains("configMapKeyRef.name")
                     || full_key.contains("configMapRef.name")
@@ -1561,14 +1899,23 @@ impl Providers for KubernetesPlugin {
                             });
                         }
                     }
-                } else if full_key.ends_with("configMapKeyRef.key") || full_key.ends_with("secretKeyRef.key") {
-                    let tk = if full_key.contains("configMapKeyRef") { "ConfigMap" } else { "Secret" };
+                } else if full_key.ends_with("configMapKeyRef.key")
+                    || full_key.ends_with("secretKeyRef.key")
+                {
+                    let tk = if full_key.contains("configMapKeyRef") {
+                        "ConfigMap"
+                    } else {
+                        "Secret"
+                    };
                     for r in snap.resources.iter().filter(|r| r.kind == tk) {
                         for dk in &r.data_keys {
                             if !items.iter().any(|i| i.label == *dk) {
                                 items.push(CompletionItem {
                                     replace: Some(replace),
-                                    detail: Some(format!("Cluster {tk} '{}' ({})", r.name, r.namespace)),
+                                    detail: Some(format!(
+                                        "Cluster {tk} '{}' ({})",
+                                        r.name, r.namespace
+                                    )),
                                     ..CompletionItem::new(dk, CompletionKind::Property)
                                 });
                             }
@@ -1593,18 +1940,33 @@ impl Providers for KubernetesPlugin {
 
     fn code_actions(&mut self, doc: &Document, selection: Range) -> Vec<CodeAction> {
         let proj = project_of(&doc.path);
-        self.index.ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
-        let parsed =
-            self.index.files.get(&normalize_slashes(&doc.path)).cloned().unwrap_or_else(|| parse_yaml(&doc.text));
+        self.index
+            .ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
+        let parsed = self
+            .index
+            .files
+            .get(&normalize_slashes(&doc.path))
+            .cloned()
+            .unwrap_or_else(|| parse_yaml(&doc.text));
         let warn_latest = host::setting_bool("warnLatestTag").unwrap_or(true);
         let warn_resources = host::setting_bool("warnMissingResources").unwrap_or(true);
-        let issues = inspect_document(&self.index, &doc.path, &doc.text, &parsed, warn_latest, warn_resources);
+        let issues = inspect_document(
+            &self.index,
+            &doc.path,
+            &doc.text,
+            &parsed,
+            warn_latest,
+            warn_resources,
+        );
         let mut actions = Vec::new();
         let mut seen_titles = std::collections::BTreeSet::new();
         for issue in issues {
             let d_line = issue.diagnostic.range.start.line;
             let overlaps = d_line >= selection.start.line && d_line <= selection.end.line;
-            let is_file_level = issue.fix.as_ref().is_some_and(|f| f.title.contains("# nonk8s"));
+            let is_file_level = issue
+                .fix
+                .as_ref()
+                .is_some_and(|f| f.title.contains("# nonk8s"));
             if (overlaps || is_file_level)
                 && let Some(fix) = issue.fix
                 && seen_titles.insert(fix.title.clone())
@@ -1617,23 +1979,38 @@ impl Providers for KubernetesPlugin {
 
     fn definition(&mut self, doc: &Document, at: Position) -> Vec<Location> {
         let proj = project_of(&doc.path);
-        self.index.ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
-        let parsed =
-            self.index.files.get(&normalize_slashes(&doc.path)).cloned().unwrap_or_else(|| parse_yaml(&doc.text));
+        self.index
+            .ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
+        let parsed = self
+            .index
+            .files
+            .get(&normalize_slashes(&doc.path))
+            .cloned()
+            .unwrap_or_else(|| parse_yaml(&doc.text));
         definitions_at(&self.index, doc, at, &parsed)
     }
 
     fn line_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
         let proj = project_of(&doc.path);
-        self.index.ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
-        let parsed =
-            self.index.files.get(&normalize_slashes(&doc.path)).cloned().unwrap_or_else(|| parse_yaml(&doc.text));
+        self.index
+            .ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
+        let parsed = self
+            .index
+            .files
+            .get(&normalize_slashes(&doc.path))
+            .cloned()
+            .unwrap_or_else(|| parse_yaml(&doc.text));
         line_markers_for(&self.index, doc, &parsed)
     }
 }
 
 impl Views for KubernetesPlugin {
-    fn render(&mut self, view: &str, _viewport: Option<Viewport>, ctx: &Invocation) -> Result<View, Error> {
+    fn render(
+        &mut self,
+        view: &str,
+        _viewport: Option<Viewport>,
+        ctx: &Invocation,
+    ) -> Result<View, Error> {
         if view != VIEW_ID {
             return Err(Error::NotFound(view.into()));
         }
@@ -1641,7 +2018,10 @@ impl Views for KubernetesPlugin {
         // so the tool window opens immediately and never times out; the page then requests
         // live cluster resources via `postMessage({op: "refresh"})` inside a background Task.
         let project = resolve_project(ctx).ok();
-        let root = project.as_ref().and_then(|p| p.root().ok()).unwrap_or_default();
+        let root = project
+            .as_ref()
+            .and_then(|p| p.root().ok())
+            .unwrap_or_default();
         self.index.ensure(project.as_ref(), None);
         let mut cfg = KubeConfigState::load();
         if let Some(ref p) = project {
@@ -1661,8 +2041,16 @@ impl Views for KubernetesPlugin {
         } else {
             format!(
                 "Context: {} • Namespace: {} • {} cluster resources • {} workspace files",
-                if snap.current_context.is_empty() { "default" } else { snap.current_context.as_str() },
-                if snap.all_namespaces { "all" } else { snap.current_namespace.as_str() },
+                if snap.current_context.is_empty() {
+                    "default"
+                } else {
+                    snap.current_context.as_str()
+                },
+                if snap.all_namespaces {
+                    "all"
+                } else {
+                    snap.current_namespace.as_str()
+                },
                 snap.resources.len(),
                 self.index.files.len()
             )
@@ -1906,12 +2294,35 @@ spec:
 
         // Gutter line markers on ConfigMap ref, Workload exposed by Service, Service selector, Ingress backend
         let markers = plugin.line_markers(&doc);
-        assert!(markers.len() >= 5, "expected at least 5 gutter markers, got {markers:?}");
-        assert!(markers.iter().any(|m| m.tooltip.contains("Exposed by Service 'web-svc'")));
-        assert!(markers.iter().any(|m| m.tooltip.contains("Go to matching Deployment 'web-api'")));
-        assert!(markers.iter().any(|m| m.tooltip.contains("Go to ConfigMap 'app-config'")));
-        assert!(markers.iter().any(|m| m.tooltip.contains("Go to key 'DATABASE_URL'")));
-        assert!(markers.iter().any(|m| m.tooltip.contains("Go to Service 'web-svc'")));
+        assert!(
+            markers.len() >= 5,
+            "expected at least 5 gutter markers, got {markers:?}"
+        );
+        assert!(
+            markers
+                .iter()
+                .any(|m| m.tooltip.contains("Exposed by Service 'web-svc'"))
+        );
+        assert!(
+            markers
+                .iter()
+                .any(|m| m.tooltip.contains("Go to matching Deployment 'web-api'"))
+        );
+        assert!(
+            markers
+                .iter()
+                .any(|m| m.tooltip.contains("Go to ConfigMap 'app-config'"))
+        );
+        assert!(
+            markers
+                .iter()
+                .any(|m| m.tooltip.contains("Go to key 'DATABASE_URL'"))
+        );
+        assert!(
+            markers
+                .iter()
+                .any(|m| m.tooltip.contains("Go to Service 'web-svc'"))
+        );
 
         // Go to Definition from `key: DATABASE_URL` (line 36) jumps to line 5 in ConfigMap `data:`
         let defs = plugin.definition(&doc, Position::new(36, 25));
@@ -1927,7 +2338,10 @@ spec:
     #[test]
     fn helm_values_and_named_templates_complete_and_navigate() {
         let host = MockHost::install();
-        host.add_file("chart/values.yaml", "image:\n  repository: nginx\n  tag: \"1.27.0\"\nreplicaCount: 3\n");
+        host.add_file(
+            "chart/values.yaml",
+            "image:\n  repository: nginx\n  tag: \"1.27.0\"\nreplicaCount: 3\n",
+        );
         host.add_file(
             "chart/templates/_helpers.tpl",
             "{{- define \"mychart.fullname\" -}}\n{{ .Chart.Name }}\n{{- end -}}\n",
@@ -1957,10 +2371,16 @@ spec:
 
         // Complete `.Values.im`
         let editing = tpl.replace(".Values.image.tag", ".Values.im");
-        let edit_doc = Document { text: editing, ..doc };
+        let edit_doc = Document {
+            text: editing,
+            ..doc
+        };
         let items = plugin.completion(&edit_doc, Position::new(10, 29), None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-        assert!(labels.contains(&"image.tag") && labels.contains(&"image.repository"), "{labels:?}");
+        assert!(
+            labels.contains(&"image.tag") && labels.contains(&"image.repository"),
+            "{labels:?}"
+        );
     }
 
     #[test]
@@ -1989,12 +2409,17 @@ spec:
 "#;
         host.add_file("deploy.yaml", bad_yaml);
         let mut plugin = KubernetesPlugin::default();
-        let count = plugin.check_and_publish("/project/deploy.yaml", false).unwrap();
+        let count = plugin
+            .check_and_publish("/project/deploy.yaml", false)
+            .unwrap();
         assert!(count >= 6, "expected at least 6 diagnostics, got {count}");
 
         let diags = host.diagnostics();
         let file_diags = &diags["/project/deploy.yaml"];
-        let codes: Vec<_> = file_diags.iter().filter_map(|d| d.code.as_deref()).collect();
+        let codes: Vec<_> = file_diags
+            .iter()
+            .filter_map(|d| d.code.as_deref())
+            .collect();
         assert!(codes.contains(&"deprecated-api-version"), "{codes:?}");
         assert!(codes.contains(&"selector-label-mismatch"), "{codes:?}");
         assert!(codes.contains(&"image-latest-tag"), "{codes:?}");
@@ -2010,9 +2435,18 @@ spec:
             version: 1,
             text: bad_yaml.into(),
         };
-        let actions = plugin.code_actions(&doc, Range::new(Position::new(0, 0), Position::new(0, 10)));
-        assert!(actions.iter().any(|a| a.title.contains("Upgrade apiVersion to apps/v1")), "{actions:?}");
-        assert!(actions.iter().any(|a| a.title.contains("# nonk8s")), "{actions:?}");
+        let actions =
+            plugin.code_actions(&doc, Range::new(Position::new(0, 0), Position::new(0, 10)));
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.title.contains("Upgrade apiVersion to apps/v1")),
+            "{actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| a.title.contains("# nonk8s")),
+            "{actions:?}"
+        );
     }
 
     #[test]
@@ -2022,47 +2456,107 @@ spec:
         host.open_editor("/project/k8s/app.yaml", "yaml", SAMPLE_MANIFEST, &[]);
 
         let mut plugin = KubernetesPlugin::default();
-        plugin.activate(&host.context("dengliu.kubernetes")).unwrap();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
 
         // Render the Kubernetes Explorer view (loads kubeconfig contexts immediately)
         let view = plugin.render(VIEW_ID, None, &host.invocation()).unwrap();
-        let Body::Html(html) = &view.body else { panic!("expected Html view") };
+        let Body::Html(html) = &view.body else {
+            panic!("expected Html view")
+        };
         assert!(!html.contains("__START_B64__"));
-        assert_eq!(host.status_items()["context"].text, "k8s: prod-east/production");
+        assert_eq!(
+            host.status_items()["context"].text,
+            "k8s: prod-east/production"
+        );
 
         // Page requests cluster resources via `{op: "refresh"}`
-        plugin.handle(VIEW_ID, ViewEvent::Message(r#"{"op":"refresh"}"#.into()), &host.invocation()).unwrap();
-        assert!(host.view_messages().iter().any(|(v, m)| v == VIEW_ID && m.contains("web-api-7f8b9-abc")));
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(r#"{"op":"refresh"}"#.into()),
+                &host.invocation(),
+            )
+            .unwrap();
+        assert!(
+            host.view_messages()
+                .iter()
+                .any(|(v, m)| v == VIEW_ID && m.contains("web-api-7f8b9-abc"))
+        );
 
         // Switch context command cycles to `dev-local`
-        let next_ctx = plugin.run_command("switch-context", &host.invocation(), None).unwrap().unwrap();
+        let next_ctx = plugin
+            .run_command("switch-context", &host.invocation(), None)
+            .unwrap()
+            .unwrap();
         assert_eq!(next_ctx, "dev-local");
-        assert_eq!(host.storage().get("context").map(String::as_str), Some("dev-local"));
+        assert_eq!(
+            host.storage().get("context").map(String::as_str),
+            Some("dev-local")
+        );
 
         // Follow logs & Exec shell open terminals with the right kubectl arguments
-        plugin.run_command("follow-logs", &host.invocation(), Some("production/web-api-7f8b9-abc/api")).unwrap();
-        plugin.run_command("exec-shell", &host.invocation(), Some("production/web-api-7f8b9-abc/api")).unwrap();
-        plugin.run_command("port-forward", &host.invocation(), Some("Service/production/web-svc:8080:80")).unwrap();
+        plugin
+            .run_command(
+                "follow-logs",
+                &host.invocation(),
+                Some("production/web-api-7f8b9-abc/api"),
+            )
+            .unwrap();
+        plugin
+            .run_command(
+                "exec-shell",
+                &host.invocation(),
+                Some("production/web-api-7f8b9-abc/api"),
+            )
+            .unwrap();
+        plugin
+            .run_command(
+                "port-forward",
+                &host.invocation(),
+                Some("Service/production/web-svc:8080:80"),
+            )
+            .unwrap();
         let terms = host.terminals();
         assert_eq!(terms.len(), 3);
         assert!(terms[0].args.contains(&"logs".into()) && terms[0].args.contains(&"-f".into()));
         assert!(terms[1].args.contains(&"exec".into()) && terms[1].args.contains(&"-it".into()));
-        assert!(terms[2].args.contains(&"port-forward".into()) && terms[2].args.contains(&"8080:80".into()));
+        assert!(
+            terms[2].args.contains(&"port-forward".into())
+                && terms[2].args.contains(&"8080:80".into())
+        );
 
         // Scale and Rollout Restart commands
-        let scaled =
-            plugin.run_command("scale", &host.invocation(), Some("Deployment/production/web-api=4")).unwrap().unwrap();
+        let scaled = plugin
+            .run_command(
+                "scale",
+                &host.invocation(),
+                Some("Deployment/production/web-api=4"),
+            )
+            .unwrap()
+            .unwrap();
         assert!(scaled.contains("scaled"));
         let restarted = plugin
-            .run_command("rollout-restart", &host.invocation(), Some("Deployment/production/web-api"))
+            .run_command(
+                "rollout-restart",
+                &host.invocation(),
+                Some("Deployment/production/web-api"),
+            )
             .unwrap()
             .unwrap();
         assert!(restarted.contains("restarted"));
 
         // Kustomize and Helm Template commands
-        let kust = plugin.run_command("kustomize-build", &host.invocation(), Some(".")).unwrap().unwrap();
+        let kust = plugin
+            .run_command("kustomize-build", &host.invocation(), Some("."))
+            .unwrap()
+            .unwrap();
         assert!(kust.contains("kustomized-svc"));
-        let helm_out = plugin.run_command("helm-template", &host.invocation(), Some(".")).unwrap().unwrap();
+        let helm_out = plugin
+            .run_command("helm-template", &host.invocation(), Some("."))
+            .unwrap()
+            .unwrap();
         assert!(helm_out.contains("rendered-chart"));
 
         // Live YAML editing in the tool window (`apply-yaml`)
@@ -2076,7 +2570,11 @@ spec:
                 &host.invocation(),
             )
             .unwrap();
-        assert!(host.view_messages().iter().any(|(v, m)| v == VIEW_ID && m.contains("Applied to cluster")));
+        assert!(
+            host.view_messages()
+                .iter()
+                .any(|(v, m)| v == VIEW_ID && m.contains("Applied to cluster"))
+        );
 
         // Content editor tab round-trip (`open-resource-yaml` -> `content-tab-action` reload/diff/save)
         plugin
@@ -2089,7 +2587,11 @@ spec:
                 &host.invocation(),
             )
             .unwrap();
-        assert!(host.view_messages().iter().any(|(v, m)| v == VIEW_ID && m.contains("resource-yaml-ready")));
+        assert!(
+            host.view_messages()
+                .iter()
+                .any(|(v, m)| v == VIEW_ID && m.contains("resource-yaml-ready"))
+        );
 
         plugin
             .handle(
@@ -2101,11 +2603,9 @@ spec:
                 &host.invocation(),
             )
             .unwrap();
-        assert!(
-            host.view_messages()
-                .iter()
-                .any(|(v, m)| v == VIEW_ID && m.contains(r#""op":"content-tab-reply""#) && m.contains(r#""requestId":"ct-1""#))
-        );
+        assert!(host.view_messages().iter().any(|(v, m)| v == VIEW_ID
+            && m.contains(r#""op":"content-tab-reply""#)
+            && m.contains(r#""requestId":"ct-1""#)));
 
         plugin
             .handle(
@@ -2117,11 +2617,9 @@ spec:
                 &host.invocation(),
             )
             .unwrap();
-        assert!(
-            host.view_messages()
-                .iter()
-                .any(|(v, m)| v == VIEW_ID && m.contains(r#""requestId":"ct-2""#) && m.contains(r#""saved":true"#))
-        );
+        assert!(host.view_messages().iter().any(|(v, m)| v == VIEW_ID
+            && m.contains(r#""requestId":"ct-2""#)
+            && m.contains(r#""saved":true"#)));
     }
 
     #[test]
@@ -2172,5 +2670,60 @@ spec:
         assert_eq!(catalog[1].version, "v1.36.2");
         assert_eq!(catalog[1].short_name, "FDC");
         assert!(!catalog[1].hotbar_pinned);
+    }
+
+    #[test]
+    fn poll_category_attaches_bounded_request_timeout_and_reports_completion() {
+        let seen_args = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let host = install_mock_with_kubectl();
+        let seen_clone = seen_args.clone();
+        host.on_process("kubectl", move |args, _stdin| {
+            seen_clone.lock().unwrap().push(args.to_vec());
+            let joined = args.join(" ");
+            let stdout = if joined.contains("config view") {
+                KUBECONFIG_JSON.to_owned()
+            } else if joined.contains("get pods") {
+                RESOURCES_JSON.to_owned()
+            } else {
+                String::new()
+            };
+            Ok(ProcessOutput {
+                status: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        });
+        host.add_file("k8s/app.yaml", SAMPLE_MANIFEST);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"poll-category","category":"Pod","includeMetrics":false}"#.into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+
+        let recorded = seen_args.lock().unwrap();
+        let pod_call = recorded
+            .iter()
+            .find(|a| a.iter().any(|x| x == "pods"))
+            .expect("pod poll call");
+        assert!(
+            pod_call.contains(&"--request-timeout=3s".to_owned()),
+            "{pod_call:?}"
+        );
+        assert!(
+            !recorded.iter().any(|a| a.iter().any(|x| x == "top")),
+            "metrics skipped when includeMetrics=false"
+        );
+        assert!(host.view_messages().iter().any(|(v, m)| v == VIEW_ID
+            && m.contains(r#""pollCompleted":true"#)
+            && m.contains(r#""pollDurationMs":"#)));
     }
 }

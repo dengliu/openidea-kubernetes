@@ -41,8 +41,12 @@ impl KubeConfigState {
             .flatten()
             .map(|v| v == "true")
             .unwrap_or_else(|| host::setting_bool("allNamespaces").unwrap_or(false));
-        let tail_lines = host::setting_number("tailLines").map(|n| (n as u32).clamp(10, 10_000)).unwrap_or(200);
-        let shell = host::setting_string("shell").filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
+        let tail_lines = host::setting_number("tailLines")
+            .map(|n| (n as u32).clamp(10, 10_000))
+            .unwrap_or(200);
+        let shell = host::setting_string("shell")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
         let debugger_image = host::setting_string("debuggerImage")
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
@@ -88,7 +92,9 @@ impl KubeConfigState {
         if !self.context.trim().is_empty() {
             args.push(format!("--context={}", self.context.trim()));
         }
-        let ns = namespace_override.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| self.namespace.trim());
+        let ns = namespace_override
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.namespace.trim());
         if !ns.is_empty() {
             args.push("-n".into());
             args.push(ns.to_owned());
@@ -228,22 +234,87 @@ pub fn resolve_project(ctx: &Invocation) -> Result<Project, Error> {
         .ok_or_else(|| Error::Invalid("open a project to run Kubernetes commands".into()))
 }
 
-/// Runs `kubectl` with `args` in `project`.
-pub fn run_kubectl(project: &Project, args: &[String], stdin: Option<&str>) -> Result<ProcessOutput, Error> {
+#[derive(Clone, Copy, Debug)]
+pub struct FetchOptions {
+    pub is_background_poll: bool,
+    pub include_metrics: bool,
+}
+
+impl Default for FetchOptions {
+    fn default() -> Self {
+        Self {
+            is_background_poll: false,
+            include_metrics: true,
+        }
+    }
+}
+
+fn should_attach_request_timeout(args: &[String]) -> bool {
+    if args.iter().any(|a| {
+        a.starts_with("--request-timeout")
+            || a.starts_with("--timeout")
+            || a == "config"
+            || a == "kustomize"
+            || a == "--dry-run=client"
+    }) {
+        return false;
+    }
+    !args.iter().any(|a| a == "exec" || a == "port-forward")
+}
+
+/// Runs `kubectl` with an explicit `--request-timeout` when `timeout_secs` is `Some`.
+pub fn run_kubectl_timed(
+    project: &Project,
+    args: &[String],
+    stdin: Option<&str>,
+    timeout_secs: Option<u32>,
+) -> Result<ProcessOutput, Error> {
+    if let Some(secs) = timeout_secs
+        && should_attach_request_timeout(args)
+    {
+        let mut timed = Vec::with_capacity(args.len() + 1);
+        timed.extend_from_slice(args);
+        timed.push(format!("--request-timeout={secs}s"));
+        return project.run_process("kubectl", &timed, stdin);
+    }
     project.run_process("kubectl", args, stdin)
+}
+
+/// Runs `kubectl` with `args` in `project` (defaulting to a 15s request timeout for cluster calls).
+pub fn run_kubectl(
+    project: &Project,
+    args: &[String],
+    stdin: Option<&str>,
+) -> Result<ProcessOutput, Error> {
+    run_kubectl_timed(project, args, stdin, Some(15))
 }
 
 pub type KubeconfigOverview = (String, Vec<String>, Option<String>, Vec<ClusterContextInfo>);
 
 /// Generates a 2–3 letter uppercase badge (like Freelens `AP`, `FDC`, `FPG`) from a context name.
 pub fn compute_short_name(name: &str) -> String {
-    let parts: Vec<&str> = name.split(['-', '_', '.', '/']).filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = name
+        .split(['-', '_', '.', '/'])
+        .filter(|s| !s.is_empty())
+        .collect();
     if parts.len() >= 3 {
-        parts.iter().take(3).filter_map(|p| p.chars().next()).map(|c| c.to_ascii_uppercase()).collect()
+        parts
+            .iter()
+            .take(3)
+            .filter_map(|p| p.chars().next())
+            .map(|c| c.to_ascii_uppercase())
+            .collect()
     } else if parts.len() == 2 {
-        parts.iter().filter_map(|p| p.chars().next()).map(|c| c.to_ascii_uppercase()).collect()
+        parts
+            .iter()
+            .filter_map(|p| p.chars().next())
+            .map(|c| c.to_ascii_uppercase())
+            .collect()
     } else {
-        name.chars().take(3).map(|c| c.to_ascii_uppercase()).collect()
+        name.chars()
+            .take(3)
+            .map(|c| c.to_ascii_uppercase())
+            .collect()
     }
 }
 
@@ -358,7 +429,10 @@ pub fn merge_freelens_stores(
                 last_seen: None,
             });
             let ver = meta.version.unwrap_or_default();
-            let dist = meta.distribution.filter(|d| d != "unknown").unwrap_or_default();
+            let dist = meta
+                .distribution
+                .filter(|d| d != "unknown")
+                .unwrap_or_default();
             let last_seen = meta.last_seen.unwrap_or_default();
             by_context.insert(
                 cl.context_name,
@@ -427,10 +501,11 @@ pub fn merge_freelens_stores(
                 entry.source = "~/.kube/config".into();
             }
         }
-        if let Some((badge, ord)) = hotbar_by_name_or_uid
-            .get(&entry.name)
-            .or_else(|| (!cluster_uid.is_empty()).then(|| hotbar_by_name_or_uid.get(&cluster_uid)).flatten())
-        {
+        if let Some((badge, ord)) = hotbar_by_name_or_uid.get(&entry.name).or_else(|| {
+            (!cluster_uid.is_empty())
+                .then(|| hotbar_by_name_or_uid.get(&cluster_uid))
+                .flatten()
+        }) {
             entry.hotbar_pinned = true;
             entry.hotbar_order = Some(*ord);
             let count = used_hotbar_badges.entry(badge.clone()).or_insert(0);
@@ -486,7 +561,10 @@ fn load_local_freelens_metadata(project: &Project, catalog: &mut [ClusterContext
 }
 
 /// Queries `kubectl config view -o json` to get available contexts, active context, active namespace, and full cluster catalog.
-pub fn fetch_kubeconfig_overview(project: &Project, cfg: &KubeConfigState) -> Result<KubeconfigOverview, Error> {
+pub fn fetch_kubeconfig_overview(
+    project: &Project,
+    cfg: &KubeConfigState,
+) -> Result<KubeconfigOverview, Error> {
     let mut args = Vec::new();
     if !cfg.kubeconfig.trim().is_empty() {
         args.push(format!("--kubeconfig={}", cfg.kubeconfig.trim()));
@@ -494,11 +572,18 @@ pub fn fetch_kubeconfig_overview(project: &Project, cfg: &KubeConfigState) -> Re
     args.extend(["config".into(), "view".into(), "-o".into(), "json".into()]);
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, "kubectl config view failed")));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            "kubectl config view failed",
+        )));
     }
-    let source =
-        if cfg.kubeconfig.trim().is_empty() { "~/.kube/config".to_owned() } else { cfg.kubeconfig.trim().to_owned() };
-    let (current, contexts, active_ns, mut catalog) = parse_kubeconfig_catalog(&out.stdout, &cfg.context, &source);
+    let source = if cfg.kubeconfig.trim().is_empty() {
+        "~/.kube/config".to_owned()
+    } else {
+        cfg.kubeconfig.trim().to_owned()
+    };
+    let (current, contexts, active_ns, mut catalog) =
+        parse_kubeconfig_catalog(&out.stdout, &cfg.context, &source);
     load_local_freelens_metadata(project, &mut catalog);
     Ok((current, contexts, active_ns, catalog))
 }
@@ -547,12 +632,19 @@ struct RawContextDetail {
 
 /// Parses `kubectl config view -o json` output using typed deserialization (skipping cert blobs).
 /// When `current-context` is not set in kubeconfig, falls back to the first available context.
-pub fn parse_kubeconfig_json(json_str: &str, override_context: &str) -> (String, Vec<String>, Option<String>) {
+pub fn parse_kubeconfig_json(
+    json_str: &str,
+    override_context: &str,
+) -> (String, Vec<String>, Option<String>) {
     let (cur, ctxs, ns, _) = parse_kubeconfig_catalog(json_str, override_context, "~/.kube/config");
     (cur, ctxs, ns)
 }
 
-pub fn parse_kubeconfig_catalog(json_str: &str, override_context: &str, source: &str) -> KubeconfigOverview {
+pub fn parse_kubeconfig_catalog(
+    json_str: &str,
+    override_context: &str,
+    source: &str,
+) -> KubeconfigOverview {
     let Ok(raw) = serde_json::from_str::<RawKubeconfig>(json_str) else {
         return (override_context.to_owned(), Vec::new(), None, Vec::new());
     };
@@ -580,7 +672,10 @@ pub fn parse_kubeconfig_catalog(json_str: &str, override_context: &str, source: 
             if let Some(ref ns) = ns_opt {
                 context_namespaces.insert(item.name.clone(), ns.clone());
             }
-            let server = cluster_servers.get(&cluster_name).cloned().unwrap_or_default();
+            let server = cluster_servers
+                .get(&cluster_name)
+                .cloned()
+                .unwrap_or_default();
             let distro = if server.contains(".azmk8s.io") {
                 "aks".into()
             } else if server.contains(".eks.amazonaws.com") {
@@ -1017,8 +1112,10 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         .and_then(|mut v| v.pop())
         .map(|o| (o.kind.unwrap_or_default(), o.name.unwrap_or_default()))
         .unwrap_or_default();
-    let labels: Vec<String> =
-        meta.labels.map(|m| m.into_iter().map(|(k, v)| format!("{k}={v}")).collect()).unwrap_or_default();
+    let labels: Vec<String> = meta
+        .labels
+        .map(|m| m.into_iter().map(|(k, v)| format!("{k}={v}")).collect())
+        .unwrap_or_default();
 
     let mut containers = Vec::new();
     let mut container_states = Vec::new();
@@ -1033,10 +1130,12 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
     let mut node_name = spec.node_name.clone().unwrap_or_default();
     let qos = st.qos_class.clone().unwrap_or_default();
 
-    let carr = spec
-        .containers
-        .as_ref()
-        .or_else(|| spec.template.as_ref().and_then(|t| t.spec.as_ref()).and_then(|s| s.containers.as_ref()));
+    let carr = spec.containers.as_ref().or_else(|| {
+        spec.template
+            .as_ref()
+            .and_then(|t| t.spec.as_ref())
+            .and_then(|s| s.containers.as_ref())
+    });
     if let Some(carr) = carr {
         for c in carr {
             if let Some(ref cname) = c.name {
@@ -1052,10 +1151,12 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         }
     }
     let mut sidecar_names = std::collections::BTreeSet::new();
-    let init_arr = spec
-        .init_containers
-        .as_ref()
-        .or_else(|| spec.template.as_ref().and_then(|t| t.spec.as_ref()).and_then(|s| s.init_containers.as_ref()));
+    let init_arr = spec.init_containers.as_ref().or_else(|| {
+        spec.template
+            .as_ref()
+            .and_then(|t| t.spec.as_ref())
+            .and_then(|s| s.init_containers.as_ref())
+    });
     if let Some(init_arr) = init_arr {
         for c in init_arr {
             if let Some(ref cname) = c.name {
@@ -1094,11 +1195,17 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                         Some(s) if s.running.is_some() => (
                             "running".to_owned(),
                             String::new(),
-                            s.running.as_ref().and_then(|r| r.started_at.clone()).unwrap_or_default(),
+                            s.running
+                                .as_ref()
+                                .and_then(|r| r.started_at.clone())
+                                .unwrap_or_default(),
                         ),
                         Some(s) if s.waiting.is_some() => (
                             "waiting".to_owned(),
-                            s.waiting.as_ref().and_then(|w| w.reason.clone()).unwrap_or_default(),
+                            s.waiting
+                                .as_ref()
+                                .and_then(|w| w.reason.clone())
+                                .unwrap_or_default(),
                             String::new(),
                         ),
                         Some(s) if s.terminated.is_some() => {
@@ -1149,11 +1256,17 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                             Some(s) if s.running.is_some() => (
                                 "running".to_owned(),
                                 String::new(),
-                                s.running.as_ref().and_then(|r| r.started_at.clone()).unwrap_or_default(),
+                                s.running
+                                    .as_ref()
+                                    .and_then(|r| r.started_at.clone())
+                                    .unwrap_or_default(),
                             ),
                             Some(s) if s.waiting.is_some() => (
                                 "waiting".to_owned(),
-                                s.waiting.as_ref().and_then(|w| w.reason.clone()).unwrap_or_default(),
+                                s.waiting
+                                    .as_ref()
+                                    .and_then(|w| w.reason.clone())
+                                    .unwrap_or_default(),
                                 String::new(),
                             ),
                             Some(s) if s.terminated.is_some() => {
@@ -1196,11 +1309,17 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                             Some(s) if s.running.is_some() => (
                                 "running".to_owned(),
                                 String::new(),
-                                s.running.as_ref().and_then(|r| r.started_at.clone()).unwrap_or_default(),
+                                s.running
+                                    .as_ref()
+                                    .and_then(|r| r.started_at.clone())
+                                    .unwrap_or_default(),
                             ),
                             Some(s) if s.waiting.is_some() => (
                                 "waiting".to_owned(),
-                                s.waiting.as_ref().and_then(|w| w.reason.clone()).unwrap_or_default(),
+                                s.waiting
+                                    .as_ref()
+                                    .and_then(|w| w.reason.clone())
+                                    .unwrap_or_default(),
                                 String::new(),
                             ),
                             Some(s) if s.terminated.is_some() => {
@@ -1262,7 +1381,11 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
             let desired = st.desired_number_scheduled.unwrap_or(0);
             let rdy = st.number_ready.unwrap_or(0);
             ready = format!("{rdy}/{desired}");
-            status = if rdy == desired { "Ready".into() } else { "Degraded".into() };
+            status = if rdy == desired {
+                "Ready".into()
+            } else {
+                "Degraded".into()
+            };
         }
         "Job" => {
             let completions = spec.completions.unwrap_or(1);
@@ -1280,7 +1403,11 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         "CronJob" => {
             let schedule = spec.schedule.as_deref().unwrap_or("* * * * *");
             let suspended = spec.suspend.unwrap_or(false);
-            status = if suspended { "Suspended".into() } else { "Scheduled".into() };
+            status = if suspended {
+                "Suspended".into()
+            } else {
+                "Scheduled".into()
+            };
             ready = schedule.to_owned();
             detail = format!("schedule: {schedule}");
         }
@@ -1305,10 +1432,16 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         }
         "Ingress" => {
             let class = spec.ingress_class_name.unwrap_or_else(|| "default".into());
-            let hosts: Vec<String> =
-                spec.rules.map(|rules| rules.into_iter().filter_map(|r| r.host).collect()).unwrap_or_default();
+            let hosts: Vec<String> = spec
+                .rules
+                .map(|rules| rules.into_iter().filter_map(|r| r.host).collect())
+                .unwrap_or_default();
             status = format!("Class: {class}");
-            detail = if hosts.is_empty() { "*".into() } else { hosts.join(", ") };
+            detail = if hosts.is_empty() {
+                "*".into()
+            } else {
+                hosts.join(", ")
+            };
         }
         "ConfigMap" | "Secret" => {
             if let Some(obj) = item.data {
@@ -1328,7 +1461,12 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
             } else {
                 status = "ConfigMap".into();
             }
-            detail = data_keys.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+            detail = data_keys
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
         }
         "PersistentVolumeClaim" => {
             status = st.phase.unwrap_or_else(|| "Pending".into());
@@ -1336,24 +1474,40 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
                 .capacity
                 .as_ref()
                 .and_then(|m| m.get("storage"))
-                .or_else(|| spec.resources.as_ref().and_then(|r| r.requests.as_ref()).and_then(|m| m.get("storage")))
+                .or_else(|| {
+                    spec.resources
+                        .as_ref()
+                        .and_then(|r| r.requests.as_ref())
+                        .and_then(|m| m.get("storage"))
+                })
                 .cloned()
                 .unwrap_or_default();
             let sc = spec.storage_class_name.unwrap_or_default();
             node_name = sc.clone();
             ready = cap;
-            detail = if sc.is_empty() { String::new() } else { format!("storageClass: {sc}") };
+            detail = if sc.is_empty() {
+                String::new()
+            } else {
+                format!("storageClass: {sc}")
+            };
         }
         "StorageClass" => {
             ready = item.provisioner.unwrap_or_default();
             status = item.reclaim_policy.unwrap_or_else(|| "Delete".into());
-            detail = item.volume_binding_mode.unwrap_or_else(|| "Immediate".into());
+            detail = item
+                .volume_binding_mode
+                .unwrap_or_else(|| "Immediate".into());
         }
         "PersistentVolume" => {
             status = st.phase.unwrap_or_else(|| "Available".into());
             let sc = spec.storage_class_name.unwrap_or_default();
             node_name = sc.clone();
-            let cap = spec.capacity.as_ref().and_then(|m| m.get("storage")).cloned().unwrap_or_default();
+            let cap = spec
+                .capacity
+                .as_ref()
+                .and_then(|m| m.get("storage"))
+                .cloned()
+                .unwrap_or_default();
             ready = cap;
             let reclaim = spec.pv_reclaim_policy.unwrap_or_default();
             detail = match (sc.is_empty(), reclaim.is_empty()) {
@@ -1365,10 +1519,19 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         }
         "Node" => {
             let is_ready = st.conditions.is_some_and(|arr| {
-                arr.iter().any(|c| c.cond_type.as_deref() == Some("Ready") && c.status.as_deref() == Some("True"))
+                arr.iter().any(|c| {
+                    c.cond_type.as_deref() == Some("Ready") && c.status.as_deref() == Some("True")
+                })
             });
-            status = if is_ready { "Ready".into() } else { "NotReady".into() };
-            ready = st.node_info.and_then(|n| n.kubelet_version).unwrap_or_default();
+            status = if is_ready {
+                "Ready".into()
+            } else {
+                "NotReady".into()
+            };
+            ready = st
+                .node_info
+                .and_then(|n| n.kubelet_version)
+                .unwrap_or_default();
         }
         "Namespace" => {
             status = st.phase.unwrap_or_else(|| "Active".into());
@@ -1396,11 +1559,19 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         "PodDisruptionBudget" => {
             let min_av = spec
                 .min_available
-                .map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()))
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| v.to_string())
+                })
                 .unwrap_or_else(|| "N/A".into());
             let max_un = spec
                 .max_unavailable
-                .map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()))
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| v.to_string())
+                })
                 .unwrap_or_else(|| "N/A".into());
             let cur_h = st.current_healthy.unwrap_or(0);
             let des_h = st.desired_healthy.unwrap_or(0);
@@ -1411,7 +1582,11 @@ fn parse_raw_resource_item(item: RawResourceItem) -> Option<ClusterResource> {
         }
         "PriorityClass" => {
             ready = item.value.unwrap_or(0).to_string();
-            status = if item.global_default.unwrap_or(false) { "True".into() } else { "False".into() };
+            status = if item.global_default.unwrap_or(false) {
+                "True".into()
+            } else {
+                "False".into()
+            };
         }
         "RuntimeClass" => {
             ready = item.handler.unwrap_or_default();
@@ -1516,11 +1691,17 @@ pub fn parse_events_json(json_str: &str) -> Vec<ClusterEvent> {
     let mut out = Vec::new();
     for item in parsed.items.into_iter().rev().take(150) {
         let (obj_kind, obj_name) = match item.involved_object {
-            Some(inv) => (inv.kind.unwrap_or_else(|| "Resource".into()), inv.name.unwrap_or_default()),
+            Some(inv) => (
+                inv.kind.unwrap_or_else(|| "Resource".into()),
+                inv.name.unwrap_or_default(),
+            ),
             None => ("Resource".into(), String::new()),
         };
         let (namespace, created) = match item.metadata {
-            Some(m) => (m.namespace.unwrap_or_else(|| "default".into()), m.creation_timestamp.unwrap_or_default()),
+            Some(m) => (
+                m.namespace.unwrap_or_else(|| "default".into()),
+                m.creation_timestamp.unwrap_or_default(),
+            ),
             None => ("default".into(), String::new()),
         };
         let last_seen = item.last_timestamp.or(item.event_time).unwrap_or(created);
@@ -1547,15 +1728,39 @@ pub fn parse_helm_releases_json(json_str: &str) -> Vec<HelmRelease> {
         .filter_map(|v| {
             Some(HelmRelease {
                 name: v.get("name")?.as_str()?.to_owned(),
-                namespace: v.get("namespace").and_then(Value::as_str).unwrap_or("default").to_owned(),
+                namespace: v
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default")
+                    .to_owned(),
                 revision: v
                     .get("revision")
-                    .map(|r| r.as_str().map(str::to_owned).unwrap_or_else(|| r.to_string()))
+                    .map(|r| {
+                        r.as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| r.to_string())
+                    })
                     .unwrap_or_default(),
-                status: v.get("status").and_then(Value::as_str).unwrap_or("unknown").to_owned(),
-                chart: v.get("chart").and_then(Value::as_str).unwrap_or("").to_owned(),
-                app_version: v.get("app_version").and_then(Value::as_str).unwrap_or("").to_owned(),
-                updated: v.get("updated").and_then(Value::as_str).unwrap_or("").to_owned(),
+                status: v
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                chart: v
+                    .get("chart")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                app_version: v
+                    .get("app_version")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                updated: v
+                    .get("updated")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
             })
         })
         .collect()
@@ -1564,7 +1769,11 @@ pub fn parse_helm_releases_json(json_str: &str) -> Vec<HelmRelease> {
 const CUSTOM_COLUMNS_SPEC: &str = "custom-columns=KIND:.kind,NS:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,READY_LIST:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount,NODE:.spec.nodeName,POD_IP:.status.podIP,READY_REP:.status.readyReplicas,SPEC_REP:.spec.replicas,DS_READY:.status.numberReady,DS_DESIRED:.status.desiredNumberScheduled,JOB_SUCC:.status.succeeded,JOB_COMP:.spec.completions,SCHEDULE:.spec.schedule,SUSPEND:.spec.suspend,SVC_TYPE:.spec.type,CLUSTER_IP:.spec.clusterIP,ING_CLASS:.spec.ingressClassName,ING_HOSTS:.spec.rules[*].host,PVC_CAP:.status.capacity.storage,PVC_SC:.spec.storageClassName,CONTAINERS:.spec.containers[*].name,PORTS:.spec.containers[*].ports[*].containerPort,SVC_PORTS:.spec.ports[*].port,OWNER_KIND:.metadata.ownerReferences[0].kind,OWNER_NAME:.metadata.ownerReferences[0].name,QOS:.status.qosClass,AGE:.metadata.creationTimestamp";
 
 fn clean_col(val: &str) -> &str {
-    if val == "<none>" || val == "<unset>" || val == "<nil>" { "" } else { val }
+    if val == "<none>" || val == "<unset>" || val == "<nil>" {
+        ""
+    } else {
+        val
+    }
 }
 
 /// Parses compact `custom-columns` lines into `ClusterResource` items.
@@ -1607,7 +1816,11 @@ pub fn parse_custom_columns_resources(text: &str) -> Vec<ClusterResource> {
         let ports_raw = clean_col(cols[n - tail_cnt + 8]);
         let svc_ports_raw = clean_col(cols[n - tail_cnt + 9]);
         let (owner_kind, owner_name, qos) = if has_owner_cols {
-            (clean_col(cols[n - 4]).to_owned(), clean_col(cols[n - 3]).to_owned(), clean_col(cols[n - 2]).to_owned())
+            (
+                clean_col(cols[n - 4]).to_owned(),
+                clean_col(cols[n - 3]).to_owned(),
+                clean_col(cols[n - 2]).to_owned(),
+            )
         } else {
             (String::new(), String::new(), String::new())
         };
@@ -1616,12 +1829,24 @@ pub fn parse_custom_columns_resources(text: &str) -> Vec<ClusterResource> {
         let containers: Vec<String> = if containers_raw.is_empty() {
             Vec::new()
         } else {
-            containers_raw.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect()
+            containers_raw
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
         };
         let mut ports: Vec<String> = if !ports_raw.is_empty() {
-            ports_raw.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect()
+            ports_raw
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
         } else if !svc_ports_raw.is_empty() {
-            svc_ports_raw.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect()
+            svc_ports_raw
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
         } else {
             Vec::new()
         };
@@ -1634,7 +1859,11 @@ pub fn parse_custom_columns_resources(text: &str) -> Vec<ClusterResource> {
 
         match kind.as_str() {
             "Pod" => {
-                status = if phase.is_empty() { "Unknown".into() } else { phase.to_owned() };
+                status = if phase.is_empty() {
+                    "Unknown".into()
+                } else {
+                    phase.to_owned()
+                };
                 if !ready_list.is_empty() {
                     let parts: Vec<&str> = ready_list.split(',').collect();
                     let rdy_cnt = parts.iter().filter(|&&b| b == "true").count();
@@ -1642,7 +1871,10 @@ pub fn parse_custom_columns_resources(text: &str) -> Vec<ClusterResource> {
                 } else {
                     ready = format!("0/{}", containers.len());
                 }
-                restarts = restarts_list.split(',').filter_map(|s| s.parse::<u64>().ok()).sum();
+                restarts = restarts_list
+                    .split(',')
+                    .filter_map(|s| s.parse::<u64>().ok())
+                    .sum();
                 detail = match (node.is_empty(), pod_ip.is_empty()) {
                     (false, false) => format!("restarts: {restarts} • {pod_ip} on {node}"),
                     (false, true) => format!("restarts: {restarts} • {node}"),
@@ -1666,36 +1898,76 @@ pub fn parse_custom_columns_resources(text: &str) -> Vec<ClusterResource> {
                 let desired = ds_desired.parse::<u64>().unwrap_or(0);
                 let rdy = ds_ready.parse::<u64>().unwrap_or(0);
                 ready = format!("{rdy}/{desired}");
-                status = if rdy == desired { "Ready".into() } else { "Degraded".into() };
+                status = if rdy == desired {
+                    "Ready".into()
+                } else {
+                    "Degraded".into()
+                };
                 detail = format!("pods: {rdy}/{desired}");
             }
             "Job" => {
                 let comp = job_comp.parse::<u64>().unwrap_or(1);
                 let succ = job_succ.parse::<u64>().unwrap_or(0);
                 ready = format!("{succ}/{comp}");
-                status = if succ >= comp { "Complete".into() } else { "Running".into() };
+                status = if succ >= comp {
+                    "Complete".into()
+                } else {
+                    "Running".into()
+                };
             }
             "CronJob" => {
-                status = if suspend == "true" { "Suspended".into() } else { "Scheduled".into() };
+                status = if suspend == "true" {
+                    "Suspended".into()
+                } else {
+                    "Scheduled".into()
+                };
                 ready = schedule.to_owned();
-                detail = if schedule.is_empty() { String::new() } else { format!("schedule: {schedule}") };
+                detail = if schedule.is_empty() {
+                    String::new()
+                } else {
+                    format!("schedule: {schedule}")
+                };
             }
             "Service" => {
-                status = if svc_type.is_empty() { "ClusterIP".into() } else { svc_type.to_owned() };
+                status = if svc_type.is_empty() {
+                    "ClusterIP".into()
+                } else {
+                    svc_type.to_owned()
+                };
                 ready = ports.join(", ");
-                detail = if cluster_ip.is_empty() { String::new() } else { format!("ClusterIP: {cluster_ip}") };
+                detail = if cluster_ip.is_empty() {
+                    String::new()
+                } else {
+                    format!("ClusterIP: {cluster_ip}")
+                };
             }
             "Ingress" => {
-                status = if ing_class.is_empty() { "Ingress".into() } else { format!("Class: {ing_class}") };
-                detail = if ing_hosts.is_empty() { "*".into() } else { ing_hosts.to_owned() };
+                status = if ing_class.is_empty() {
+                    "Ingress".into()
+                } else {
+                    format!("Class: {ing_class}")
+                };
+                detail = if ing_hosts.is_empty() {
+                    "*".into()
+                } else {
+                    ing_hosts.to_owned()
+                };
             }
             "ConfigMap" => {
                 status = "ConfigMap".into();
             }
             "PersistentVolumeClaim" => {
-                status = if phase.is_empty() { "Bound".into() } else { phase.to_owned() };
+                status = if phase.is_empty() {
+                    "Bound".into()
+                } else {
+                    phase.to_owned()
+                };
                 ready = pvc_cap.to_owned();
-                detail = if pvc_sc.is_empty() { String::new() } else { format!("storageClass: {pvc_sc}") };
+                detail = if pvc_sc.is_empty() {
+                    String::new()
+                } else {
+                    format!("storageClass: {pvc_sc}")
+                };
             }
             _ => {}
         }
@@ -1713,8 +1985,16 @@ pub fn parse_custom_columns_resources(text: &str) -> Vec<ClusterResource> {
             restarts,
             controlled_by_kind: owner_kind,
             controlled_by_name: owner_name,
-            pod_ip: if !pod_ip.is_empty() { pod_ip.to_owned() } else { cluster_ip.to_owned() },
-            node_name: if !node.is_empty() { node.to_owned() } else { pvc_sc.to_owned() },
+            pod_ip: if !pod_ip.is_empty() {
+                pod_ip.to_owned()
+            } else {
+                cluster_ip.to_owned()
+            },
+            node_name: if !node.is_empty() {
+                node.to_owned()
+            } else {
+                pvc_sc.to_owned()
+            },
             qos,
             ..Default::default()
         });
@@ -1726,7 +2006,11 @@ pub fn parse_custom_columns_resources(text: &str) -> Vec<ClusterResource> {
 }
 
 /// Fetches `Namespace` rows using fast Server-Side Table output (`kubectl get namespaces --no-headers`).
-pub fn fetch_namespaces_into_snapshot(project: &Project, cfg: &KubeConfigState, snap: &mut ClusterSnapshot) {
+pub fn fetch_namespaces_into_snapshot(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+) {
     let mut ns_args = cfg.base_args(false);
     ns_args.extend(["get".into(), "namespaces".into(), "--no-headers".into()]);
     if let Ok(out) = run_kubectl(project, &ns_args, None)
@@ -1792,27 +2076,63 @@ fn parse_kube_gi(raw: &str) -> f64 {
 
 /// Fetches `Node` rows on demand using Server-Side custom-columns output + `kubectl top nodes`,
 /// avoiding downloading megabytes of full Node `.status.images` JSON over the network.
-pub fn fetch_nodes_into_snapshot(project: &Project, cfg: &KubeConfigState, snap: &mut ClusterSnapshot) {
+pub fn fetch_nodes_into_snapshot(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+) {
+    fetch_nodes_with_options(project, cfg, snap, FetchOptions::default());
+}
+
+pub fn fetch_nodes_with_options(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+    opts: FetchOptions,
+) {
+    let prev_metrics: BTreeMap<String, (String, String)> = snap
+        .resources
+        .iter()
+        .filter(|r| r.kind == "Node" && (!r.cpu.is_empty() || !r.memory.is_empty()))
+        .map(|r| (r.name.clone(), (r.cpu.clone(), r.memory.clone())))
+        .collect();
+    let prev_node_cnt = snap.resources.iter().filter(|r| r.kind == "Node").count();
+
     let mut top_map: BTreeMap<String, (f64, f64)> = BTreeMap::new();
-    let mut top_args = cfg.base_args(false);
-    top_args.extend(["top".into(), "nodes".into(), "--no-headers".into()]);
-    if let Ok(top_out) = run_kubectl(project, &top_args, None)
-        && top_out.status == Some(0)
-    {
-        for line in top_out.stdout.lines() {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() >= 4 {
-                let nname = cols[0].to_owned();
-                let u_cpu = parse_kube_cores(cols[1]);
-                let u_mem = parse_kube_gi(cols[3]);
-                top_map.insert(nname, (u_cpu, u_mem));
+    let should_query_top =
+        opts.include_metrics && (!opts.is_background_poll || prev_node_cnt <= 120);
+    if should_query_top {
+        let mut top_args = cfg.base_args(false);
+        top_args.extend(["top".into(), "nodes".into(), "--no-headers".into()]);
+        if let Ok(top_out) = run_kubectl_timed(project, &top_args, None, Some(3))
+            && top_out.status == Some(0)
+        {
+            for line in top_out.stdout.lines() {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() >= 4 {
+                    let nname = cols[0].to_owned();
+                    let u_cpu = parse_kube_cores(cols[1]);
+                    let u_mem = parse_kube_gi(cols[3]);
+                    top_map.insert(nname, (u_cpu, u_mem));
+                }
             }
         }
     }
 
+    let req_timeout = if opts.is_background_poll {
+        Some(3)
+    } else {
+        Some(15)
+    };
     let mut node_args = cfg.base_args(false);
-    node_args.extend(["get".into(), "nodes".into(), "-o".into(), NODE_COLUMNS_SPEC.into(), "--no-headers".into()]);
-    if let Ok(out) = run_kubectl(project, &node_args, None)
+    node_args.extend([
+        "get".into(),
+        "nodes".into(),
+        "-o".into(),
+        NODE_COLUMNS_SPEC.into(),
+        "--no-headers".into(),
+    ]);
+    if let Ok(out) = run_kubectl_timed(project, &node_args, None, req_timeout)
         && out.status == Some(0)
     {
         snap.resources.retain(|r| r.kind != "Node");
@@ -1830,8 +2150,14 @@ pub fn fetch_nodes_into_snapshot(project: &Project, cfg: &KubeConfigState, snap:
                     let internal_ip = clean_col(cols[5]);
                     let alloc_cpu = parse_kube_cores(cols[6]);
                     let alloc_mem = parse_kube_gi(cols[7]);
-                    let cond_types: Vec<&str> = clean_col(cols[8]).split(',').filter(|s| !s.is_empty()).collect();
-                    let cond_stats: Vec<&str> = clean_col(cols[9]).split(',').filter(|s| !s.is_empty()).collect();
+                    let cond_types: Vec<&str> = clean_col(cols[8])
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let cond_stats: Vec<&str> = clean_col(cols[9])
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .collect();
                     let instance_type = clean_col(cols[10]);
                     let node_group = clean_col(cols[11]);
                     let age = clean_col(cols[12]);
@@ -1839,7 +2165,11 @@ pub fn fetch_nodes_into_snapshot(project: &Project, cfg: &KubeConfigState, snap:
                     let taints_list: Vec<String> = if taints_raw.is_empty() {
                         Vec::new()
                     } else {
-                        taints_raw.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect()
+                        taints_raw
+                            .split(',')
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .collect()
                     };
                     let taints_cnt = taints_list.len() as u64;
                     let schedulable = if unsched == "true" { "False" } else { "True" };
@@ -1853,15 +2183,42 @@ pub fn fetch_nodes_into_snapshot(project: &Project, cfg: &KubeConfigState, snap:
                     if active_conds.is_empty() {
                         active_conds.push("NotReady".into());
                     }
-                    if unsched == "true" && !active_conds.iter().any(|c| c == "SchedulingDisabled") {
+                    if unsched == "true" && !active_conds.iter().any(|c| c == "SchedulingDisabled")
+                    {
                         active_conds.push("SchedulingDisabled".into());
                     }
                     let status = active_conds.join(", ");
 
-                    let (u_cpu, u_mem) = top_map.get(name).copied().unwrap_or((0.0, 0.0));
-                    let cpu_str = if alloc_cpu > 0.0 { format!("{u_cpu:.2}/{alloc_cpu:.2}") } else { String::new() };
-                    let mem_str =
-                        if alloc_mem > 0.0 { format!("{u_mem:.1}Gi/{alloc_mem:.1}Gi") } else { String::new() };
+                    let (cpu_str, mem_str) = if should_query_top {
+                        let (u_cpu, u_mem) = top_map.get(name).copied().unwrap_or((0.0, 0.0));
+                        (
+                            if alloc_cpu > 0.0 {
+                                format!("{u_cpu:.2}/{alloc_cpu:.2}")
+                            } else {
+                                String::new()
+                            },
+                            if alloc_mem > 0.0 {
+                                format!("{u_mem:.1}Gi/{alloc_mem:.1}Gi")
+                            } else {
+                                String::new()
+                            },
+                        )
+                    } else if let Some((p_cpu, p_mem)) = prev_metrics.get(name) {
+                        (p_cpu.clone(), p_mem.clone())
+                    } else {
+                        (
+                            if alloc_cpu > 0.0 {
+                                format!("0.00/{alloc_cpu:.2}")
+                            } else {
+                                String::new()
+                            },
+                            if alloc_mem > 0.0 {
+                                format!("0.0Gi/{alloc_mem:.1}Gi")
+                            } else {
+                                String::new()
+                            },
+                        )
+                    };
 
                     snap.resources.push(ClusterResource {
                         kind: "Node".into(),
@@ -1888,7 +2245,11 @@ pub fn fetch_nodes_into_snapshot(project: &Project, cfg: &KubeConfigState, snap:
                     let age = cols.get(3).copied().map(clean_col).unwrap_or("");
                     let version = cols.get(4).copied().map(clean_col).unwrap_or("");
                     let internal_ip = cols.get(5).copied().map(clean_col).unwrap_or("");
-                    let schedulable = if status.contains("SchedulingDisabled") { "False" } else { "True" };
+                    let schedulable = if status.contains("SchedulingDisabled") {
+                        "False"
+                    } else {
+                        "True"
+                    };
                     snap.resources.push(ClusterResource {
                         kind: "Node".into(),
                         name: name.to_owned(),
@@ -1897,7 +2258,11 @@ pub fn fetch_nodes_into_snapshot(project: &Project, cfg: &KubeConfigState, snap:
                         age: age.to_owned(),
                         detail: internal_ip.to_owned(),
                         pod_ip: internal_ip.to_owned(),
-                        host_ip: if roles == "agent" { String::new() } else { roles.to_owned() },
+                        host_ip: if roles == "agent" {
+                            String::new()
+                        } else {
+                            roles.to_owned()
+                        },
                         qos: schedulable.to_owned(),
                         ..Default::default()
                     });
@@ -1909,8 +2274,7 @@ pub fn fetch_nodes_into_snapshot(project: &Project, cfg: &KubeConfigState, snap:
 
 const CRD_COLUMNS_SPEC: &str = "custom-columns=NAME:.metadata.name,GROUP:.spec.group,KIND:.spec.names.kind,SCOPE:.spec.scope,VERSION:.spec.versions[0].name,AGE:.metadata.creationTimestamp";
 
-const CR_INSTANCE_COLUMNS_SPEC: &str =
-    "custom-columns=KIND:.kind,NS:.metadata.namespace,NAME:.metadata.name,AGE:.metadata.creationTimestamp";
+const CR_INSTANCE_COLUMNS_SPEC: &str = "custom-columns=KIND:.kind,NS:.metadata.namespace,NAME:.metadata.name,AGE:.metadata.creationTimestamp";
 
 /// Parses `CR_INSTANCE_COLUMNS_SPEC` lines into `ClusterResource` items for a given CRD name.
 pub fn parse_cr_instance_lines(text: &str, crd_name: &str) -> Vec<ClusterResource> {
@@ -1941,13 +2305,24 @@ pub fn parse_cr_instance_lines(text: &str, crd_name: &str) -> Vec<ClusterResourc
 
 /// Fetches `CustomResourceDefinition` rows on demand using Server-Side custom-columns output,
 /// avoiding downloading megabytes of OpenAPI v3 validation schemas.
-pub fn fetch_crds_into_snapshot(project: &Project, cfg: &KubeConfigState, snap: &mut ClusterSnapshot) {
+pub fn fetch_crds_into_snapshot(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+) {
     let mut crd_args = cfg.base_args(false);
-    crd_args.extend(["get".into(), "crd".into(), "-o".into(), CRD_COLUMNS_SPEC.into(), "--no-headers".into()]);
+    crd_args.extend([
+        "get".into(),
+        "crd".into(),
+        "-o".into(),
+        CRD_COLUMNS_SPEC.into(),
+        "--no-headers".into(),
+    ]);
     if let Ok(out) = run_kubectl(project, &crd_args, None)
         && out.status == Some(0)
     {
-        snap.resources.retain(|r| r.kind != "CustomResourceDefinition");
+        snap.resources
+            .retain(|r| r.kind != "CustomResourceDefinition");
         for line in out.stdout.lines() {
             let cols: Vec<&str> = line.split_whitespace().collect();
             if cols.len() >= 6 {
@@ -1990,7 +2365,11 @@ pub fn fetch_crds_into_snapshot(project: &Project, cfg: &KubeConfigState, snap: 
 
 /// Fetches `Secret` rows using Server-Side Table output (`kubectl get secrets --no-headers`),
 /// avoiding downloading `.data` payloads over the network.
-pub fn fetch_secrets_into_snapshot(project: &Project, cfg: &KubeConfigState, snap: &mut ClusterSnapshot) {
+pub fn fetch_secrets_into_snapshot(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+) {
     let mut sec_args = cfg.base_args(true);
     sec_args.extend(["get".into(), "secrets".into()]);
     cfg.push_scope_flags(&mut sec_args);
@@ -2055,7 +2434,11 @@ pub fn fetch_secrets_into_snapshot(project: &Project, cfg: &KubeConfigState, sna
 }
 
 /// Fetches cluster `Event` items on demand.
-pub fn fetch_events_into_snapshot(project: &Project, cfg: &KubeConfigState, snap: &mut ClusterSnapshot) {
+pub fn fetch_events_into_snapshot(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+) {
     let mut ev_args = cfg.base_args(true);
     ev_args.extend(["get".into(), "events".into()]);
     cfg.push_scope_flags(&mut ev_args);
@@ -2068,7 +2451,11 @@ pub fn fetch_events_into_snapshot(project: &Project, cfg: &KubeConfigState, snap
 }
 
 /// Fetches `HelmRelease` items on demand.
-pub fn fetch_helm_into_snapshot(project: &Project, cfg: &KubeConfigState, snap: &mut ClusterSnapshot) {
+pub fn fetch_helm_into_snapshot(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+) {
     let mut helm_args = Vec::new();
     if !cfg.kubeconfig.trim().is_empty() {
         helm_args.push(format!("--kubeconfig={}", cfg.kubeconfig.trim()));
@@ -2096,7 +2483,11 @@ pub fn fetch_helm_into_snapshot(project: &Project, cfg: &KubeConfigState, snap: 
 fn format_pod_memory_aligned(raw: &str) -> String {
     let s = raw.trim();
     if let Some(mi) = s.strip_suffix("Mi").and_then(|v| v.parse::<f64>().ok()) {
-        if mi >= 1024.0 { format!("{:.1}Gi", mi / 1024.0) } else { format!("{mi:.1}Mi") }
+        if mi >= 1024.0 {
+            format!("{:.1}Gi", mi / 1024.0)
+        } else {
+            format!("{mi:.1}Mi")
+        }
     } else if let Some(ki) = s.strip_suffix("Ki").and_then(|v| v.parse::<f64>().ok()) {
         if ki >= 1024.0 * 1024.0 {
             format!("{:.1}Gi", ki / (1024.0 * 1024.0))
@@ -2122,7 +2513,7 @@ pub fn enrich_pod_metrics(project: &Project, cfg: &KubeConfigState, snap: &mut C
     args.extend(["top".into(), "pods".into()]);
     cfg.push_scope_flags(&mut args);
     args.push("--no-headers".into());
-    let Ok(out) = run_kubectl(project, &args, None) else {
+    let Ok(out) = run_kubectl_timed(project, &args, None, Some(3)) else {
         return;
     };
     if out.status != Some(0) {
@@ -2136,7 +2527,10 @@ pub fn enrich_pod_metrics(project: &Project, cfg: &KubeConfigState, snap: &mut C
             let ns = cols[0].to_owned();
             let name = cols[1].to_owned();
             let raw_cpu = cols[2];
-            let cpu = if let Some(m) = raw_cpu.strip_suffix('m').and_then(|v| v.parse::<f64>().ok()) {
+            let cpu = if let Some(m) = raw_cpu
+                .strip_suffix('m')
+                .and_then(|v| v.parse::<f64>().ok())
+            {
                 format!("{:.3}", m / 1000.0)
             } else {
                 raw_cpu.to_owned()
@@ -2146,7 +2540,10 @@ pub fn enrich_pod_metrics(project: &Project, cfg: &KubeConfigState, snap: &mut C
         } else if cols.len() == 3 {
             let name = cols[0].to_owned();
             let raw_cpu = cols[1];
-            let cpu = if let Some(m) = raw_cpu.strip_suffix('m').and_then(|v| v.parse::<f64>().ok()) {
+            let cpu = if let Some(m) = raw_cpu
+                .strip_suffix('m')
+                .and_then(|v| v.parse::<f64>().ok())
+            {
                 format!("{:.3}", m / 1000.0)
             } else {
                 raw_cpu.to_owned()
@@ -2156,8 +2553,9 @@ pub fn enrich_pod_metrics(project: &Project, cfg: &KubeConfigState, snap: &mut C
         }
     }
     for r in snap.resources.iter_mut().filter(|r| r.kind == "Pod") {
-        if let Some((cpu, mem)) =
-            ns_metrics.get(&(r.namespace.clone(), r.name.clone())).or_else(|| single_metrics.get(&r.name))
+        if let Some((cpu, mem)) = ns_metrics
+            .get(&(r.namespace.clone(), r.name.clone()))
+            .or_else(|| single_metrics.get(&r.name))
         {
             r.cpu = cpu.clone();
             r.memory = mem.clone();
@@ -2166,7 +2564,11 @@ pub fn enrich_pod_metrics(project: &Project, cfg: &KubeConfigState, snap: &mut C
 }
 
 /// Fetches the 10 namespaced workload/network/config resource kinds into `snap`.
-pub fn fetch_workloads_into_snapshot(project: &Project, cfg: &KubeConfigState, snap: &mut ClusterSnapshot) {
+pub fn fetch_workloads_into_snapshot(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+) {
     let mut res_args = cfg.base_args(true);
     res_args.extend([
         "get".into(),
@@ -2174,7 +2576,11 @@ pub fn fetch_workloads_into_snapshot(project: &Project, cfg: &KubeConfigState, s
     ]);
     cfg.push_scope_flags(&mut res_args);
     if cfg.all_namespaces {
-        res_args.extend(["-o".into(), CUSTOM_COLUMNS_SPEC.into(), "--no-headers".into()]);
+        res_args.extend([
+            "-o".into(),
+            CUSTOM_COLUMNS_SPEC.into(),
+            "--no-headers".into(),
+        ]);
     } else {
         res_args.extend(["-o".into(), "json".into()]);
     }
@@ -2182,12 +2588,17 @@ pub fn fetch_workloads_into_snapshot(project: &Project, cfg: &KubeConfigState, s
         Ok(out) if out.status == Some(0) => {
             snap.connected = true;
             snap.error = None;
-            snap.resources
-                .retain(|r| matches!(r.kind.as_str(), "Namespace" | "Node" | "CustomResourceDefinition" | "Secret"));
+            snap.resources.retain(|r| {
+                matches!(
+                    r.kind.as_str(),
+                    "Namespace" | "Node" | "CustomResourceDefinition" | "Secret"
+                )
+            });
             if out.stdout.trim_start().starts_with('{') {
                 snap.resources.extend(parse_resource_list_json(&out.stdout));
             } else {
-                snap.resources.extend(parse_custom_columns_resources(&out.stdout));
+                snap.resources
+                    .extend(parse_custom_columns_resources(&out.stdout));
             }
             enrich_pod_metrics(project, cfg, snap);
         }
@@ -2251,9 +2662,25 @@ pub fn fetch_category_into_snapshot(
     snap: &mut ClusterSnapshot,
     category: &str,
 ) {
+    fetch_category_with_options(project, cfg, snap, category, FetchOptions::default());
+}
+
+pub fn fetch_category_with_options(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+    category: &str,
+    opts: FetchOptions,
+) {
+    let req_timeout = if opts.is_background_poll {
+        Some(3)
+    } else {
+        Some(15)
+    };
+    let started = std::time::Instant::now();
     match category {
         "Namespace" => fetch_namespaces_into_snapshot(project, cfg, snap),
-        "Node" => fetch_nodes_into_snapshot(project, cfg, snap),
+        "Node" => fetch_nodes_with_options(project, cfg, snap, opts),
         "CustomResourceDefinition" => fetch_crds_into_snapshot(project, cfg, snap),
         "Secret" => fetch_secrets_into_snapshot(project, cfg, snap),
         "Event" => fetch_events_into_snapshot(project, cfg, snap),
@@ -2265,7 +2692,11 @@ pub fn fetch_category_into_snapshot(
         "ClusterCatalog" | "Workspace" => {}
         kind if kind.starts_with("CR:") => {
             let crd_name = kind.strip_prefix("CR:").unwrap_or(kind);
-            if !snap.resources.iter().any(|r| r.kind == "CustomResourceDefinition") {
+            if !snap
+                .resources
+                .iter()
+                .any(|r| r.kind == "CustomResourceDefinition")
+            {
                 fetch_crds_into_snapshot(project, cfg, snap);
             }
             let is_cluster_scoped = snap
@@ -2278,17 +2709,36 @@ pub fn fetch_category_into_snapshot(
             if !is_cluster_scoped {
                 cfg.push_scope_flags(&mut cr_args);
             }
-            cr_args.extend(["-o".into(), CR_INSTANCE_COLUMNS_SPEC.into(), "--no-headers".into()]);
-            if let Ok(out) = run_kubectl(project, &cr_args, None)
+            cr_args.extend([
+                "-o".into(),
+                CR_INSTANCE_COLUMNS_SPEC.into(),
+                "--no-headers".into(),
+            ]);
+            if let Ok(out) = run_kubectl_timed(project, &cr_args, None, req_timeout)
                 && out.status == Some(0)
             {
                 snap.connected = true;
                 snap.error = None;
                 snap.resources.retain(|r| r.kind != kind);
-                snap.resources.extend(parse_cr_instance_lines(&out.stdout, crd_name));
+                snap.resources
+                    .extend(parse_cr_instance_lines(&out.stdout, crd_name));
             }
         }
         kind => {
+            let prev_pod_metrics: BTreeMap<(String, String), (String, String)> = if kind == "Pod" {
+                snap.resources
+                    .iter()
+                    .filter(|r| r.kind == "Pod" && (!r.cpu.is_empty() || !r.memory.is_empty()))
+                    .map(|r| {
+                        (
+                            (r.namespace.clone(), r.name.clone()),
+                            (r.cpu.clone(), r.memory.clone()),
+                        )
+                    })
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
             let (kubectl_type, cluster_scoped, prefer_json_in_all_ns) = kubectl_resource_info(kind);
             let mut res_args = cfg.base_args(!cluster_scoped);
             res_args.extend(["get".into(), kubectl_type.into()]);
@@ -2296,11 +2746,15 @@ pub fn fetch_category_into_snapshot(
                 cfg.push_scope_flags(&mut res_args);
             }
             if cfg.all_namespaces && !cluster_scoped && !prefer_json_in_all_ns {
-                res_args.extend(["-o".into(), CUSTOM_COLUMNS_SPEC.into(), "--no-headers".into()]);
+                res_args.extend([
+                    "-o".into(),
+                    CUSTOM_COLUMNS_SPEC.into(),
+                    "--no-headers".into(),
+                ]);
             } else {
                 res_args.extend(["-o".into(), "json".into()]);
             }
-            match run_kubectl(project, &res_args, None) {
+            match run_kubectl_timed(project, &res_args, None, req_timeout) {
                 Ok(out) if out.status == Some(0) => {
                     snap.connected = true;
                     snap.error = None;
@@ -2308,7 +2762,8 @@ pub fn fetch_category_into_snapshot(
                     if out.stdout.trim_start().starts_with('{') {
                         snap.resources.extend(parse_resource_list_json(&out.stdout));
                     } else {
-                        snap.resources.extend(parse_custom_columns_resources(&out.stdout));
+                        snap.resources
+                            .extend(parse_custom_columns_resources(&out.stdout));
                     }
                     if kind == "Pod" {
                         let finished_debuggers: Vec<(String, String)> = snap
@@ -2316,12 +2771,16 @@ pub fn fetch_category_into_snapshot(
                             .iter()
                             .filter(|r| {
                                 r.kind == "Pod"
-                                    && (r.name.starts_with("node-debugger-") || r.name.starts_with("node-dbg-watch-"))
-                                    && matches!(r.status.as_str(), "Succeeded" | "Completed" | "Failed")
+                                    && (r.name.starts_with("node-debugger-")
+                                        || r.name.starts_with("node-dbg-watch-"))
+                                    && matches!(
+                                        r.status.as_str(),
+                                        "Succeeded" | "Completed" | "Failed"
+                                    )
                             })
                             .map(|r| (r.namespace.clone(), r.name.clone()))
                             .collect();
-                        if !finished_debuggers.is_empty() {
+                        if !finished_debuggers.is_empty() && !opts.is_background_poll {
                             for (ns, name) in &finished_debuggers {
                                 let _ = delete_cluster_resource(project, cfg, "Pod", ns, name);
                             }
@@ -2330,27 +2789,59 @@ pub fn fetch_category_into_snapshot(
                             !(r.kind == "Pod"
                                 && (r.name.starts_with("node-dbg-watch-")
                                     || (r.name.starts_with("node-debugger-")
-                                        && matches!(r.status.as_str(), "Succeeded" | "Completed" | "Failed"))))
+                                        && matches!(
+                                            r.status.as_str(),
+                                            "Succeeded" | "Completed" | "Failed"
+                                        ))))
                         });
-                        enrich_pod_metrics(project, cfg, snap);
+                        let pod_cnt = snap.resources.iter().filter(|r| r.kind == "Pod").count();
+                        let allow_metrics = opts.include_metrics
+                            && (!opts.is_background_poll
+                                || (pod_cnt <= 300
+                                    && started.elapsed() < std::time::Duration::from_millis(1200)));
+                        if allow_metrics {
+                            enrich_pod_metrics(project, cfg, snap);
+                        } else if !prev_pod_metrics.is_empty() {
+                            for r in snap.resources.iter_mut().filter(|r| r.kind == "Pod") {
+                                if let Some((cpu, mem)) =
+                                    prev_pod_metrics.get(&(r.namespace.clone(), r.name.clone()))
+                                {
+                                    r.cpu = cpu.clone();
+                                    r.memory = mem.clone();
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(out) => {
                     snap.error = Some(first_line_or(&out.stderr, "kubectl get resources failed"));
                 }
                 Err(e) => {
-                    if cfg.all_namespaces && !cluster_scoped && prefer_json_in_all_ns {
+                    if !opts.is_background_poll
+                        && cfg.all_namespaces
+                        && !cluster_scoped
+                        && prefer_json_in_all_ns
+                    {
                         let mut fallback_args = cfg.base_args(true);
-                        fallback_args.extend(["get".into(), kubectl_type.into(), "--all-namespaces".into()]);
-                        fallback_args.extend(["-o".into(), CUSTOM_COLUMNS_SPEC.into(), "--no-headers".into()]);
-                        if let Ok(out) = run_kubectl(project, &fallback_args, None)
+                        fallback_args.extend([
+                            "get".into(),
+                            kubectl_type.into(),
+                            "--all-namespaces".into(),
+                        ]);
+                        fallback_args.extend([
+                            "-o".into(),
+                            CUSTOM_COLUMNS_SPEC.into(),
+                            "--no-headers".into(),
+                        ]);
+                        if let Ok(out) = run_kubectl_timed(project, &fallback_args, None, Some(15))
                             && out.status == Some(0)
                         {
                             snap.connected = true;
                             snap.error = None;
                             snap.resources.retain(|r| r.kind != kind);
-                            snap.resources.extend(parse_custom_columns_resources(&out.stdout));
-                            if kind == "Pod" {
+                            snap.resources
+                                .extend(parse_custom_columns_resources(&out.stdout));
+                            if kind == "Pod" && opts.include_metrics {
                                 enrich_pod_metrics(project, cfg, snap);
                             }
                             return;
@@ -2393,7 +2884,11 @@ pub fn fetch_cluster_snapshot(project: &Project, cfg: &mut KubeConfigState) -> C
                 cfg.namespace = ns.clone();
                 let _ = storage::set("namespace", &ns);
             }
-            snap.current_context = if cfg.context.is_empty() { current_ctx } else { cfg.context.clone() };
+            snap.current_context = if cfg.context.is_empty() {
+                current_ctx
+            } else {
+                cfg.context.clone()
+            };
             snap.contexts = contexts;
             snap.cluster_catalog = catalog;
             snap.current_namespace = cfg.namespace.clone();
@@ -2446,7 +2941,10 @@ pub fn fetch_pod_logs(
     args.push("--timestamps=true".into());
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, "kubectl logs failed")));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            "kubectl logs failed",
+        )));
     }
     Ok(out.stdout)
 }
@@ -2461,21 +2959,45 @@ pub fn inspect_cluster_resource(
     as_yaml: bool,
 ) -> Result<String, Error> {
     if kind == "HelmRelease" {
-        return fetch_helm_release_detail(project, cfg, namespace, name, if as_yaml { "manifest" } else { "all" });
+        return fetch_helm_release_detail(
+            project,
+            cfg,
+            namespace,
+            name,
+            if as_yaml { "manifest" } else { "all" },
+        );
     }
-    let target_type = kind.strip_prefix("CR:").unwrap_or(kind).to_ascii_lowercase();
-    let (_, cluster_scoped, _) =
-        if kind.starts_with("CR:") { ("cr", namespace.is_empty(), false) } else { kubectl_resource_info(kind) };
-    let mut args =
-        if cluster_scoped || namespace.is_empty() { cfg.base_args(false) } else { cfg.target_args(Some(namespace)) };
+    let target_type = kind
+        .strip_prefix("CR:")
+        .unwrap_or(kind)
+        .to_ascii_lowercase();
+    let (_, cluster_scoped, _) = if kind.starts_with("CR:") {
+        ("cr", namespace.is_empty(), false)
+    } else {
+        kubectl_resource_info(kind)
+    };
+    let mut args = if cluster_scoped || namespace.is_empty() {
+        cfg.base_args(false)
+    } else {
+        cfg.target_args(Some(namespace))
+    };
     if as_yaml {
-        args.extend(["get".into(), target_type, name.to_owned(), "-o".into(), "yaml".into()]);
+        args.extend([
+            "get".into(),
+            target_type,
+            name.to_owned(),
+            "-o".into(),
+            "yaml".into(),
+        ]);
     } else {
         args.extend(["describe".into(), target_type, name.to_owned()]);
     }
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, "kubectl resource query failed")));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            "kubectl resource query failed",
+        )));
     }
     Ok(out.stdout)
 }
@@ -2510,7 +3032,13 @@ pub fn inspect_cluster_resource_json(
             .unwrap_or_else(|| json!({}));
 
         let mut val_args = base;
-        val_args.extend(["get".into(), "values".into(), name.to_owned(), "-o".into(), "json".into()]);
+        val_args.extend([
+            "get".into(),
+            "values".into(),
+            name.to_owned(),
+            "-o".into(),
+            "json".into(),
+        ]);
         let values_json: Value = project
             .run_process("helm", &val_args, None)
             .ok()
@@ -2523,10 +3051,22 @@ pub fn inspect_cluster_resource_json(
             .or_else(|| status_json.pointer("/info/first_deployed"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        let notes = status_json.pointer("/info/notes").and_then(Value::as_str).unwrap_or("");
-        let description = status_json.pointer("/info/description").and_then(Value::as_str).unwrap_or("");
-        let status_str = status_json.pointer("/info/status").and_then(Value::as_str).unwrap_or("deployed");
-        let version = status_json.get("version").and_then(Value::as_u64).unwrap_or(1);
+        let notes = status_json
+            .pointer("/info/notes")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let description = status_json
+            .pointer("/info/description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let status_str = status_json
+            .pointer("/info/status")
+            .and_then(Value::as_str)
+            .unwrap_or("deployed");
+        let version = status_json
+            .get("version")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
 
         let wrapped = json!({
             "kind": "HelmRelease",
@@ -2545,15 +3085,33 @@ pub fn inspect_cluster_resource_json(
         });
         return Ok(wrapped.to_string());
     }
-    let target_type = kind.strip_prefix("CR:").unwrap_or(kind).to_ascii_lowercase();
-    let (_, cluster_scoped, _) =
-        if kind.starts_with("CR:") { ("cr", namespace.is_empty(), false) } else { kubectl_resource_info(kind) };
-    let mut args =
-        if cluster_scoped || namespace.is_empty() { cfg.base_args(false) } else { cfg.target_args(Some(namespace)) };
-    args.extend(["get".into(), target_type, name.to_owned(), "-o".into(), "json".into()]);
+    let target_type = kind
+        .strip_prefix("CR:")
+        .unwrap_or(kind)
+        .to_ascii_lowercase();
+    let (_, cluster_scoped, _) = if kind.starts_with("CR:") {
+        ("cr", namespace.is_empty(), false)
+    } else {
+        kubectl_resource_info(kind)
+    };
+    let mut args = if cluster_scoped || namespace.is_empty() {
+        cfg.base_args(false)
+    } else {
+        cfg.target_args(Some(namespace))
+    };
+    args.extend([
+        "get".into(),
+        target_type,
+        name.to_owned(),
+        "-o".into(),
+        "json".into(),
+    ]);
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, "kubectl get resource json failed")));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            "kubectl get resource json failed",
+        )));
     }
     Ok(out.stdout)
 }
@@ -2608,7 +3166,10 @@ pub fn fetch_resource_extras(
                         let ns = cols[0].to_owned();
                         let pname = cols[1].to_owned();
                         let raw_cpu = cols[2];
-                        let cpu = if let Some(m) = raw_cpu.strip_suffix('m').and_then(|v| v.parse::<f64>().ok()) {
+                        let cpu = if let Some(m) = raw_cpu
+                            .strip_suffix('m')
+                            .and_then(|v| v.parse::<f64>().ok())
+                        {
                             format!("{:.3}", m / 1000.0)
                         } else {
                             raw_cpu.to_owned()
@@ -2617,33 +3178,51 @@ pub fn fetch_resource_extras(
                     }
                 }
                 for pod in &mut related_pods {
-                    if let Some((cpu, mem)) = metrics.get(&(pod.namespace.clone(), pod.name.clone())) {
+                    if let Some((cpu, mem)) =
+                        metrics.get(&(pod.namespace.clone(), pod.name.clone()))
+                    {
                         pod.cpu = cpu.clone();
                         pod.memory = mem.clone();
                     }
                 }
             }
         }
-    } else if matches!(kind, "Deployment" | "DaemonSet" | "StatefulSet" | "ReplicaSet" | "Job") && !namespace.is_empty()
+    } else if matches!(
+        kind,
+        "Deployment" | "DaemonSet" | "StatefulSet" | "ReplicaSet" | "Job"
+    ) && !namespace.is_empty()
     {
         if let Ok(parsed) = serde_json::from_str::<Value>(raw_json) {
             let selector = parsed
                 .pointer("/spec/selector/matchLabels")
                 .and_then(Value::as_object)
                 .map(|m| {
-                    m.iter().filter_map(|(k, v)| v.as_str().map(|vs| format!("{k}={vs}"))).collect::<Vec<_>>().join(",")
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|vs| format!("{k}={vs}")))
+                        .collect::<Vec<_>>()
+                        .join(",")
                 })
                 .unwrap_or_default();
             if !selector.is_empty() {
                 let mut p_args = cfg.target_args(Some(namespace));
-                p_args.extend(["get".into(), "pods".into(), "-l".into(), selector.clone(), "-o".into(), "json".into()]);
+                p_args.extend([
+                    "get".into(),
+                    "pods".into(),
+                    "-l".into(),
+                    selector.clone(),
+                    "-o".into(),
+                    "json".into(),
+                ]);
                 if let Ok(out) = run_kubectl(project, &p_args, None)
                     && out.status == Some(0)
                 {
                     let all_pods = parse_resource_list_json(&out.stdout);
                     if matches!(kind, "ReplicaSet" | "Job") {
-                        let owned: Vec<ClusterResource> =
-                            all_pods.iter().filter(|p| p.controlled_by_name == name).cloned().collect();
+                        let owned: Vec<ClusterResource> = all_pods
+                            .iter()
+                            .filter(|p| p.controlled_by_name == name)
+                            .cloned()
+                            .collect();
                         related_pods = if owned.is_empty() { all_pods } else { owned };
                     } else {
                         related_pods = all_pods;
@@ -2651,7 +3230,13 @@ pub fn fetch_resource_extras(
                 }
                 if !related_pods.is_empty() {
                     let mut t_args = cfg.target_args(Some(namespace));
-                    t_args.extend(["top".into(), "pods".into(), "-l".into(), selector.clone(), "--no-headers".into()]);
+                    t_args.extend([
+                        "top".into(),
+                        "pods".into(),
+                        "-l".into(),
+                        selector.clone(),
+                        "--no-headers".into(),
+                    ]);
                     if let Ok(out) = run_kubectl(project, &t_args, None)
                         && out.status == Some(0)
                     {
@@ -2661,7 +3246,9 @@ pub fn fetch_resource_extras(
                             if cols.len() >= 3 {
                                 let pname = cols[0].to_owned();
                                 let raw_cpu = cols[1];
-                                let cpu = if let Some(m) = raw_cpu.strip_suffix('m').and_then(|v| v.parse::<f64>().ok())
+                                let cpu = if let Some(m) = raw_cpu
+                                    .strip_suffix('m')
+                                    .and_then(|v| v.parse::<f64>().ok())
                                 {
                                     format!("{:.3}", m / 1000.0)
                                 } else {
@@ -2680,13 +3267,23 @@ pub fn fetch_resource_extras(
                 }
                 if kind == "Deployment" {
                     let mut rs_args = cfg.target_args(Some(namespace));
-                    rs_args.extend(["get".into(), "rs".into(), "-l".into(), selector, "-o".into(), "json".into()]);
+                    rs_args.extend([
+                        "get".into(),
+                        "rs".into(),
+                        "-l".into(),
+                        selector,
+                        "-o".into(),
+                        "json".into(),
+                    ]);
                     if let Ok(out) = run_kubectl(project, &rs_args, None)
                         && out.status == Some(0)
                     {
                         let all_rs = parse_resource_list_json(&out.stdout);
-                        let owned: Vec<ClusterResource> =
-                            all_rs.iter().filter(|r| r.controlled_by_name == name).cloned().collect();
+                        let owned: Vec<ClusterResource> = all_rs
+                            .iter()
+                            .filter(|r| r.controlled_by_name == name)
+                            .cloned()
+                            .collect();
                         related_resources = if owned.is_empty() { all_rs } else { owned };
                     }
                 }
@@ -2698,8 +3295,10 @@ pub fn fetch_resource_extras(
         if let Ok(out) = run_kubectl(project, &j_args, None)
             && out.status == Some(0)
         {
-            related_resources =
-                parse_resource_list_json(&out.stdout).into_iter().filter(|r| r.controlled_by_name == name).collect();
+            related_resources = parse_resource_list_json(&out.stdout)
+                .into_iter()
+                .filter(|r| r.controlled_by_name == name)
+                .collect();
         }
     } else if kind == "StorageClass" {
         let mut pv_args = cfg.base_args(false);
@@ -2714,7 +3313,12 @@ pub fn fetch_resource_extras(
         }
     } else if kind == "Namespace" {
         let mut rq_args = cfg.target_args(Some(name));
-        rq_args.extend(["get".into(), "resourcequotas,limitranges".into(), "-o".into(), "json".into()]);
+        rq_args.extend([
+            "get".into(),
+            "resourcequotas,limitranges".into(),
+            "-o".into(),
+            "json".into(),
+        ]);
         if let Ok(out) = run_kubectl(project, &rq_args, None)
             && out.status == Some(0)
         {
@@ -2773,7 +3377,10 @@ pub fn fetch_resource_extras(
                         if cols.len() >= 3 {
                             let pname = cols[0].to_owned();
                             let raw_cpu = cols[1];
-                            let cpu = if let Some(m) = raw_cpu.strip_suffix('m').and_then(|v| v.parse::<f64>().ok()) {
+                            let cpu = if let Some(m) = raw_cpu
+                                .strip_suffix('m')
+                                .and_then(|v| v.parse::<f64>().ok())
+                            {
                                 format!("{:.3}", m / 1000.0)
                             } else {
                                 raw_cpu.to_owned()
@@ -2916,7 +3523,10 @@ pub fn open_exec_or_debug_terminal(
                     "Container '{cname}' in pod '{pod}' does not have a shell (/bin/sh). Please choose 'Debug Shell (busybox:latest)' or 'Debug Shell ({custom_img})' from the Shell (>_) menu."
                 )));
             }
-            return Err(Error::Failed(first_line_or(&raw_msg, "kubectl exec failed")));
+            return Err(Error::Failed(first_line_or(
+                &raw_msg,
+                "kubectl exec failed",
+            )));
         }
     }
     open_exec_terminal(cfg, namespace, pod, container)
@@ -2973,7 +3583,10 @@ pub fn open_debug_terminal(
         ]);
         let out = run_kubectl(proj, &create_args, None)?;
         if out.status != Some(0) {
-            return Err(Error::Failed(first_line_or(&out.stderr, "kubectl debug failed")));
+            return Err(Error::Failed(first_line_or(
+                &out.stderr,
+                "kubectl debug failed",
+            )));
         }
 
         // Wait until the ephemeral container is running and read its containerID + nodeName
@@ -2981,7 +3594,13 @@ pub fn open_debug_terminal(
         let mut cid = String::new();
         for _ in 0..30 {
             let mut get_args = cfg.target_args(Some(namespace));
-            get_args.extend(["get".into(), "pod".into(), pod.to_owned(), "-o".into(), "json".into()]);
+            get_args.extend([
+                "get".into(),
+                "pod".into(),
+                pod.to_owned(),
+                "-o".into(),
+                "json".into(),
+            ]);
             if let Ok(gout) = run_kubectl(proj, &get_args, None)
                 && gout.status == Some(0)
                 && let Ok(v) = serde_json::from_str::<Value>(&gout.stdout)
@@ -2993,7 +3612,10 @@ pub fn open_debug_terminal(
                         .unwrap_or("")
                         .to_owned();
                 }
-                if let Some(arr) = v.pointer("/status/ephemeralContainerStatuses").and_then(Value::as_array) {
+                if let Some(arr) = v
+                    .pointer("/status/ephemeralContainerStatuses")
+                    .and_then(Value::as_array)
+                {
                     for ecs in arr {
                         if ecs.get("name").and_then(Value::as_str) == Some(dbg_name.as_str())
                             && ecs.pointer("/state/running").is_some()
@@ -3014,7 +3636,7 @@ pub fn open_debug_terminal(
                     break;
                 }
             }
-            std::thread::sleep( std::time::Duration::from_millis(250));
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
 
         // Launch a self-deleting node watcher pod that monitors containerd's open -stdout FIFOs for `cid`
@@ -3106,7 +3728,12 @@ pub fn open_debug_terminal(
     }
 
     let mut args = cfg.target_args(Some(namespace));
-    args.extend(["debug".into(), "-it".into(), pod.to_owned(), format!("--image={debug_image}")]);
+    args.extend([
+        "debug".into(),
+        "-it".into(),
+        pod.to_owned(),
+        format!("--image={debug_image}"),
+    ]);
     if let Some(c) = container.filter(|c| !c.is_empty()) {
         args.push(format!("--target={c}"));
     }
@@ -3135,7 +3762,10 @@ pub fn open_node_shell_terminal(
     } else {
         cfg.debugger_image.trim()
     };
-    let shell_mode = mode.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("host");
+    let shell_mode = mode
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("host");
     let image = match shell_mode {
         "host" | "busybox" | "busybox:latest" => "busybox:latest",
         "custom" => custom_default,
@@ -3143,11 +3773,21 @@ pub fn open_node_shell_terminal(
     };
     let sanitized: String = node
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_owned();
-    let suffix = if sanitized.len() > 42 { &sanitized[..42] } else { &sanitized };
+    let suffix = if sanitized.len() > 42 {
+        &sanitized[..42]
+    } else {
+        &sanitized
+    };
     let pod_name = format!("node-debugger-{suffix}");
 
     if let Some(proj) = project {
@@ -3241,7 +3881,10 @@ pub fn open_node_shell_terminal(
         apply_args.extend(["apply".into(), "-f".into(), "-".into()]);
         let out = run_kubectl(proj, &apply_args, Some(&manifest.to_string()))?;
         if out.status != Some(0) {
-            return Err(Error::Failed(first_line_or(&out.stderr, "failed to create node-debugger pod")));
+            return Err(Error::Failed(first_line_or(
+                &out.stderr,
+                "failed to create node-debugger pod",
+            )));
         }
 
         let mut wait_args = cfg.target_args(Some("default"));
@@ -3289,7 +3932,11 @@ pub fn exec_pod_command(
     command: &str,
     cwd: &str,
 ) -> Value {
-    let start_dir = if cwd.trim().is_empty() { "/" } else { cwd.trim() };
+    let start_dir = if cwd.trim().is_empty() {
+        "/"
+    } else {
+        cwd.trim()
+    };
     let wrapped = format!(
         "cd '{}' 2>/dev/null; {}; printf '\\n__OPENIDEA_PWD__:%s' \"$(pwd 2>/dev/null || echo '{}')\"",
         start_dir.replace('\'', "'\\''"),
@@ -3312,7 +3959,8 @@ pub fn exec_pod_command(
                 || out.stderr.contains("no such file or directory") && out.stdout.is_empty();
             if no_shell {
                 // Distroless container fallback: try running the command directly without `/bin/sh -c`
-                let direct_tokens: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+                let direct_tokens: Vec<String> =
+                    command.split_whitespace().map(str::to_owned).collect();
                 if !direct_tokens.is_empty() && !command.contains("&&") && !command.contains(';') {
                     let mut d_args = cfg.target_args(Some(namespace));
                     d_args.push("exec".into());
@@ -3405,20 +4053,31 @@ pub fn open_port_forward_terminal(
 ) -> Result<(), Error> {
     let mut args = cfg.target_args(Some(namespace));
     args.push("port-forward".into());
-    let addr = address.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("localhost");
+    let addr = address
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("localhost");
     if addr != "localhost" && addr != "127.0.0.1" {
         args.push(format!("--address={addr}"));
     }
     let resource_target = format!("{}/{name}", kind.to_ascii_lowercase());
     args.push(resource_target);
 
-    let target_port = if port_spec.trim().is_empty() { "8080" } else { port_spec.trim() };
+    let target_port = if port_spec.trim().is_empty() {
+        "8080"
+    } else {
+        port_spec.trim()
+    };
     let clean_local = local_port
         .map(str::trim)
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("random") && *s != "0");
 
     let (mapping, resolved_local_port): (String, Option<String>) = if target_port.contains(':') {
-        let lp = target_port.split(':').next().filter(|s| !s.is_empty()).map(str::to_owned);
+        let lp = target_port
+            .split(':')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         (target_port.to_owned(), lp)
     } else if let Some(lp) = clean_local {
         (format!("{lp}:{target_port}"), Some(lp.to_owned()))
@@ -3434,11 +4093,13 @@ pub fn open_port_forward_terminal(
     };
 
     args.push(mapping.clone());
-    host::open_terminal(&format!("Port Forward: {name} ({mapping})"), "kubectl", &args)?;
+    host::open_terminal(
+        &format!("Port Forward: {name} ({mapping})"),
+        "kubectl",
+        &args,
+    )?;
 
-    if open_in_browser
-        && let Some(lp) = resolved_local_port
-    {
+    if open_in_browser && let Some(lp) = resolved_local_port {
         let scheme = if https { "https" } else { "http" };
         let first_host = addr
             .split(',')
@@ -3461,10 +4122,17 @@ pub fn scale_workload(
     replicas: u32,
 ) -> Result<String, Error> {
     let mut args = cfg.target_args(Some(namespace));
-    args.extend(["scale".into(), format!("{}/{name}", kind.to_ascii_lowercase()), format!("--replicas={replicas}")]);
+    args.extend([
+        "scale".into(),
+        format!("{}/{name}", kind.to_ascii_lowercase()),
+        format!("--replicas={replicas}"),
+    ]);
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, "kubectl scale failed")));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            "kubectl scale failed",
+        )));
     }
     Ok(out.stdout.trim().to_owned())
 }
@@ -3478,10 +4146,17 @@ pub fn rollout_restart(
     name: &str,
 ) -> Result<String, Error> {
     let mut args = cfg.target_args(Some(namespace));
-    args.extend(["rollout".into(), "restart".into(), format!("{}/{name}", kind.to_ascii_lowercase())]);
+    args.extend([
+        "rollout".into(),
+        "restart".into(),
+        format!("{}/{name}", kind.to_ascii_lowercase()),
+    ]);
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, "kubectl rollout restart failed")));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            "kubectl rollout restart failed",
+        )));
     }
     Ok(out.stdout.trim().to_owned())
 }
@@ -3521,41 +4196,81 @@ pub fn delete_cluster_resource_opts(
         args.extend(["uninstall".into(), name.to_owned()]);
         let out = project.run_process("helm", &args, None)?;
         if out.status != Some(0) {
-            return Err(Error::Failed(first_line_or(&out.stderr, "helm uninstall failed")));
+            return Err(Error::Failed(first_line_or(
+                &out.stderr,
+                "helm uninstall failed",
+            )));
         }
         return Ok(out.stdout.trim().to_owned());
     }
-    let target_type = kind.strip_prefix("CR:").unwrap_or(kind).to_ascii_lowercase();
-    let (_, cluster_scoped, _) =
-        if kind.starts_with("CR:") { ("cr", namespace.is_empty(), false) } else { kubectl_resource_info(kind) };
-    let mut args =
-        if cluster_scoped || namespace.is_empty() { cfg.base_args(false) } else { cfg.target_args(Some(namespace)) };
-    args.extend(["delete".into(), target_type, name.to_owned(), "--wait=false".into()]);
+    let target_type = kind
+        .strip_prefix("CR:")
+        .unwrap_or(kind)
+        .to_ascii_lowercase();
+    let (_, cluster_scoped, _) = if kind.starts_with("CR:") {
+        ("cr", namespace.is_empty(), false)
+    } else {
+        kubectl_resource_info(kind)
+    };
+    let mut args = if cluster_scoped || namespace.is_empty() {
+        cfg.base_args(false)
+    } else {
+        cfg.target_args(Some(namespace))
+    };
+    args.extend([
+        "delete".into(),
+        target_type,
+        name.to_owned(),
+        "--wait=false".into(),
+    ]);
     if force {
         args.extend(["--force".into(), "--grace-period=0".into()]);
     }
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, "kubectl delete failed")));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            "kubectl delete failed",
+        )));
     }
     Ok(out.stdout.trim().to_owned())
 }
 
 /// Triggers a manual Job from a CronJob (`kubectl create job --from=cronjob/<name> <name>-manual`).
-pub fn trigger_cronjob(project: &Project, cfg: &KubeConfigState, namespace: &str, name: &str) -> Result<String, Error> {
+pub fn trigger_cronjob(
+    project: &Project,
+    cfg: &KubeConfigState,
+    namespace: &str,
+    name: &str,
+) -> Result<String, Error> {
     let mut args = cfg.target_args(Some(namespace));
     let job_name = format!("{name}-manual");
     let _ = run_kubectl(
         project,
-        &[cfg.target_args(Some(namespace)), vec!["delete".into(), "job".into(), job_name.clone()]].concat(),
+        &[
+            cfg.target_args(Some(namespace)),
+            vec!["delete".into(), "job".into(), job_name.clone()],
+        ]
+        .concat(),
         None,
     );
-    args.extend(["create".into(), "job".into(), format!("--from=cronjob/{name}"), job_name]);
+    args.extend([
+        "create".into(),
+        "job".into(),
+        format!("--from=cronjob/{name}"),
+        job_name,
+    ]);
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, "kubectl create job --from=cronjob failed")));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            "kubectl create job --from=cronjob failed",
+        )));
     }
-    Ok(first_line_or(&out.stdout, &format!("Triggered job from cronjob/{name}")))
+    Ok(first_line_or(
+        &out.stdout,
+        &format!("Triggered job from cronjob/{name}"),
+    ))
 }
 
 /// Suspends or resumes a CronJob (`kubectl patch cronjob <name> -p '{"spec":{"suspend":...}}'`).
@@ -3568,22 +4283,45 @@ pub fn suspend_cronjob(
 ) -> Result<String, Error> {
     let mut args = cfg.target_args(Some(namespace));
     let patch = format!("{{\"spec\":{{\"suspend\":{suspend}}}}}");
-    args.extend(["patch".into(), "cronjob".into(), name.to_owned(), "-p".into(), patch]);
+    args.extend([
+        "patch".into(),
+        "cronjob".into(),
+        name.to_owned(),
+        "-p".into(),
+        patch,
+    ]);
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, "kubectl patch cronjob failed")));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            "kubectl patch cronjob failed",
+        )));
     }
-    Ok(first_line_or(&out.stdout, &format!("cronjob/{name} {}", if suspend { "suspended" } else { "resumed" })))
+    Ok(first_line_or(
+        &out.stdout,
+        &format!(
+            "cronjob/{name} {}",
+            if suspend { "suspended" } else { "resumed" }
+        ),
+    ))
 }
 
 /// Cordons or uncordons a cluster Node (`kubectl cordon <node>` / `kubectl uncordon <node>`).
-pub fn cordon_node(project: &Project, cfg: &KubeConfigState, name: &str, uncordon: bool) -> Result<String, Error> {
+pub fn cordon_node(
+    project: &Project,
+    cfg: &KubeConfigState,
+    name: &str,
+    uncordon: bool,
+) -> Result<String, Error> {
     let mut args = cfg.base_args(false);
     let op = if uncordon { "uncordon" } else { "cordon" };
     args.extend([op.into(), name.to_owned()]);
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, &format!("kubectl {op} failed"))));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            &format!("kubectl {op} failed"),
+        )));
     }
     Ok(first_line_or(&out.stdout, &format!("node/{name} {op}ed")))
 }
@@ -3601,7 +4339,10 @@ pub fn drain_node(project: &Project, cfg: &KubeConfigState, name: &str) -> Resul
     ]);
     let out = run_kubectl(project, &args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, "kubectl drain failed")));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            "kubectl drain failed",
+        )));
     }
     Ok(first_line_or(&out.stdout, &format!("node/{name} drained")))
 }
@@ -3619,7 +4360,12 @@ pub fn apply_or_diff_manifest(
             args.extend(["apply".into(), "-f".into(), "-".into()]);
         }
         "dry-run" => {
-            args.extend(["apply".into(), "--dry-run=client".into(), "-f".into(), "-".into()]);
+            args.extend([
+                "apply".into(),
+                "--dry-run=client".into(),
+                "-f".into(),
+                "-".into(),
+            ]);
         }
         "diff" => {
             args.extend(["diff".into(), "-f".into(), "-".into()]);
@@ -3635,11 +4381,17 @@ pub fn apply_or_diff_manifest(
         return match out.status {
             Some(0) => Ok("No differences between manifest and live cluster resource.".into()),
             Some(1) => Ok(out.stdout),
-            _ => Err(Error::Failed(first_line_or(&out.stderr, "kubectl diff failed"))),
+            _ => Err(Error::Failed(first_line_or(
+                &out.stderr,
+                "kubectl diff failed",
+            ))),
         };
     }
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, &format!("kubectl {subcommand} failed"))));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            &format!("kubectl {subcommand} failed"),
+        )));
     }
     Ok(out.stdout.trim().to_owned())
 }
@@ -3656,7 +4408,10 @@ pub fn build_kustomize(project: &Project, dir: &str) -> Result<String, Error> {
     let k_args = vec!["build".to_owned(), target.to_owned()];
     let out = project.run_process("kustomize", &k_args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, "kustomize build failed")));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            "kustomize build failed",
+        )));
     }
     Ok(out.stdout)
 }
@@ -3667,7 +4422,10 @@ pub fn render_helm_template(project: &Project, chart_dir: &str) -> Result<String
     let args = vec!["template".to_owned(), target.to_owned()];
     let out = project.run_process("helm", &args, None)?;
     if out.status != Some(0) {
-        return Err(Error::Failed(first_line_or(&out.stderr, "helm template failed")));
+        return Err(Error::Failed(first_line_or(
+            &out.stderr,
+            "helm template failed",
+        )));
     }
     Ok(out.stdout)
 }
@@ -3700,15 +4458,24 @@ pub fn fetch_helm_release_detail(
 }
 
 /// Summarizes workspace Kubernetes manifests for the tool window's "Workspace Manifests" section.
-pub fn workspace_manifests_json(files: &BTreeMap<String, crate::manifest::ParsedFile>, root: &str) -> Value {
+pub fn workspace_manifests_json(
+    files: &BTreeMap<String, crate::manifest::ParsedFile>,
+    root: &str,
+) -> Value {
     let norm_root = root.replace('\\', "/");
     let mut items = Vec::new();
     for (path, parsed) in files {
-        let rel = path.strip_prefix(&norm_root).map(|r| r.trim_start_matches('/')).unwrap_or(path);
+        let rel = path
+            .strip_prefix(&norm_root)
+            .map(|r| r.trim_start_matches('/'))
+            .unwrap_or(path);
         for doc in &parsed.docs {
             if let Some(ref kind) = doc.kind {
                 let name = doc.name.as_ref().map_or("(unnamed)", |n| n.value.as_str());
-                let ns = doc.namespace.as_ref().map_or("default", |n| n.value.as_str());
+                let ns = doc
+                    .namespace
+                    .as_ref()
+                    .map_or("default", |n| n.value.as_str());
                 let api = doc.api_version.as_ref().map_or("", |a| a.value.as_str());
                 items.push(json!({
                     "path": rel,
@@ -3726,5 +4493,9 @@ pub fn workspace_manifests_json(files: &BTreeMap<String, crate::manifest::Parsed
 }
 
 fn first_line_or(stderr: &str, fallback: &str) -> String {
-    stderr.lines().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_owned()).unwrap_or_else(|| fallback.to_owned())
+    stderr
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_owned())
+        .unwrap_or_else(|| fallback.to_owned())
 }
