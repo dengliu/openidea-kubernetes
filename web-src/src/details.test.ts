@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyWatchDeltaToSnapshot,
   computePollDelayMs,
   computeVirtualWindow,
   formatCompactAge,
@@ -89,6 +90,105 @@ describe("ResourceDetails helpers", () => {
     );
     expect(appended.subheaderText).toBe("300 of 133,948 loaded");
     expect(appended.isAppend).toBe(true);
+  });
+
+  it("applies watch-delta upserts and deletions in place while preserving cached CPU/Memory metrics", () => {
+    const base = {
+      connected: true,
+      current_context: "falcon-phx-ca",
+      contexts: ["falcon-phx-ca"],
+      cluster_catalog: [],
+      current_namespace: "production",
+      all_namespaces: false,
+      namespaces: ["default", "production"],
+      resources: [
+        {
+          kind: "Pod",
+          name: "api-0",
+          namespace: "production",
+          status: "Running",
+          ready: "1/1",
+          age: "10m",
+          detail: "",
+          containers: ["web"],
+          ports: [],
+          data_keys: [],
+          cpu: "0.250",
+          memory: "512.0Mi",
+          restarts: 0,
+        },
+        {
+          kind: "Pod",
+          name: "old-job-0",
+          namespace: "production",
+          status: "Succeeded",
+          ready: "0/1",
+          age: "20m",
+          detail: "",
+          containers: ["job"],
+          ports: [],
+          data_keys: [],
+        },
+      ],
+      events: [],
+      helm_releases: [],
+      page_info: {
+        Pod: {
+          category: "Pod",
+          limit: 100,
+          continue_token: "",
+          loaded_count: 2,
+          page_index: 1,
+          mode: "replace",
+          resource_version: "1001",
+          watch_supported: true,
+        },
+      },
+      overview_counts: { Pod: 2 },
+    };
+
+    const next = applyWatchDeltaToSnapshot(base, {
+      category: "Pod",
+      upserts: [
+        {
+          kind: "Pod",
+          name: "api-0",
+          namespace: "production",
+          status: "CrashLoopBackOff",
+          ready: "0/1",
+          age: "11m",
+          detail: "",
+          containers: ["web"],
+          ports: [],
+          data_keys: [],
+          cpu: "",
+          memory: "",
+          restarts: 3,
+        },
+        {
+          kind: "Pod",
+          name: "api-1",
+          namespace: "production",
+          status: "Running",
+          ready: "1/1",
+          age: "2s",
+          detail: "",
+          containers: ["web"],
+          ports: [],
+          data_keys: [],
+          restarts: 0,
+        },
+      ],
+      deleted: [{ kind: "Pod", namespace: "production", name: "old-job-0" }],
+    });
+
+    expect(next.resources.map((r) => r.name)).toEqual(["api-0", "api-1"]);
+    expect(next.resources[0].status).toBe("CrashLoopBackOff");
+    expect(next.resources[0].restarts).toBe(3);
+    expect(next.resources[0].cpu).toBe("0.250");
+    expect(next.resources[0].memory).toBe("512.0Mi");
+    expect(next.overview_counts?.Pod).toBe(2);
+    expect(next.page_info?.Pod.loaded_count).toBe(2);
   });
 
   it("preserves server-side table multi-unit duration strings in formatCompactAge", () => {

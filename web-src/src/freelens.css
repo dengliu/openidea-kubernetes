@@ -1900,6 +1900,28 @@ body,
   cursor: pointer;
 }
 
+.fl-watch-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--fl-teal-text);
+  background: color-mix(in srgb, var(--fl-teal) 14%, var(--fl-bg));
+  border: 1px solid color-mix(in srgb, var(--fl-teal) 35%, var(--fl-border));
+  vertical-align: middle;
+}
+
+.fl-watch-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fl-teal);
+}
+
 .fl-drawer-pager {
   display: flex;
   align-items: center;

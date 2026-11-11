@@ -82,6 +82,8 @@ export interface CategoryPageInfo {
   loaded_count: number;
   page_index: number;
   mode: "replace" | "append" | string;
+  resource_version?: string;
+  watch_supported?: boolean;
 }
 
 export interface ClusterSnapshot {

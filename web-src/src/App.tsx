@@ -704,6 +704,111 @@ export function formatPaginationStatus(
   };
 }
 
+export function applyWatchDeltaToSnapshot(
+  prev: ClusterSnapshot,
+  delta: {
+    category?: string;
+    upserts?: ClusterResource[];
+    deleted?: Array<{ kind: string; namespace: string; name: string }>;
+    eventUpserts?: ClusterEvent[];
+  },
+): ClusterSnapshot {
+  const upserts = Array.isArray(delta.upserts) ? delta.upserts : [];
+  const deleted = Array.isArray(delta.deleted) ? delta.deleted : [];
+  const eventUpserts = Array.isArray(delta.eventUpserts) ? delta.eventUpserts : [];
+  if (upserts.length === 0 && deleted.length === 0 && eventUpserts.length === 0) {
+    return prev;
+  }
+
+  let nextResources = prev.resources || [];
+  let nextNamespaces = prev.namespaces || [];
+
+  if (upserts.length > 0 || deleted.length > 0) {
+    nextResources = nextResources.slice();
+    const deletedKeys = new Set(deleted.map((d) => `${d.kind}:${d.namespace || ""}/${d.name}`));
+    if (deletedKeys.size > 0) {
+      nextResources = nextResources.filter((r) => !deletedKeys.has(`${r.kind}:${r.namespace || ""}/${r.name}`));
+      const deletedNs = deleted.filter((d) => d.kind === "Namespace").map((d) => d.name);
+      if (deletedNs.length > 0) {
+        const delNsSet = new Set(deletedNs);
+        nextNamespaces = nextNamespaces.filter((n) => !delNsSet.has(n));
+      }
+    }
+
+    const idxByKey = new Map<string, number>();
+    nextResources.forEach((r, idx) => {
+      idxByKey.set(`${r.kind}:${r.namespace || ""}/${r.name}`, idx);
+    });
+
+    let nsChanged = false;
+    const nsCopy = nextNamespaces.slice();
+    for (const item of upserts) {
+      const key = `${item.kind}:${item.namespace || ""}/${item.name}`;
+      const existingIdx = idxByKey.get(key);
+      if (existingIdx !== undefined) {
+        const old = nextResources[existingIdx];
+        nextResources[existingIdx] = {
+          ...item,
+          cpu: item.cpu || old.cpu || "",
+          memory: item.memory || old.memory || "",
+        };
+      } else {
+        idxByKey.set(key, nextResources.length);
+        nextResources.push(item);
+      }
+      if (item.kind === "Namespace" && item.name && !nsCopy.includes(item.name)) {
+        nsCopy.push(item.name);
+        nsChanged = true;
+      }
+    }
+    if (nsChanged) {
+      nsCopy.sort();
+      nextNamespaces = nsCopy;
+    }
+  }
+
+  let nextEvents = prev.events || [];
+  if (eventUpserts.length > 0) {
+    nextEvents = nextEvents.slice();
+    for (const ev of eventUpserts) {
+      const idx = nextEvents.findIndex(
+        (e) => e.namespace === ev.namespace && e.object === ev.object && e.reason === ev.reason,
+      );
+      if (idx >= 0) {
+        nextEvents[idx] = ev;
+      } else {
+        if (nextEvents.length >= 2000) nextEvents.shift();
+        nextEvents.push(ev);
+      }
+    }
+  }
+
+  const nextCounts = { ...(prev.overview_counts || {}) };
+  const nextPageInfo = { ...(prev.page_info || {}) };
+  if (delta.category) {
+    const catCnt =
+      delta.category === "Event"
+        ? nextEvents.length
+        : nextResources.filter((r) => r.kind === delta.category).length;
+    nextCounts[delta.category] = catCnt;
+    if (nextPageInfo[delta.category]) {
+      nextPageInfo[delta.category] = {
+        ...nextPageInfo[delta.category],
+        loaded_count: catCnt,
+      };
+    }
+  }
+
+  return {
+    ...prev,
+    resources: nextResources,
+    namespaces: nextNamespaces,
+    events: nextEvents,
+    overview_counts: nextCounts,
+    page_info: nextPageInfo,
+  };
+}
+
 export function computePollDelayMs(durationMs: number, itemCount: number): number {
   if (durationMs >= 2000 || itemCount >= 1500) return 15000;
   if (durationMs >= 800 || itemCount >= 400) return 10000;
@@ -1075,6 +1180,11 @@ export function App() {
   const lastPollDurationMsRef = useRef<number>(0);
   const pollTickSeqRef = useRef<number>(0);
   const [pollTrigger, setPollTrigger] = useState<number>(0);
+  const watchInFlightSinceRef = useRef<number>(0);
+  const watchTickSeqRef = useRef<number>(0);
+  const [watchTrigger, setWatchTrigger] = useState<number>(0);
+  const [categoryWatching, setCategoryWatching] = useState<boolean>(false);
+  const [drawerWatching, setDrawerWatching] = useState<boolean>(false);
   const tableContainerRef = useRef<HTMLDivElement>(null);
   const [tableScrollTop, setTableScrollTop] = useState<number>(0);
   const [tableViewportHeight, setTableViewportHeight] = useState<number>(640);
@@ -1131,9 +1241,87 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  // Non-overlapping adaptive background category poll so slow large clusters never queue overlapping requests
+  const activeCategoryWatchEligible = Boolean(snapshot.page_info?.[activeKind]?.watch_supported);
+
+  // Stop the single-object Drawer watch stream immediately when the Drawer closes
   useEffect(() => {
-    if (!snapshot.connected || activeKind === "ClusterCatalog" || activeKind === "Workspace") return;
+    if (!drawerOpen) {
+      setDrawerWatching(false);
+      sendToBackend({ op: "stop-drawer-watch" });
+    }
+  }, [drawerOpen]);
+
+  // Fast 600ms non-overlapping watch-delta drainer whenever either:
+  //   1) the active category is watch-eligible (`totalItems <= 1,000`), OR
+  //   2) the Right Detail Drawer is open on a specific resource (`fieldSelector=metadata.name=...`)
+  useEffect(() => {
+    if (!snapshot.connected || activeKind === "ClusterCatalog" || activeKind === "Workspace") {
+      setCategoryWatching(false);
+      return;
+    }
+    const hasDrawerTarget = Boolean(drawerOpen && selectedRowKey);
+    if (!activeCategoryWatchEligible && !hasDrawerTarget) {
+      setCategoryWatching(false);
+      return;
+    }
+    const id = window.setTimeout(() => {
+      const now = Date.now();
+      if (watchInFlightSinceRef.current > 0 && now - watchInFlightSinceRef.current < 5000) {
+        setWatchTrigger((n) => (n + 1) % 1_000_000);
+        return;
+      }
+      if (document.visibilityState === "visible") {
+        let inspectKind: string | null = null;
+        let inspectNs: string | null = null;
+        let inspectName: string | null = null;
+        if (drawerOpen && selectedRowKey) {
+          const colonIdx = selectedRowKey.indexOf(":");
+          const slashIdx = selectedRowKey.indexOf("/", colonIdx + 1);
+          if (colonIdx > 0 && slashIdx > colonIdx) {
+            inspectKind = selectedRowKey.slice(0, colonIdx);
+            inspectNs = selectedRowKey.slice(colonIdx + 1, slashIdx);
+            inspectName = selectedRowKey.slice(slashIdx + 1);
+          }
+        }
+        watchInFlightSinceRef.current = now;
+        const seq = ++watchTickSeqRef.current;
+        const refreshMetrics = activeKind === "Pod" && activeCategoryWatchEligible && seq % 15 === 0;
+        sendToBackend({
+          op: "poll-watch",
+          category: activeKind,
+          inspectKind,
+          inspectNs,
+          inspectName,
+          refreshMetrics,
+        });
+      } else {
+        setWatchTrigger((n) => (n + 1) % 1_000_000);
+      }
+    }, 600);
+    return () => window.clearTimeout(id);
+  }, [
+    snapshot.connected,
+    snapshot.current_context,
+    snapshot.current_namespace,
+    snapshot.all_namespaces,
+    activeKind,
+    activeCategoryWatchEligible,
+    drawerOpen,
+    selectedRowKey,
+    watchTrigger,
+  ]);
+
+  // Non-overlapping adaptive background category poll for large (`> 1,000` item) paginated scopes
+  // or categories that do not use REST watch (`HelmRelease`, `CustomResourceDefinition`, Overviews).
+  useEffect(() => {
+    if (
+      !snapshot.connected ||
+      activeKind === "ClusterCatalog" ||
+      activeKind === "Workspace" ||
+      activeCategoryWatchEligible
+    ) {
+      return;
+    }
     const itemCount = (snapshot.resources || []).length;
     const delay = computePollDelayMs(lastPollDurationMsRef.current, itemCount);
     const id = window.setTimeout(() => {
@@ -1147,7 +1335,7 @@ export function App() {
         let inspectKind: string | null = null;
         let inspectNs: string | null = null;
         let inspectName: string | null = null;
-        if (drawerOpen && selectedRowKey) {
+        if (drawerOpen && selectedRowKey && !drawerWatching) {
           const colonIdx = selectedRowKey.indexOf(":");
           const slashIdx = selectedRowKey.indexOf("/", colonIdx + 1);
           if (colonIdx > 0 && slashIdx > colonIdx) {
@@ -1179,7 +1367,9 @@ export function App() {
     snapshot.all_namespaces,
     snapshot.resources.length,
     activeKind,
+    activeCategoryWatchEligible,
     drawerOpen,
+    drawerWatching,
     selectedRowKey,
     pollTrigger,
   ]);
@@ -1215,8 +1405,34 @@ export function App() {
           });
           return;
         }
+        if (m.op === "watch-delta") {
+          watchInFlightSinceRef.current = 0;
+          setCategoryWatching(Boolean(m.categoryWatching));
+          setDrawerWatching(Boolean(m.drawerWatching));
+          setSnapshot((prev) => applyWatchDeltaToSnapshot(prev, m));
+          if (m.drawerResource && typeof m.drawerResource.json === "string") {
+            try {
+              setDrawerJson(JSON.parse(m.drawerResource.json));
+            } catch {
+              // ignore malformed json
+            }
+          }
+          if (m.drawerDeleted) {
+            const delKey = `${m.drawerDeleted.kind}:${m.drawerDeleted.namespace || ""}/${m.drawerDeleted.name}`;
+            setSelectedRowKey((cur) => {
+              if (cur === delKey) {
+                setDrawerOpen(false);
+                return null;
+              }
+              return cur;
+            });
+          }
+          setWatchTrigger((n) => (n + 1) % 1_000_000);
+          return;
+        }
         if (m.op === "state") {
           pollInFlightSinceRef.current = 0;
+          watchInFlightSinceRef.current = 0;
           setPageLoading(false);
           if (typeof m.pollDurationMs === "number" && Number.isFinite(m.pollDurationMs)) {
             lastPollDurationMsRef.current = m.pollDurationMs;
@@ -1276,6 +1492,7 @@ export function App() {
             sendToBackend({ op: "load-category", category: "Pod", limit: pageSizeRef.current });
           }
         } else if (m.op === "resource-json") {
+          setDrawerWatching(Boolean(m.drawerWatching));
           try {
             setDrawerJson(JSON.parse(m.json));
           } catch {
@@ -2909,6 +3126,15 @@ export function App() {
                   : activeKind === "ClusterOverview" || activeKind === "WorkloadsOverview"
                     ? ""
                     : paginationStatus.subheaderText}
+            {activeCategoryWatchEligible && categoryWatching && (
+              <span
+                className="fl-watch-pill"
+                title="Live Kubernetes watch stream active (sub-second ADDED / MODIFIED / DELETED updates)"
+              >
+                <span className="fl-watch-dot" />
+                Live
+              </span>
+            )}
           </div>
           <div className="fl-subheader-controls">
             {activeKind !== "ClusterCatalog" &&
