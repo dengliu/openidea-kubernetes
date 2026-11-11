@@ -53,9 +53,9 @@ function parseKubeOrHelmTimestamp(raw?: string): number {
 }
 
 /** Converts an ISO timestamp (`2026-10-31T00:30:56Z`), Helm timestamp, or duration string (`6d22h`) into compact Freelens Age (`6d22h`, `20h`, `45m`). */
-function formatCompactAge(raw?: string): string {
+export function formatCompactAge(raw?: string): string {
   if (!raw) return "-";
-  if (/^\d+[smhd](\d+[smhd])?$/.test(raw.trim())) return raw.trim();
+  if (/^(?:\d+[smhd])+$/.test(raw.trim())) return raw.trim();
   const ts = parseKubeOrHelmTimestamp(raw);
   if (Number.isNaN(ts)) return raw;
   const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
@@ -580,6 +580,34 @@ function statusClass(status: string): "ok" | "warn" | "err" {
   return "ok";
 }
 
+export const VIRTUAL_ROW_HEIGHT = 37;
+export const VIRTUAL_OVERSCAN = 20;
+export const VIRTUAL_THRESHOLD = 100;
+const MAX_RENDERED_NAMESPACES = 200;
+
+export function computeVirtualWindow(
+  totalRows: number,
+  scrollTop: number,
+  viewportHeight: number,
+  rowHeight = VIRTUAL_ROW_HEIGHT,
+  overscan = VIRTUAL_OVERSCAN,
+): { start: number; end: number; topPadPx: number; bottomPadPx: number } {
+  if (totalRows <= VIRTUAL_THRESHOLD || rowHeight <= 0) {
+    return { start: 0, end: totalRows, topPadPx: 0, bottomPadPx: 0 };
+  }
+  const safeHeight = Math.max(200, viewportHeight || 600);
+  const firstVisible = Math.max(0, Math.floor(scrollTop / rowHeight));
+  const visibleCount = Math.ceil(safeHeight / rowHeight);
+  const start = Math.max(0, firstVisible - overscan);
+  const end = Math.min(totalRows, firstVisible + visibleCount + overscan);
+  return {
+    start,
+    end,
+    topPadPx: start * rowHeight,
+    bottomPadPx: Math.max(0, (totalRows - end) * rowHeight),
+  };
+}
+
 export function computePollDelayMs(durationMs: number, itemCount: number): number {
   if (durationMs >= 2000 || itemCount >= 1500) return 15000;
   if (durationMs >= 800 || itemCount >= 400) return 10000;
@@ -934,16 +962,38 @@ export function App() {
   const lastPollDurationMsRef = useRef<number>(0);
   const pollTickSeqRef = useRef<number>(0);
   const [pollTrigger, setPollTrigger] = useState<number>(0);
+  const tableContainerRef = useRef<HTMLDivElement>(null);
+  const [tableScrollTop, setTableScrollTop] = useState<number>(0);
+  const [tableViewportHeight, setTableViewportHeight] = useState<number>(640);
 
-  // Live 1-second Age ticker so relative ages ("12s", "1m", "2m") update continuously
+  // Throttled 15-second Age ticker so large clusters avoid re-reconciling every second
   useEffect(() => {
     const id = window.setInterval(() => {
       if (document.visibilityState === "visible") {
         setAgeTick((t) => (t + 1) % 1_000_000);
       }
-    }, 1000);
+    }, 15000);
     return () => window.clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    const el = tableContainerRef.current;
+    if (!el) return;
+    setTableViewportHeight(el.clientHeight || 640);
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      setTableViewportHeight(el.clientHeight || 640);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    setTableScrollTop(0);
+    if (tableContainerRef.current) {
+      tableContainerRef.current.scrollTop = 0;
+    }
+  }, [activeKind, snapshot.current_context, snapshot.current_namespace, snapshot.all_namespaces, searchQuery]);
 
   // Support Cmd/Ctrl + =/-/0 font size zoom inside the Kubernetes plugin window
   useEffect(() => {
@@ -1579,6 +1629,35 @@ export function App() {
     }
     return Array.from(set).filter(Boolean).sort();
   }, [snapshot.namespaces, snapshot.current_namespace, snapshot.resources]);
+
+  const matchingNamespaces = useMemo(() => {
+    const q = nsSearch.trim().toLowerCase();
+    return q ? allAvailableNamespaces.filter((ns) => ns.toLowerCase().includes(q)) : allAvailableNamespaces;
+  }, [allAvailableNamespaces, nsSearch]);
+
+  const renderedNamespaces = useMemo(() => {
+    if (matchingNamespaces.length <= MAX_RENDERED_NAMESPACES) return matchingNamespaces;
+    const top = matchingNamespaces.slice(0, MAX_RENDERED_NAMESPACES);
+    if (
+      !snapshot.all_namespaces &&
+      snapshot.current_namespace &&
+      matchingNamespaces.includes(snapshot.current_namespace) &&
+      !top.includes(snapshot.current_namespace)
+    ) {
+      top.unshift(snapshot.current_namespace);
+    }
+    return top;
+  }, [matchingNamespaces, snapshot.all_namespaces, snapshot.current_namespace]);
+
+  const virtualWin = useMemo(
+    () => computeVirtualWindow(filteredResources.length, tableScrollTop, tableViewportHeight),
+    [filteredResources.length, tableScrollTop, tableViewportHeight],
+  );
+
+  const visibleResources = useMemo(
+    () => filteredResources.slice(virtualWin.start, virtualWin.end),
+    [filteredResources, virtualWin.start, virtualWin.end],
+  );
 
   function getPodContainerItems(
     res: ClusterResource,
@@ -2525,25 +2604,35 @@ export function App() {
                           <span>All Namespaces</span>
                           {snapshot.all_namespaces && <span>✓</span>}
                         </div>
-                        {allAvailableNamespaces
-                          .filter((ns) => !nsSearch.trim() || ns.toLowerCase().includes(nsSearch.trim().toLowerCase()))
-                          .map((ns) => {
-                            const isSelected = !snapshot.all_namespaces && ns === snapshot.current_namespace;
-                            return (
-                              <div
-                                key={ns}
-                                className={`fl-ns-opt ${isSelected ? "active" : ""}`}
-                                onClick={() => {
-                                  setNsMenuOpen(false);
-                                  setNsSearch("");
-                                  handleSelectNamespace(ns);
-                                }}
-                              >
-                                <span>{ns}</span>
-                                {isSelected && <span>✓</span>}
-                              </div>
-                            );
-                          })}
+                        {renderedNamespaces.map((ns) => {
+                          const isSelected = !snapshot.all_namespaces && ns === snapshot.current_namespace;
+                          return (
+                            <div
+                              key={ns}
+                              className={`fl-ns-opt ${isSelected ? "active" : ""}`}
+                              onClick={() => {
+                                setNsMenuOpen(false);
+                                setNsSearch("");
+                                handleSelectNamespace(ns);
+                              }}
+                            >
+                              <span>{ns}</span>
+                              {isSelected && <span>✓</span>}
+                            </div>
+                          );
+                        })}
+                        {matchingNamespaces.length > MAX_RENDERED_NAMESPACES && (
+                          <div
+                            style={{
+                              padding: "6px 10px",
+                              fontSize: 11.5,
+                              color: "var(--fl-fg-muted)",
+                              borderTop: "1px solid var(--fl-border)",
+                            }}
+                          >
+                            Showing {renderedNamespaces.length} of {matchingNamespaces.length} namespaces — type to filter
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
@@ -2580,7 +2669,11 @@ export function App() {
         </div>
 
         {/* Content Body */}
-        <div className="fl-table-container">
+        <div
+          ref={tableContainerRef}
+          className="fl-table-container"
+          onScroll={(e) => setTableScrollTop(e.currentTarget.scrollTop)}
+        >
           {activeKind === "WorkloadsOverview" || activeKind === "ClusterOverview" ? (
             <div className="fl-overview-cards">
               {[
@@ -2968,7 +3061,16 @@ export function App() {
                     </td>
                   </tr>
                 ) : (
-                  filteredResources.map((res) => {
+                  <>
+                    {virtualWin.topPadPx > 0 && (
+                      <tr aria-hidden="true" style={{ height: virtualWin.topPadPx, border: "none" }}>
+                        <td
+                          colSpan={visibleCols.length + (activeKind === "Node" ? 1 : 2)}
+                          style={{ padding: 0, border: "none" }}
+                        />
+                      </tr>
+                    )}
+                    {visibleResources.map((res) => {
                     const rowKey = `${res.kind}:${res.namespace}/${res.name}`;
                     const isSel = rowKey === selectedRowKey && drawerOpen;
                     return (
@@ -3053,7 +3155,16 @@ export function App() {
                         </td>
                       </tr>
                     );
-                  })
+                  })}
+                    {virtualWin.bottomPadPx > 0 && (
+                      <tr aria-hidden="true" style={{ height: virtualWin.bottomPadPx, border: "none" }}>
+                        <td
+                          colSpan={visibleCols.length + (activeKind === "Node" ? 1 : 2)}
+                          style={{ padding: 0, border: "none" }}
+                        />
+                      </tr>
+                    )}
+                  </>
                 )}
               </tbody>
             </table>

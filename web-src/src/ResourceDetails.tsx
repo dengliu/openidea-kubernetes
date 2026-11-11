@@ -495,6 +495,7 @@ function PodDetailsListSection({
 }) {
   const [sortCol, setSortCol] = useState<"name" | "node" | "namespace" | "cpu" | "memory">("cpu");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const [showAll, setShowAll] = useState<boolean>(false);
 
   const hideNode = ownerKind === "Node";
 
@@ -554,7 +555,7 @@ function PodDetailsListSection({
           </tr>
         </thead>
         <tbody>
-          {sortedPods.map((pod) => {
+          {(showAll ? sortedPods : sortedPods.slice(0, 100)).map((pod) => {
             const cpuVal = cpuUnitsToNumber(pod.cpu);
             const memBytes = unitsToBytes(pod.memory);
             const readyText = (pod.ready || "0/0").replace("/", " / ");
@@ -614,6 +615,13 @@ function PodDetailsListSection({
           })}
         </tbody>
       </table>
+      {!showAll && sortedPods.length > 100 && (
+        <div style={{ padding: "8px 0", textAlign: "center" }}>
+          <button type="button" className="fl-icon-btn" onClick={() => setShowAll(true)}>
+            Show all {sortedPods.length} pods
+          </button>
+        </div>
+      )}
     </div>
   );
 }

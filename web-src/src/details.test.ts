@@ -1,8 +1,28 @@
 import { describe, expect, it } from "vitest";
-import { computePollDelayMs } from "./App";
+import { computePollDelayMs, computeVirtualWindow, formatCompactAge, VIRTUAL_ROW_HEIGHT } from "./App";
 import { bytesToUnits, cpuUnitsToNumber, formatKubeMemory, toYamlLines, unitsToBytes } from "./ResourceDetails";
 
 describe("ResourceDetails helpers", () => {
+  it("computes virtualized table window with top and bottom spacers on large row sets", () => {
+    expect(computeVirtualWindow(40, 0, 600)).toEqual({
+      start: 0,
+      end: 40,
+      topPadPx: 0,
+      bottomPadPx: 0,
+    });
+    const win = computeVirtualWindow(10000, VIRTUAL_ROW_HEIGHT * 500, 740, VIRTUAL_ROW_HEIGHT, 20);
+    expect(win.start).toBe(480);
+    expect(win.end).toBe(540);
+    expect(win.topPadPx).toBe(480 * VIRTUAL_ROW_HEIGHT);
+    expect(win.bottomPadPx).toBe((10000 - 540) * VIRTUAL_ROW_HEIGHT);
+  });
+
+  it("preserves server-side table multi-unit duration strings in formatCompactAge", () => {
+    expect(formatCompactAge("6d22h")).toBe("6d22h");
+    expect(formatCompactAge("3d5h10m")).toBe("3d5h10m");
+    expect(formatCompactAge("45s")).toBe("45s");
+  });
+
   it("adapts background poll interval to cluster latency and resource count", () => {
     expect(computePollDelayMs(150, 40)).toBe(5000);
     expect(computePollDelayMs(950, 40)).toBe(10000);
