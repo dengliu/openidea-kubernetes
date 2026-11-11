@@ -1998,7 +1998,325 @@ pub fn parse_custom_columns_resources(text: &str) -> Vec<ClusterResource> {
             qos,
             ..Default::default()
         });
-        if out.len() >= 2_500 {
+        if out.len() >= 25_000 {
+            break;
+        }
+    }
+    out
+}
+
+/// Parses `kubectl get pods [-A] -o wide --no-headers` Server-Side Table output.
+/// Unlike `-o json` or `-o custom-columns`, `-o wide` uses Kubernetes Server-Side `Table`
+/// (`application/json;as=Table`), reducing payload size by ~150x on large clusters.
+pub fn parse_pods_wide_table(
+    text: &str,
+    all_namespaces: bool,
+    default_ns: &str,
+) -> Vec<ClusterResource> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let min_cols = if all_namespaces { 6 } else { 5 };
+        if cols.len() < min_cols {
+            continue;
+        }
+        let mut idx = 0usize;
+        let namespace = if all_namespaces {
+            let ns = clean_col(cols[idx]).to_owned();
+            idx += 1;
+            ns
+        } else {
+            default_ns.to_owned()
+        };
+        let name = cols[idx].to_owned();
+        idx += 1;
+        let ready = cols[idx].to_owned();
+        idx += 1;
+        let status_raw = cols[idx];
+        idx += 1;
+        let restarts_tok = cols.get(idx).copied().unwrap_or("0");
+        let restarts = restarts_tok.parse::<u64>().unwrap_or(0);
+        idx += 1;
+        // K8s 1.22+ formats recent restarts as `3 (5m12s ago)` across whitespace tokens.
+        if cols.get(idx).is_some_and(|t| t.starts_with('(')) {
+            while let Some(&tok) = cols.get(idx) {
+                idx += 1;
+                if tok.ends_with(')') {
+                    break;
+                }
+            }
+        }
+        let age = cols
+            .get(idx)
+            .copied()
+            .map(clean_col)
+            .unwrap_or("")
+            .to_owned();
+        let pod_ip = cols
+            .get(idx + 1)
+            .copied()
+            .map(clean_col)
+            .unwrap_or("")
+            .to_owned();
+        let node_name = cols
+            .get(idx + 2)
+            .copied()
+            .map(clean_col)
+            .unwrap_or("")
+            .to_owned();
+
+        let (rdy_cnt, total_cnt) = ready
+            .split_once('/')
+            .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
+            .unwrap_or((0, 0));
+        let mut container_states = Vec::with_capacity(total_cnt.min(16));
+        let mut containers = Vec::with_capacity(total_cnt.min(16));
+        let is_done = matches!(status_raw, "Completed" | "Succeeded");
+        for i in 0..total_cnt.min(16) {
+            let cname = format!("c{}", i + 1);
+            containers.push(cname.clone());
+            let (cstate, cready, creason) = if is_done {
+                ("terminated".to_owned(), false, "Completed".to_owned())
+            } else if i < rdy_cnt {
+                ("running".to_owned(), true, String::new())
+            } else {
+                ("waiting".to_owned(), false, status_raw.to_owned())
+            };
+            container_states.push(ContainerStateBadge {
+                name: cname,
+                state: cstate,
+                ready: cready,
+                reason: creason,
+                ..Default::default()
+            });
+        }
+        let detail = match (node_name.is_empty(), pod_ip.is_empty()) {
+            (false, false) => format!("restarts: {restarts} • {pod_ip} on {node_name}"),
+            (false, true) => format!("restarts: {restarts} • {node_name}"),
+            _ => format!("restarts: {restarts}"),
+        };
+        out.push(ClusterResource {
+            kind: "Pod".into(),
+            name,
+            namespace,
+            status: status_raw.to_owned(),
+            ready,
+            age,
+            detail,
+            containers,
+            container_states,
+            restarts,
+            pod_ip,
+            node_name,
+            ..Default::default()
+        });
+        if out.len() >= 25_000 {
+            break;
+        }
+    }
+    out
+}
+
+/// Parses Server-Side Table (`--no-headers`) output for namespaced resources when `--all-namespaces` is active.
+pub fn parse_server_table_resources(
+    kind: &str,
+    text: &str,
+    all_namespaces: bool,
+    default_ns: &str,
+) -> Vec<ClusterResource> {
+    if kind == "Pod" {
+        return parse_pods_wide_table(text, all_namespaces, default_ns);
+    }
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let min_cols = if all_namespaces { 3 } else { 2 };
+        if cols.len() < min_cols {
+            continue;
+        }
+        let base = if all_namespaces { 1 } else { 0 };
+        let namespace = if all_namespaces {
+            clean_col(cols[0]).to_owned()
+        } else {
+            default_ns.to_owned()
+        };
+        let name = cols[base].to_owned();
+        let age = cols.last().copied().map(clean_col).unwrap_or("").to_owned();
+        let mut status = "Active".to_owned();
+        let mut ready = String::new();
+        let mut detail = String::new();
+        let mut pod_ip = String::new();
+        let mut node_name = String::new();
+        let mut restarts = 0u64;
+
+        match kind {
+            "Deployment" | "StatefulSet" => {
+                ready = cols.get(base + 1).copied().unwrap_or("0/0").to_owned();
+                let (rdy, des) = ready
+                    .split_once('/')
+                    .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+                    .unwrap_or((0, 0));
+                status = if rdy == des {
+                    "Ready".into()
+                } else if rdy > 0 {
+                    "Progressing".into()
+                } else {
+                    "Scaling".into()
+                };
+                detail = format!("replicas: {ready}");
+            }
+            "DaemonSet" | "ReplicaSet" | "ReplicationController" => {
+                let des = cols
+                    .get(base + 1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let rdy = cols
+                    .get(base + 3)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                ready = format!("{rdy}/{des}");
+                status = if rdy == des {
+                    "Ready".into()
+                } else if kind == "DaemonSet" {
+                    "Degraded".into()
+                } else if rdy > 0 {
+                    "Progressing".into()
+                } else {
+                    "Scaling".into()
+                };
+                detail = format!("ready: {ready}");
+            }
+            "Job" => {
+                let c1 = cols.get(base + 1).copied().unwrap_or("");
+                let c2 = cols.get(base + 2).copied().unwrap_or("");
+                if c1.contains('/') {
+                    ready = c1.to_owned();
+                    let (succ, comp) = ready
+                        .split_once('/')
+                        .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+                        .unwrap_or((0, 1));
+                    status = if succ >= comp {
+                        "Complete".into()
+                    } else {
+                        "Running".into()
+                    };
+                } else {
+                    status = c1.to_owned();
+                    ready = c2.to_owned();
+                }
+            }
+            "CronJob" => {
+                // NAMESPACE NAME SCHEDULE [TIMEZONE] SUSPEND ACTIVE LAST_SCHEDULE AGE
+                if cols.len() >= base + 6 {
+                    let suspend_idx = cols.len().saturating_sub(4);
+                    let active_idx = cols.len().saturating_sub(3);
+                    let sched_end = if suspend_idx > base + 1
+                        && matches!(cols[suspend_idx - 1], "True" | "False")
+                    {
+                        suspend_idx - 1
+                    } else {
+                        suspend_idx
+                    };
+                    let schedule = if sched_end > base + 1 {
+                        cols[base + 1..sched_end].join(" ")
+                    } else {
+                        cols.get(base + 1).copied().unwrap_or("").to_owned()
+                    };
+                    let suspend = cols.get(suspend_idx).copied().unwrap_or("False");
+                    restarts = cols
+                        .get(active_idx)
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    status = if suspend.eq_ignore_ascii_case("true") {
+                        "Suspended".into()
+                    } else {
+                        "Scheduled".into()
+                    };
+                    ready = schedule.clone();
+                    detail = format!("schedule: {schedule}");
+                }
+            }
+            "Service" => {
+                status = cols
+                    .get(base + 1)
+                    .copied()
+                    .unwrap_or("ClusterIP")
+                    .to_owned();
+                pod_ip = cols
+                    .get(base + 2)
+                    .copied()
+                    .map(clean_col)
+                    .unwrap_or("")
+                    .to_owned();
+                ready = cols
+                    .get(base + 4)
+                    .copied()
+                    .map(clean_col)
+                    .unwrap_or("")
+                    .to_owned();
+                detail = if pod_ip.is_empty() {
+                    String::new()
+                } else {
+                    format!("ClusterIP: {pod_ip}")
+                };
+            }
+            "Ingress" => {
+                let class = cols.get(base + 1).copied().map(clean_col).unwrap_or("");
+                let hosts = cols.get(base + 2).copied().map(clean_col).unwrap_or("*");
+                status = if class.is_empty() {
+                    "Ingress".into()
+                } else {
+                    format!("Class: {class}")
+                };
+                detail = hosts.to_owned();
+            }
+            "ConfigMap" => {
+                let data_cnt = cols.get(base + 1).copied().unwrap_or("0");
+                status = "ConfigMap".into();
+                ready = format!("{data_cnt} keys");
+                detail = format!("{data_cnt} keys");
+            }
+            "PersistentVolumeClaim" => {
+                status = cols.get(base + 1).copied().unwrap_or("Bound").to_owned();
+                ready = cols
+                    .get(base + 3)
+                    .copied()
+                    .map(clean_col)
+                    .unwrap_or("")
+                    .to_owned();
+                node_name = cols
+                    .get(base + 5)
+                    .copied()
+                    .map(clean_col)
+                    .unwrap_or("")
+                    .to_owned();
+                detail = if node_name.is_empty() {
+                    String::new()
+                } else {
+                    format!("storageClass: {node_name}")
+                };
+            }
+            _ => {
+                if cols.len() > base + 2 {
+                    ready = clean_col(cols[base + 1]).to_owned();
+                }
+            }
+        }
+
+        out.push(ClusterResource {
+            kind: kind.to_owned(),
+            name,
+            namespace,
+            status,
+            ready,
+            age,
+            detail,
+            pod_ip,
+            node_name,
+            restarts,
+            ..Default::default()
+        });
+        if out.len() >= 25_000 {
             break;
         }
     }
@@ -2084,6 +2402,57 @@ pub fn fetch_nodes_into_snapshot(
     fetch_nodes_with_options(project, cfg, snap, FetchOptions::default());
 }
 
+/// Parses `kubectl get nodes -o wide --no-headers` Server-Side Table lines into `ClusterResource` items.
+pub fn parse_nodes_wide_table(
+    text: &str,
+    prev_metrics: &BTreeMap<String, (String, String)>,
+) -> Vec<ClusterResource> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let Some(&name) = cols.first() else {
+            continue;
+        };
+        let status_raw = cols.get(1).copied().unwrap_or("Ready");
+        let status = status_raw.replace(',', ", ");
+        let roles = cols.get(2).copied().map(clean_col).unwrap_or("");
+        let age = cols.get(3).copied().map(clean_col).unwrap_or("");
+        let version = cols.get(4).copied().map(clean_col).unwrap_or("");
+        let internal_ip = cols.get(5).copied().map(clean_col).unwrap_or("");
+        let kernel = if cols.len() >= 9 {
+            clean_col(cols[cols.len() - 2])
+        } else {
+            ""
+        };
+        let schedulable = if status_raw.contains("SchedulingDisabled") {
+            "False"
+        } else {
+            "True"
+        };
+        let (cpu, memory) = prev_metrics.get(name).cloned().unwrap_or_default();
+        out.push(ClusterResource {
+            kind: "Node".into(),
+            name: name.to_owned(),
+            status,
+            ready: version.to_owned(),
+            age: age.to_owned(),
+            detail: internal_ip.to_owned(),
+            cpu,
+            memory,
+            pod_ip: internal_ip.to_owned(),
+            host_ip: if roles == "agent" {
+                String::new()
+            } else {
+                roles.to_owned()
+            },
+            node_name: kernel.to_owned(),
+            qos: schedulable.to_owned(),
+            ..Default::default()
+        });
+    }
+    out
+}
+
 pub fn fetch_nodes_with_options(
     project: &Project,
     cfg: &KubeConfigState,
@@ -2096,12 +2465,49 @@ pub fn fetch_nodes_with_options(
         .filter(|r| r.kind == "Node" && (!r.cpu.is_empty() || !r.memory.is_empty()))
         .map(|r| (r.name.clone(), (r.cpu.clone(), r.memory.clone())))
         .collect();
-    let prev_node_cnt = snap.resources.iter().filter(|r| r.kind == "Node").count();
+
+    let req_timeout = if opts.is_background_poll {
+        Some(3)
+    } else {
+        Some(15)
+    };
+
+    // Always fetch Server-Side Table (`-o wide --no-headers`) first so large clusters (500+ nodes)
+    // never download tens of megabytes of `.status.images` JSON from kube-apiserver.
+    let mut wide_args = cfg.base_args(false);
+    wide_args.extend([
+        "get".into(),
+        "nodes".into(),
+        "-o".into(),
+        "wide".into(),
+        "--no-headers".into(),
+    ]);
+    let Ok(wide_out) = run_kubectl_timed(project, &wide_args, None, req_timeout) else {
+        return;
+    };
+    if wide_out.status != Some(0) {
+        return;
+    }
+
+    if wide_out.stdout.trim_start().starts_with('{') {
+        snap.resources.retain(|r| r.kind != "Node");
+        snap.resources
+            .extend(parse_resource_list_json(&wide_out.stdout));
+        return;
+    }
+
+    let wide_nodes = parse_nodes_wide_table(&wide_out.stdout, &prev_metrics);
+    let node_cnt = wide_nodes.len();
+
+    // Only enrich full per-node allocatable + `kubectl top nodes` on small-to-medium clusters (<= 80 nodes).
+    if node_cnt == 0 || node_cnt > 80 || (opts.is_background_poll && !opts.include_metrics) {
+        snap.resources.retain(|r| r.kind != "Node");
+        snap.resources.extend(wide_nodes);
+        return;
+    }
 
     let mut top_map: BTreeMap<String, (f64, f64)> = BTreeMap::new();
-    let should_query_top =
-        opts.include_metrics && (!opts.is_background_poll || prev_node_cnt <= 120);
-    if should_query_top {
+    if opts.include_metrics {
         let mut top_args = cfg.base_args(false);
         top_args.extend(["top".into(), "nodes".into(), "--no-headers".into()]);
         if let Ok(top_out) = run_kubectl_timed(project, &top_args, None, Some(3))
@@ -2119,11 +2525,6 @@ pub fn fetch_nodes_with_options(
         }
     }
 
-    let req_timeout = if opts.is_background_poll {
-        Some(3)
-    } else {
-        Some(15)
-    };
     let mut node_args = cfg.base_args(false);
     node_args.extend([
         "get".into(),
@@ -2132,147 +2533,110 @@ pub fn fetch_nodes_with_options(
         NODE_COLUMNS_SPEC.into(),
         "--no-headers".into(),
     ]);
-    if let Ok(out) = run_kubectl_timed(project, &node_args, None, req_timeout)
+    if let Ok(out) = run_kubectl_timed(project, &node_args, None, Some(4))
         && out.status == Some(0)
+        && !out.stdout.trim_start().starts_with('{')
     {
+        let roles_by_name: BTreeMap<String, String> = wide_nodes
+            .iter()
+            .map(|n| (n.name.clone(), n.host_ip.clone()))
+            .collect();
         snap.resources.retain(|r| r.kind != "Node");
-        if out.stdout.trim_start().starts_with('{') {
-            snap.resources.extend(parse_resource_list_json(&out.stdout));
-        } else {
-            for line in out.stdout.lines() {
-                let cols: Vec<&str> = line.split_whitespace().collect();
-                if cols.len() >= 13 {
-                    let name = cols[0];
-                    let taints_raw = clean_col(cols[1]);
-                    let unsched = clean_col(cols[2]);
-                    let version = clean_col(cols[3]);
-                    let kernel = clean_col(cols[4]);
-                    let internal_ip = clean_col(cols[5]);
-                    let alloc_cpu = parse_kube_cores(cols[6]);
-                    let alloc_mem = parse_kube_gi(cols[7]);
-                    let cond_types: Vec<&str> = clean_col(cols[8])
+        for line in out.stdout.lines() {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() >= 13 {
+                let name = cols[0];
+                let taints_raw = clean_col(cols[1]);
+                let unsched = clean_col(cols[2]);
+                let version = clean_col(cols[3]);
+                let kernel = clean_col(cols[4]);
+                let internal_ip = clean_col(cols[5]);
+                let alloc_cpu = parse_kube_cores(cols[6]);
+                let alloc_mem = parse_kube_gi(cols[7]);
+                let cond_types: Vec<&str> = clean_col(cols[8])
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let cond_stats: Vec<&str> = clean_col(cols[9])
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let instance_type = clean_col(cols[10]);
+                let node_group = clean_col(cols[11]);
+                let age = clean_col(cols[12]);
+
+                let taints_list: Vec<String> = if taints_raw.is_empty() {
+                    Vec::new()
+                } else {
+                    taints_raw
                         .split(',')
                         .filter(|s| !s.is_empty())
-                        .collect();
-                    let cond_stats: Vec<&str> = clean_col(cols[9])
-                        .split(',')
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    let instance_type = clean_col(cols[10]);
-                    let node_group = clean_col(cols[11]);
-                    let age = clean_col(cols[12]);
+                        .map(str::to_owned)
+                        .collect()
+                };
+                let taints_cnt = taints_list.len() as u64;
+                let schedulable = if unsched == "true" { "False" } else { "True" };
 
-                    let taints_list: Vec<String> = if taints_raw.is_empty() {
-                        Vec::new()
-                    } else {
-                        taints_raw
-                            .split(',')
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_owned)
-                            .collect()
-                    };
-                    let taints_cnt = taints_list.len() as u64;
-                    let schedulable = if unsched == "true" { "False" } else { "True" };
-
-                    let mut active_conds: Vec<String> = Vec::new();
-                    for (ct, cs) in cond_types.iter().zip(cond_stats.iter()) {
-                        if *cs == "True" {
-                            active_conds.push((*ct).to_owned());
-                        }
+                let mut active_conds: Vec<String> = Vec::new();
+                for (ct, cs) in cond_types.iter().zip(cond_stats.iter()) {
+                    if *cs == "True" {
+                        active_conds.push((*ct).to_owned());
                     }
-                    if active_conds.is_empty() {
-                        active_conds.push("NotReady".into());
-                    }
-                    if unsched == "true" && !active_conds.iter().any(|c| c == "SchedulingDisabled")
-                    {
-                        active_conds.push("SchedulingDisabled".into());
-                    }
-                    let status = active_conds.join(", ");
-
-                    let (cpu_str, mem_str) = if should_query_top {
-                        let (u_cpu, u_mem) = top_map.get(name).copied().unwrap_or((0.0, 0.0));
-                        (
-                            if alloc_cpu > 0.0 {
-                                format!("{u_cpu:.2}/{alloc_cpu:.2}")
-                            } else {
-                                String::new()
-                            },
-                            if alloc_mem > 0.0 {
-                                format!("{u_mem:.1}Gi/{alloc_mem:.1}Gi")
-                            } else {
-                                String::new()
-                            },
-                        )
-                    } else if let Some((p_cpu, p_mem)) = prev_metrics.get(name) {
-                        (p_cpu.clone(), p_mem.clone())
-                    } else {
-                        (
-                            if alloc_cpu > 0.0 {
-                                format!("0.00/{alloc_cpu:.2}")
-                            } else {
-                                String::new()
-                            },
-                            if alloc_mem > 0.0 {
-                                format!("0.0Gi/{alloc_mem:.1}Gi")
-                            } else {
-                                String::new()
-                            },
-                        )
-                    };
-
-                    snap.resources.push(ClusterResource {
-                        kind: "Node".into(),
-                        name: name.to_owned(),
-                        status,
-                        ready: version.to_owned(),
-                        age: age.to_owned(),
-                        detail: internal_ip.to_owned(),
-                        containers: taints_list,
-                        cpu: cpu_str,
-                        memory: mem_str,
-                        restarts: taints_cnt,
-                        controlled_by_kind: instance_type.to_owned(),
-                        controlled_by_name: node_group.to_owned(),
-                        pod_ip: internal_ip.to_owned(),
-                        host_ip: String::new(),
-                        node_name: kernel.to_owned(),
-                        qos: schedulable.to_owned(),
-                        ..Default::default()
-                    });
-                } else if let Some(&name) = cols.first() {
-                    let status = cols.get(1).copied().unwrap_or("Ready");
-                    let roles = cols.get(2).copied().map(clean_col).unwrap_or("");
-                    let age = cols.get(3).copied().map(clean_col).unwrap_or("");
-                    let version = cols.get(4).copied().map(clean_col).unwrap_or("");
-                    let internal_ip = cols.get(5).copied().map(clean_col).unwrap_or("");
-                    let schedulable = if status.contains("SchedulingDisabled") {
-                        "False"
-                    } else {
-                        "True"
-                    };
-                    snap.resources.push(ClusterResource {
-                        kind: "Node".into(),
-                        name: name.to_owned(),
-                        status: status.to_owned(),
-                        ready: version.to_owned(),
-                        age: age.to_owned(),
-                        detail: internal_ip.to_owned(),
-                        pod_ip: internal_ip.to_owned(),
-                        host_ip: if roles == "agent" {
-                            String::new()
-                        } else {
-                            roles.to_owned()
-                        },
-                        qos: schedulable.to_owned(),
-                        ..Default::default()
-                    });
                 }
+                if active_conds.is_empty() {
+                    active_conds.push("NotReady".into());
+                }
+                if unsched == "true" && !active_conds.iter().any(|c| c == "SchedulingDisabled") {
+                    active_conds.push("SchedulingDisabled".into());
+                }
+                let status = active_conds.join(", ");
+
+                let (cpu_str, mem_str) = if opts.include_metrics {
+                    let (u_cpu, u_mem) = top_map.get(name).copied().unwrap_or((0.0, 0.0));
+                    (
+                        if alloc_cpu > 0.0 {
+                            format!("{u_cpu:.2}/{alloc_cpu:.2}")
+                        } else {
+                            String::new()
+                        },
+                        if alloc_mem > 0.0 {
+                            format!("{u_mem:.1}Gi/{alloc_mem:.1}Gi")
+                        } else {
+                            String::new()
+                        },
+                    )
+                } else if let Some((p_cpu, p_mem)) = prev_metrics.get(name) {
+                    (p_cpu.clone(), p_mem.clone())
+                } else {
+                    (String::new(), String::new())
+                };
+
+                snap.resources.push(ClusterResource {
+                    kind: "Node".into(),
+                    name: name.to_owned(),
+                    status,
+                    ready: version.to_owned(),
+                    age: age.to_owned(),
+                    detail: internal_ip.to_owned(),
+                    containers: taints_list,
+                    cpu: cpu_str,
+                    memory: mem_str,
+                    restarts: taints_cnt,
+                    controlled_by_kind: instance_type.to_owned(),
+                    controlled_by_name: node_group.to_owned(),
+                    pod_ip: internal_ip.to_owned(),
+                    host_ip: roles_by_name.get(name).cloned().unwrap_or_default(),
+                    node_name: kernel.to_owned(),
+                    qos: schedulable.to_owned(),
+                    ..Default::default()
+                });
             }
         }
+    } else {
+        snap.resources.retain(|r| r.kind != "Node");
+        snap.resources.extend(wide_nodes);
     }
 }
-
-const CRD_COLUMNS_SPEC: &str = "custom-columns=NAME:.metadata.name,GROUP:.spec.group,KIND:.spec.names.kind,SCOPE:.spec.scope,VERSION:.spec.versions[0].name,AGE:.metadata.creationTimestamp";
 
 const CR_INSTANCE_COLUMNS_SPEC: &str = "custom-columns=KIND:.kind,NS:.metadata.namespace,NAME:.metadata.name,AGE:.metadata.creationTimestamp";
 
@@ -2298,12 +2662,38 @@ pub fn parse_cr_instance_lines(text: &str, crd_name: &str) -> Vec<ClusterResourc
                 controlled_by_name: crd_name.to_owned(),
                 ..Default::default()
             });
+        } else if cols.len() == 3 {
+            let ns = clean_col(cols[0]);
+            let name = cols[1];
+            let age = clean_col(cols[2]);
+            out.push(ClusterResource {
+                kind: format!("CR:{crd_name}"),
+                name: name.to_owned(),
+                namespace: ns.to_owned(),
+                status: "Active".into(),
+                age: age.to_owned(),
+                detail: crd_name.to_owned(),
+                controlled_by_name: crd_name.to_owned(),
+                ..Default::default()
+            });
+        } else if cols.len() == 2 {
+            let name = cols[0];
+            let age = clean_col(cols[1]);
+            out.push(ClusterResource {
+                kind: format!("CR:{crd_name}"),
+                name: name.to_owned(),
+                status: "Active".into(),
+                age: age.to_owned(),
+                detail: crd_name.to_owned(),
+                controlled_by_name: crd_name.to_owned(),
+                ..Default::default()
+            });
         }
     }
     out
 }
 
-/// Fetches `CustomResourceDefinition` rows on demand using Server-Side custom-columns output,
+/// Fetches `CustomResourceDefinition` rows on demand using Server-Side Table output (`kubectl get crd --no-headers`),
 /// avoiding downloading megabytes of OpenAPI v3 validation schemas.
 pub fn fetch_crds_into_snapshot(
     project: &Project,
@@ -2311,13 +2701,7 @@ pub fn fetch_crds_into_snapshot(
     snap: &mut ClusterSnapshot,
 ) {
     let mut crd_args = cfg.base_args(false);
-    crd_args.extend([
-        "get".into(),
-        "crd".into(),
-        "-o".into(),
-        CRD_COLUMNS_SPEC.into(),
-        "--no-headers".into(),
-    ]);
+    crd_args.extend(["get".into(), "crd".into(), "--no-headers".into()]);
     if let Ok(out) = run_kubectl(project, &crd_args, None)
         && out.status == Some(0)
     {
@@ -2344,10 +2728,11 @@ pub fn fetch_crds_into_snapshot(
                     ready: cols[2].to_owned(),
                     age: cols.get(4).copied().unwrap_or("").to_owned(),
                     detail: cols[1].to_owned(),
+                    controlled_by_kind: cols[2].to_owned(),
                     ..Default::default()
                 });
             } else if let Some(&name) = cols.first() {
-                let group = name.split_once('.').map(|(_, g)| g).unwrap_or("");
+                let (plural, group) = name.split_once('.').unwrap_or((name, ""));
                 let age = cols.get(1).copied().unwrap_or("");
                 snap.resources.push(ClusterResource {
                     kind: "CustomResourceDefinition".into(),
@@ -2356,6 +2741,7 @@ pub fn fetch_crds_into_snapshot(
                     ready: "v1".into(),
                     age: age.to_owned(),
                     detail: group.to_owned(),
+                    controlled_by_kind: plural.to_owned(),
                     ..Default::default()
                 });
             }
@@ -2709,11 +3095,15 @@ pub fn fetch_category_with_options(
             if !is_cluster_scoped {
                 cfg.push_scope_flags(&mut cr_args);
             }
-            cr_args.extend([
-                "-o".into(),
-                CR_INSTANCE_COLUMNS_SPEC.into(),
-                "--no-headers".into(),
-            ]);
+            if cfg.all_namespaces {
+                cr_args.push("--no-headers".into());
+            } else {
+                cr_args.extend([
+                    "-o".into(),
+                    CR_INSTANCE_COLUMNS_SPEC.into(),
+                    "--no-headers".into(),
+                ]);
+            }
             if let Ok(out) = run_kubectl_timed(project, &cr_args, None, req_timeout)
                 && out.status == Some(0)
             {
@@ -2739,20 +3129,21 @@ pub fn fetch_category_with_options(
             } else {
                 BTreeMap::new()
             };
-            let (kubectl_type, cluster_scoped, prefer_json_in_all_ns) = kubectl_resource_info(kind);
+            let (kubectl_type, cluster_scoped, _) = kubectl_resource_info(kind);
+            let use_server_table = cfg.all_namespaces && !cluster_scoped;
             let mut res_args = cfg.base_args(!cluster_scoped);
             res_args.extend(["get".into(), kubectl_type.into()]);
             if !cluster_scoped {
                 cfg.push_scope_flags(&mut res_args);
             }
-            if cfg.all_namespaces && !cluster_scoped && !prefer_json_in_all_ns {
-                res_args.extend([
-                    "-o".into(),
-                    CUSTOM_COLUMNS_SPEC.into(),
-                    "--no-headers".into(),
-                ]);
+            if use_server_table {
+                if kind == "Pod" {
+                    res_args.extend(["-o".into(), "wide".into(), "--no-headers".into()]);
+                } else {
+                    res_args.push("--no-headers".into());
+                }
             } else {
-                res_args.extend(["-o".into(), "json".into()]);
+                res_args.extend(["-o".into(), "json".into(), "--chunk-size=500".into()]);
             }
             match run_kubectl_timed(project, &res_args, None, req_timeout) {
                 Ok(out) if out.status == Some(0) => {
@@ -2761,6 +3152,13 @@ pub fn fetch_category_with_options(
                     snap.resources.retain(|r| r.kind != kind);
                     if out.stdout.trim_start().starts_with('{') {
                         snap.resources.extend(parse_resource_list_json(&out.stdout));
+                    } else if use_server_table {
+                        snap.resources.extend(parse_server_table_resources(
+                            kind,
+                            &out.stdout,
+                            cfg.all_namespaces,
+                            &cfg.namespace,
+                        ));
                     } else {
                         snap.resources
                             .extend(parse_custom_columns_resources(&out.stdout));
@@ -2817,33 +3215,30 @@ pub fn fetch_category_with_options(
                     snap.error = Some(first_line_or(&out.stderr, "kubectl get resources failed"));
                 }
                 Err(e) => {
-                    if !opts.is_background_poll
-                        && cfg.all_namespaces
-                        && !cluster_scoped
-                        && prefer_json_in_all_ns
-                    {
+                    if !use_server_table && !cluster_scoped && !opts.is_background_poll {
                         let mut fallback_args = cfg.base_args(true);
-                        fallback_args.extend([
-                            "get".into(),
-                            kubectl_type.into(),
-                            "--all-namespaces".into(),
-                        ]);
-                        fallback_args.extend([
-                            "-o".into(),
-                            CUSTOM_COLUMNS_SPEC.into(),
-                            "--no-headers".into(),
-                        ]);
+                        fallback_args.extend(["get".into(), kubectl_type.into()]);
+                        if kind == "Pod" {
+                            fallback_args.extend([
+                                "-o".into(),
+                                "wide".into(),
+                                "--no-headers".into(),
+                            ]);
+                        } else {
+                            fallback_args.push("--no-headers".into());
+                        }
                         if let Ok(out) = run_kubectl_timed(project, &fallback_args, None, Some(15))
                             && out.status == Some(0)
                         {
                             snap.connected = true;
                             snap.error = None;
                             snap.resources.retain(|r| r.kind != kind);
-                            snap.resources
-                                .extend(parse_custom_columns_resources(&out.stdout));
-                            if kind == "Pod" && opts.include_metrics {
-                                enrich_pod_metrics(project, cfg, snap);
-                            }
+                            snap.resources.extend(parse_server_table_resources(
+                                kind,
+                                &out.stdout,
+                                false,
+                                &cfg.namespace,
+                            ));
                             return;
                         }
                     }

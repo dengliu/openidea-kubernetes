@@ -2726,4 +2726,112 @@ spec:
             && m.contains(r#""pollCompleted":true"#)
             && m.contains(r#""pollDurationMs":"#)));
     }
+
+    #[test]
+    fn parses_server_side_tables_for_large_clusters_without_full_json() {
+        let pods_wide = "\
+kube-system   coredns-7c65d6cfc9-x8p4k   1/1   Running            0               42d   10.244.0.12   aks-sys-01   <none>   <none>
+train-jobs    trainer-worker-0           1/2   CrashLoopBackOff   4 (2m15s ago)   18m   10.244.8.44   aks-gpu-99   <none>   <none>
+batch         migrate-db-x9z             0/1   Completed          0               5h    10.244.9.10   aks-cpu-03   <none>   <none>
+";
+        let pods = kubectl::parse_pods_wide_table(pods_wide, true, "default");
+        assert_eq!(pods.len(), 3);
+        assert_eq!(pods[0].namespace, "kube-system");
+        assert_eq!(pods[0].ready, "1/1");
+        assert_eq!(pods[0].pod_ip, "10.244.0.12");
+        assert_eq!(pods[0].node_name, "aks-sys-01");
+        assert_eq!(pods[1].restarts, 4);
+        assert_eq!(pods[1].age, "18m");
+        assert_eq!(pods[1].pod_ip, "10.244.8.44");
+        assert_eq!(pods[1].container_states.len(), 2);
+        assert!(pods[1].container_states[0].ready && !pods[1].container_states[1].ready);
+        assert_eq!(pods[2].container_states[0].state, "terminated");
+
+        let nodes_wide = "\
+aks-gpu-001   Ready                      agent           31d   v1.31.2   10.10.1.4   <none>   Ubuntu 22.04.5 LTS   6.8.0-1017-azure   containerd://1.7.22
+aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1.5   <none>   Ubuntu 22.04.5 LTS   6.8.0-1017-azure   containerd://1.7.22
+";
+        let nodes = kubectl::parse_nodes_wide_table(nodes_wide, &std::collections::BTreeMap::new());
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].qos, "True");
+        assert_eq!(nodes[0].ready, "v1.31.2");
+        assert_eq!(nodes[0].pod_ip, "10.10.1.4");
+        assert_eq!(nodes[0].node_name, "6.8.0-1017-azure");
+        assert_eq!(nodes[1].qos, "False");
+        assert_eq!(nodes[1].host_ip, "control-plane");
+
+        let deploys = kubectl::parse_server_table_resources(
+            "Deployment",
+            "production   web-api   3/3   3   3   12d\nstaging      canary    1/2   2   1   45m\n",
+            true,
+            "default",
+        );
+        assert_eq!(deploys.len(), 2);
+        assert_eq!(deploys[0].status, "Ready");
+        assert_eq!(deploys[0].age, "12d");
+        assert_eq!(deploys[1].status, "Progressing");
+    }
+
+    #[test]
+    fn large_cluster_nodes_skip_client_side_custom_columns() {
+        let seen_args = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let host = install_mock_with_kubectl();
+        let seen_clone = seen_args.clone();
+        host.on_process("kubectl", move |args, _stdin| {
+            seen_clone.lock().unwrap().push(args.to_vec());
+            let joined = args.join(" ");
+            let stdout = if joined.contains("config view") {
+                KUBECONFIG_JSON.to_owned()
+            } else if joined.contains("get nodes -o wide") {
+                (0..120)
+                    .map(|i| {
+                        format!(
+                            "aks-node-{i:03} Ready agent 14d v1.31.2 10.0.0.{} <none> Ubuntu 22.04 6.8.0-azure containerd://1.7",
+                            (i % 250) + 1
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                String::new()
+            };
+            Ok(ProcessOutput {
+                status: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        });
+        host.add_file("k8s/app.yaml", SAMPLE_MANIFEST);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(r#"{"op":"load-category","category":"Node"}"#.into()),
+                &host.invocation(),
+            )
+            .unwrap();
+
+        let recorded = seen_args.lock().unwrap();
+        assert!(
+            !recorded
+                .iter()
+                .any(|a| a.iter().any(|x| x.starts_with("custom-columns="))),
+            "large >80-node clusters must not fetch full Node JSON via custom-columns: {recorded:?}"
+        );
+        assert_eq!(
+            plugin
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .resources
+                .iter()
+                .filter(|r| r.kind == "Node")
+                .count(),
+            120
+        );
+    }
 }
