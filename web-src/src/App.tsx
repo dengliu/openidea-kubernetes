@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { PodTerminal, dispatchPtyEvent } from "./PodTerminal";
 import { ResourceDetails, cpuUnitsToNumber, unitsToBytes } from "./ResourceDetails";
 import type {
+  CategoryPageInfo,
   ClusterContextInfo,
   ClusterEvent,
   ClusterResource,
@@ -583,7 +584,9 @@ function statusClass(status: string): "ok" | "warn" | "err" {
 export const VIRTUAL_ROW_HEIGHT = 37;
 export const VIRTUAL_OVERSCAN = 20;
 export const VIRTUAL_THRESHOLD = 100;
-const MAX_RENDERED_NAMESPACES = 200;
+export const NS_OPTION_ROW_HEIGHT = 30;
+export const NS_VIEWPORT_HEIGHT = 288;
+export const PAGE_SIZE_OPTIONS = [50, 100, 250, 500] as const;
 
 export function computeVirtualWindow(
   totalRows: number,
@@ -591,11 +594,12 @@ export function computeVirtualWindow(
   viewportHeight: number,
   rowHeight = VIRTUAL_ROW_HEIGHT,
   overscan = VIRTUAL_OVERSCAN,
+  threshold = VIRTUAL_THRESHOLD,
 ): { start: number; end: number; topPadPx: number; bottomPadPx: number } {
-  if (totalRows <= VIRTUAL_THRESHOLD || rowHeight <= 0) {
+  if (totalRows <= threshold || rowHeight <= 0) {
     return { start: 0, end: totalRows, topPadPx: 0, bottomPadPx: 0 };
   }
-  const safeHeight = Math.max(200, viewportHeight || 600);
+  const safeHeight = Math.max(120, viewportHeight || 600);
   const firstVisible = Math.max(0, Math.floor(scrollTop / rowHeight));
   const visibleCount = Math.ceil(safeHeight / rowHeight);
   const start = Math.max(0, firstVisible - overscan);
@@ -605,6 +609,98 @@ export function computeVirtualWindow(
     end,
     topPadPx: start * rowHeight,
     bottomPadPx: Math.max(0, (totalRows - end) * rowHeight),
+  };
+}
+
+export function formatPaginationStatus(
+  pageInfo: CategoryPageInfo | undefined,
+  filteredCount: number,
+  rawCount: number,
+  hasSearch: boolean,
+): {
+  subheaderText: string;
+  rangeText: string;
+  estTotal: number;
+  totalPages: number | null;
+  hasMore: boolean;
+  pageIndex: number;
+  isAppend: boolean;
+} {
+  if (!pageInfo) {
+    const label = hasSearch
+      ? `${filteredCount.toLocaleString()} of ${rawCount.toLocaleString()} items`
+      : `${filteredCount.toLocaleString()} items`;
+    return {
+      subheaderText: label,
+      rangeText: label,
+      estTotal: rawCount,
+      totalPages: null,
+      hasMore: false,
+      pageIndex: 1,
+      isAppend: false,
+    };
+  }
+  const pageIndex = Math.max(1, pageInfo.page_index || 1);
+  const limit = Math.max(1, pageInfo.limit || 100);
+  const hasMore = Boolean(pageInfo.continue_token);
+  const isAppend = pageInfo.mode === "append" && rawCount > limit;
+  const rem = pageInfo.remaining_count ?? 0;
+
+  if (isAppend) {
+    const estTotal = rawCount + rem;
+    const rangeText = hasMore
+      ? `${rawCount.toLocaleString()} of ${estTotal.toLocaleString()} loaded`
+      : `${rawCount.toLocaleString()} items`;
+    const subheaderText = hasSearch
+      ? `${filteredCount.toLocaleString()} matching (${rangeText})`
+      : rangeText;
+    return {
+      subheaderText,
+      rangeText,
+      estTotal,
+      totalPages: null,
+      hasMore,
+      pageIndex,
+      isAppend: true,
+    };
+  }
+
+  const offset = (pageIndex - 1) * limit;
+  const estTotal = offset + rawCount + rem;
+  const isPaged = hasMore || pageIndex > 1;
+  if (!isPaged) {
+    const label = hasSearch
+      ? `${filteredCount.toLocaleString()} of ${rawCount.toLocaleString()} items`
+      : `${rawCount.toLocaleString()} items`;
+    return {
+      subheaderText: label,
+      rangeText: label,
+      estTotal: rawCount,
+      totalPages: 1,
+      hasMore: false,
+      pageIndex: 1,
+      isAppend: false,
+    };
+  }
+
+  const startNum = rawCount > 0 ? offset + 1 : 0;
+  const endNum = offset + rawCount;
+  const rangeText =
+    rawCount > 0
+      ? `${startNum.toLocaleString()}–${endNum.toLocaleString()} of ${estTotal.toLocaleString()} items`
+      : `0 of ${estTotal.toLocaleString()} items`;
+  const subheaderText = hasSearch
+    ? `${filteredCount.toLocaleString()} matching (${startNum.toLocaleString()}–${endNum.toLocaleString()} of ${estTotal.toLocaleString()})`
+    : rangeText;
+  const totalPages = estTotal > 0 ? Math.max(pageIndex, Math.ceil(estTotal / limit)) : null;
+  return {
+    subheaderText,
+    rangeText,
+    estTotal,
+    totalPages,
+    hasMore,
+    pageIndex,
+    isAppend: false,
   };
 }
 
@@ -935,9 +1031,26 @@ export function App() {
     openInBrowser: boolean;
   } | null>(null);
 
-  // Searchable Namespace Picker state
+  // Searchable & virtualized Namespace Picker state
   const [nsMenuOpen, setNsMenuOpen] = useState<boolean>(false);
   const [nsSearch, setNsSearch] = useState<string>("");
+  const [nsScrollTop, setNsScrollTop] = useState<number>(0);
+  const nsListRef = useRef<HTMLDivElement>(null);
+
+  // Server-side limit + continue pagination state
+  const [pageSize, setPageSize] = useState<number>(() => {
+    try {
+      const saved = Number(window.localStorage.getItem("k8s.pageSize") || "100");
+      return PAGE_SIZE_OPTIONS.includes(saved as any) ? saved : 100;
+    } catch {
+      return 100;
+    }
+  });
+  const pageSizeRef = useRef<number>(pageSize);
+  pageSizeRef.current = pageSize;
+  const [prevTokensByKind, setPrevTokensByKind] = useState<Record<string, string[]>>({});
+  const [pageLoading, setPageLoading] = useState<boolean>(false);
+
   const [debuggerImage, setDebuggerImage] = useState<string>("dengliu/k8sdebugger:3cfd912");
   const [customHotbar, setCustomHotbar] = useState<string[] | null>(null);
   const [hotbarContextMenu, setHotbarContextMenu] = useState<{ name: string; x: number; y: number } | null>(null);
@@ -1104,6 +1217,7 @@ export function App() {
         }
         if (m.op === "state") {
           pollInFlightSinceRef.current = 0;
+          setPageLoading(false);
           if (typeof m.pollDurationMs === "number" && Number.isFinite(m.pollDurationMs)) {
             lastPollDurationMsRef.current = m.pollDurationMs;
           }
@@ -1115,6 +1229,20 @@ export function App() {
           }
           if (Array.isArray(m.hotbarItems)) {
             setCustomHotbar((prev) => (prev === null ? m.hotbarItems : prev));
+          }
+          if (m.snapshot?.page_info) {
+            const pmap = m.snapshot.page_info as Record<string, CategoryPageInfo>;
+            setPrevTokensByKind((prev) => {
+              let changed = false;
+              const next = { ...prev };
+              for (const [k, info] of Object.entries(pmap)) {
+                if ((info.page_index || 1) <= 1 && next[k] && next[k].length > 0) {
+                  delete next[k];
+                  changed = true;
+                }
+              }
+              return changed ? next : prev;
+            });
           }
           setSnapshot((prev) => {
             const next: ClusterSnapshot = m.snapshot || prev;
@@ -1145,7 +1273,7 @@ export function App() {
             const curCtx = m.snapshot?.current_context || "";
             sendToBackend({ op: "sync-cluster", context: curCtx });
           } else if (m.needsClusterFetch) {
-            sendToBackend({ op: "load-category", category: "Pod" });
+            sendToBackend({ op: "load-category", category: "Pod", limit: pageSizeRef.current });
           }
         } else if (m.op === "resource-json") {
           try {
@@ -1170,7 +1298,7 @@ export function App() {
         // ignore malformed message
       }
     });
-    sendToBackend({ op: "init" });
+    sendToBackend({ op: "init", limit: pageSizeRef.current });
   }, []);
 
   const catalogList: ClusterContextInfo[] = useMemo(() => {
@@ -1312,6 +1440,8 @@ export function App() {
     const defaultNs = (entry && entry.namespace) || "default";
     const nextKind = targetKind || (activeKind === "ClusterCatalog" ? "Pod" : activeKind);
     loadedLazyRef.current = {};
+    setPrevTokensByKind({});
+    setPageLoading(true);
     setClusterMenuOpen(false);
     setSelectedRowKey(null);
     setCheckedRows({});
@@ -1328,10 +1458,12 @@ export function App() {
       resources: [],
       events: [],
       helm_releases: [],
+      page_info: {},
+      overview_counts: {},
       namespaces: Array.from(new Set([defaultNs, "default", "kube-system"])),
     }));
     setBanner({ text: `Connecting to ${chosen} (${defaultNs})…`, isError: false });
-    sendToBackend({ op: "set-context", context: chosen, category: nextKind });
+    sendToBackend({ op: "set-context", context: chosen, category: nextKind, limit: pageSize });
   }
 
   function handleSelectKind(nextKind: string) {
@@ -1343,36 +1475,140 @@ export function App() {
     setBulkDeleteConfirmOpen(false);
     setDrawerOpen(false);
     setColMenuOpen(false);
+    setPrevTokensByKind((prev) => ({ ...prev, [nextKind]: [] }));
     // Ensure parent group is expanded
     const parentGroup = SIDEBAR_TREE.find((g) => g.items?.some((i) => i.kind === nextKind));
     if (parentGroup) {
       setExpandedGroups((prev) => ({ ...prev, [parentGroup.id]: true }));
     }
     if (nextKind !== "ClusterCatalog") {
-      const hasAny = (snapshot.resources || []).some((r) => r.kind === nextKind);
+      const hasAny =
+        nextKind === "Event"
+          ? (snapshot.events || []).length > 0
+          : (snapshot.resources || []).some((r) => r.kind === nextKind);
       if (!hasAny && nextKind !== "Workspace" && nextKind !== "ClusterOverview" && nextKind !== "WorkloadsOverview") {
         setBanner({ text: `Loading ${nextKind}…`, isError: false });
       }
+      setPageLoading(true);
       loadedLazyRef.current[nextKind] = true;
-      sendToBackend({ op: "load-category", category: nextKind });
+      sendToBackend({ op: "load-category", category: nextKind, limit: pageSize, pageIndex: 1 });
     }
   }
 
   function handleSelectNamespace(val: string) {
     loadedLazyRef.current = {};
+    setPrevTokensByKind({});
+    setPageLoading(true);
     setSelectedRowKey(null);
     setCheckedRows({});
     setBulkDeleteConfirmOpen(false);
     setDrawerOpen(false);
     if (val === "__ALL__") {
-      setSnapshot((prev) => ({ ...prev, all_namespaces: true }));
+      setSnapshot((prev) => ({ ...prev, all_namespaces: true, page_info: {} }));
       setBanner({ text: "Querying all namespaces…", isError: false });
-      sendToBackend({ op: "set-all-namespaces", all: true, category: activeKind });
+      sendToBackend({ op: "set-all-namespaces", all: true, category: activeKind, limit: pageSize });
     } else {
-      setSnapshot((prev) => ({ ...prev, current_namespace: val, all_namespaces: false }));
+      setSnapshot((prev) => ({ ...prev, current_namespace: val, all_namespaces: false, page_info: {} }));
       setBanner({ text: `Switching namespace to ${val}…`, isError: false });
-      sendToBackend({ op: "set-namespace", namespace: val, category: activeKind });
+      sendToBackend({ op: "set-namespace", namespace: val, category: activeKind, limit: pageSize });
     }
+  }
+
+  function resetScrollToTop() {
+    setTableScrollTop(0);
+    if (tableContainerRef.current) {
+      tableContainerRef.current.scrollTop = 0;
+    }
+  }
+
+  function handlePageFirst() {
+    setPrevTokensByKind((prev) => ({ ...prev, [activeKind]: [] }));
+    setPageLoading(true);
+    resetScrollToTop();
+    sendToBackend({
+      op: "load-category",
+      category: activeKind,
+      limit: pageSize,
+      continueToken: "",
+      pageMode: "replace",
+      pageIndex: 1,
+    });
+  }
+
+  function handlePageNext() {
+    const pi = snapshot.page_info?.[activeKind];
+    if (!pi || !pi.continue_token) return;
+    const curReqTok = pi.request_token || "";
+    const curPageIdx = Math.max(1, pi.page_index || 1);
+    setPrevTokensByKind((prev) => ({
+      ...prev,
+      [activeKind]: [...(prev[activeKind] || []), curReqTok],
+    }));
+    setPageLoading(true);
+    resetScrollToTop();
+    sendToBackend({
+      op: "load-category",
+      category: activeKind,
+      limit: pageSize,
+      continueToken: pi.continue_token,
+      pageMode: "replace",
+      pageIndex: curPageIdx + 1,
+    });
+  }
+
+  function handlePagePrev() {
+    const stack = prevTokensByKind[activeKind] || [];
+    if (stack.length === 0) {
+      handlePageFirst();
+      return;
+    }
+    const prevTok = stack[stack.length - 1] || "";
+    const nextStack = stack.slice(0, -1);
+    setPrevTokensByKind((prev) => ({ ...prev, [activeKind]: nextStack }));
+    setPageLoading(true);
+    resetScrollToTop();
+    sendToBackend({
+      op: "load-category",
+      category: activeKind,
+      limit: pageSize,
+      continueToken: prevTok,
+      pageMode: "replace",
+      pageIndex: nextStack.length + 1,
+    });
+  }
+
+  function handleLoadMore() {
+    const pi = snapshot.page_info?.[activeKind];
+    if (!pi || !pi.continue_token) return;
+    setPageLoading(true);
+    sendToBackend({
+      op: "load-category",
+      category: activeKind,
+      limit: pageSize,
+      continueToken: pi.continue_token,
+      pageMode: "append",
+      pageIndex: Math.max(1, pi.page_index || 1) + 1,
+    });
+  }
+
+  function handleChangePageSize(nextLimit: number) {
+    setPageSize(nextLimit);
+    try {
+      window.localStorage.setItem("k8s.pageSize", String(nextLimit));
+    } catch {
+      // ignore storage errors
+    }
+    setPrevTokensByKind((prev) => ({ ...prev, [activeKind]: [] }));
+    setPageLoading(true);
+    resetScrollToTop();
+    sendToBackend({
+      op: "load-category",
+      category: activeKind,
+      limit: nextLimit,
+      continueToken: "",
+      pageMode: "replace",
+      pageIndex: 1,
+    });
   }
 
   // Active columns configuration for the current kind
@@ -1635,28 +1871,138 @@ export function App() {
     return q ? allAvailableNamespaces.filter((ns) => ns.toLowerCase().includes(q)) : allAvailableNamespaces;
   }, [allAvailableNamespaces, nsSearch]);
 
-  const renderedNamespaces = useMemo(() => {
-    if (matchingNamespaces.length <= MAX_RENDERED_NAMESPACES) return matchingNamespaces;
-    const top = matchingNamespaces.slice(0, MAX_RENDERED_NAMESPACES);
-    if (
-      !snapshot.all_namespaces &&
-      snapshot.current_namespace &&
-      matchingNamespaces.includes(snapshot.current_namespace) &&
-      !top.includes(snapshot.current_namespace)
-    ) {
-      top.unshift(snapshot.current_namespace);
+  useEffect(() => {
+    if (!nsMenuOpen) return;
+    let nextScroll = 0;
+    if (!snapshot.all_namespaces && snapshot.current_namespace && !nsSearch.trim()) {
+      const idx = matchingNamespaces.indexOf(snapshot.current_namespace);
+      if (idx > 4) {
+        nextScroll = Math.max(0, (idx - 3) * NS_OPTION_ROW_HEIGHT);
+      }
     }
-    return top;
-  }, [matchingNamespaces, snapshot.all_namespaces, snapshot.current_namespace]);
+    setNsScrollTop(nextScroll);
+    requestAnimationFrame(() => {
+      if (nsListRef.current) {
+        nsListRef.current.scrollTop = nextScroll;
+      }
+    });
+  }, [nsMenuOpen]);
+
+  const nsVirtualWin = useMemo(
+    () => computeVirtualWindow(matchingNamespaces.length, nsScrollTop, NS_VIEWPORT_HEIGHT, NS_OPTION_ROW_HEIGHT, 10, 50),
+    [matchingNamespaces.length, nsScrollTop],
+  );
+
+  const visibleNamespaces = useMemo(
+    () => matchingNamespaces.slice(nsVirtualWin.start, nsVirtualWin.end),
+    [matchingNamespaces, nsVirtualWin.start, nsVirtualWin.end],
+  );
+
+  const filteredEvents = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    const base = snapshot.events || [];
+    const matched = q
+      ? base.filter(
+          (ev) =>
+            (ev.message || "").toLowerCase().includes(q) ||
+            (ev.reason || "").toLowerCase().includes(q) ||
+            (ev.namespace || "").toLowerCase().includes(q) ||
+            (ev.object || "").toLowerCase().includes(q) ||
+            (ev.kind || "").toLowerCase().includes(q) ||
+            (ev.event_type || "").toLowerCase().includes(q),
+        )
+      : base.slice();
+    matched.sort((a, b) => {
+      if (sortCol === "count") {
+        const av = Number(a.count) || 0;
+        const bv = Number(b.count) || 0;
+        return sortAsc ? av - bv : bv - av;
+      }
+      const valOf = (ev: ClusterEvent): string => {
+        switch (sortCol) {
+          case "type":
+            return ev.event_type || "";
+          case "message":
+            return ev.message || "";
+          case "namespace":
+            return ev.namespace || "";
+          case "object":
+            return `${ev.kind}: ${ev.object}`;
+          case "age":
+            return ev.last_seen || "";
+          default:
+            return ev.last_seen || "";
+        }
+      };
+      const av = valOf(a);
+      const bv = valOf(b);
+      return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+    });
+    return matched;
+  }, [snapshot.events, searchQuery, sortCol, sortAsc]);
+
+  const filteredWorkspace = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    const matched = q
+      ? workspace.filter(
+          (w) =>
+            (w.name || "").toLowerCase().includes(q) ||
+            (w.kind || "").toLowerCase().includes(q) ||
+            (w.namespace || "").toLowerCase().includes(q) ||
+            (w.path || "").toLowerCase().includes(q),
+        )
+      : workspace.slice();
+    matched.sort((a, b) => {
+      const av = String((a as any)[sortCol] ?? a.name ?? "");
+      const bv = String((b as any)[sortCol] ?? b.name ?? "");
+      return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+    });
+    return matched;
+  }, [workspace, searchQuery, sortCol, sortAsc]);
+
+  const activeTotalFilteredRows =
+    activeKind === "Event"
+      ? filteredEvents.length
+      : activeKind === "Workspace"
+        ? filteredWorkspace.length
+        : filteredResources.length;
 
   const virtualWin = useMemo(
-    () => computeVirtualWindow(filteredResources.length, tableScrollTop, tableViewportHeight),
-    [filteredResources.length, tableScrollTop, tableViewportHeight],
+    () => computeVirtualWindow(activeTotalFilteredRows, tableScrollTop, tableViewportHeight),
+    [activeTotalFilteredRows, tableScrollTop, tableViewportHeight],
   );
 
   const visibleResources = useMemo(
     () => filteredResources.slice(virtualWin.start, virtualWin.end),
     [filteredResources, virtualWin.start, virtualWin.end],
+  );
+
+  const visibleEvents = useMemo(
+    () => filteredEvents.slice(virtualWin.start, virtualWin.end),
+    [filteredEvents, virtualWin.start, virtualWin.end],
+  );
+
+  const visibleWorkspace = useMemo(
+    () => filteredWorkspace.slice(virtualWin.start, virtualWin.end),
+    [filteredWorkspace, virtualWin.start, virtualWin.end],
+  );
+
+  const rawActiveCategoryCount = useMemo(() => {
+    if (activeKind === "Event") return (snapshot.events || []).length;
+    if (activeKind === "HelmRelease") return (snapshot.helm_releases || []).length;
+    return (snapshot.resources || []).filter((r) => r.kind === activeKind).length;
+  }, [snapshot.events, snapshot.helm_releases, snapshot.resources, activeKind]);
+
+  const activePageInfo: CategoryPageInfo | undefined = snapshot.page_info?.[activeKind];
+  const paginationStatus = useMemo(
+    () =>
+      formatPaginationStatus(
+        activePageInfo,
+        activeKind === "Event" ? filteredEvents.length : filteredResources.length,
+        rawActiveCategoryCount,
+        Boolean(searchQuery.trim()),
+      ),
+    [activePageInfo, activeKind, filteredEvents.length, filteredResources.length, rawActiveCategoryCount, searchQuery],
   );
 
   function getPodContainerItems(
@@ -2553,14 +2899,16 @@ export function App() {
           <div className="fl-subheader-title">{currentViewLabel}</div>
           <div className="fl-subheader-count">
             {activeKind === "ClusterCatalog"
-              ? `${catalogList.length} items`
+              ? `${catalogList.length.toLocaleString()} items`
               : activeKind === "Workspace"
-                ? `${workspace.length} items`
-                : activeKind === "Event"
-                  ? `${(snapshot.events || []).length} items`
-                  : activeKind === "HelmRelease"
-                    ? `${(snapshot.helm_releases || []).length} items`
-                    : `${filteredResources.length} items`}
+                ? searchQuery.trim()
+                  ? `${filteredWorkspace.length.toLocaleString()} of ${workspace.length.toLocaleString()} items`
+                  : `${workspace.length.toLocaleString()} items`
+                : activeKind === "HelmRelease"
+                  ? `${filteredResources.length.toLocaleString()} items`
+                  : activeKind === "ClusterOverview" || activeKind === "WorkloadsOverview"
+                    ? ""
+                    : paginationStatus.subheaderText}
           </div>
           <div className="fl-subheader-controls">
             {activeKind !== "ClusterCatalog" &&
@@ -2587,12 +2935,16 @@ export function App() {
                       <input
                         className="fl-ns-search"
                         type="text"
-                        placeholder={`Filter ${allAvailableNamespaces.length} namespaces…`}
+                        placeholder={`Filter ${allAvailableNamespaces.length.toLocaleString()} namespaces…`}
                         value={nsSearch}
-                        onChange={(e) => setNsSearch(e.target.value)}
+                        onChange={(e) => {
+                          setNsSearch(e.target.value);
+                          setNsScrollTop(0);
+                          if (nsListRef.current) nsListRef.current.scrollTop = 0;
+                        }}
                         autoFocus
                       />
-                      <div className="fl-ns-list">
+                      <div className="fl-ns-pinned">
                         <div
                           className={`fl-ns-opt ${snapshot.all_namespaces ? "active" : ""}`}
                           onClick={() => {
@@ -2604,12 +2956,22 @@ export function App() {
                           <span>All Namespaces</span>
                           {snapshot.all_namespaces && <span>✓</span>}
                         </div>
-                        {renderedNamespaces.map((ns) => {
+                      </div>
+                      <div
+                        ref={nsListRef}
+                        className="fl-ns-list"
+                        onScroll={(e) => setNsScrollTop(e.currentTarget.scrollTop)}
+                      >
+                        {nsVirtualWin.topPadPx > 0 && (
+                          <div style={{ height: nsVirtualWin.topPadPx }} aria-hidden="true" />
+                        )}
+                        {visibleNamespaces.map((ns) => {
                           const isSelected = !snapshot.all_namespaces && ns === snapshot.current_namespace;
                           return (
                             <div
                               key={ns}
                               className={`fl-ns-opt ${isSelected ? "active" : ""}`}
+                              title={ns}
                               onClick={() => {
                                 setNsMenuOpen(false);
                                 setNsSearch("");
@@ -2621,18 +2983,14 @@ export function App() {
                             </div>
                           );
                         })}
-                        {matchingNamespaces.length > MAX_RENDERED_NAMESPACES && (
-                          <div
-                            style={{
-                              padding: "6px 10px",
-                              fontSize: 11.5,
-                              color: "var(--fl-fg-muted)",
-                              borderTop: "1px solid var(--fl-border)",
-                            }}
-                          >
-                            Showing {renderedNamespaces.length} of {matchingNamespaces.length} namespaces — type to filter
-                          </div>
+                        {nsVirtualWin.bottomPadPx > 0 && (
+                          <div style={{ height: nsVirtualWin.bottomPadPx }} aria-hidden="true" />
                         )}
+                      </div>
+                      <div className="fl-ns-footer">
+                        {nsSearch.trim()
+                          ? `${matchingNamespaces.length.toLocaleString()} of ${allAvailableNamespaces.length.toLocaleString()} namespaces`
+                          : `${allAvailableNamespaces.length.toLocaleString()} namespaces — scroll or type to filter`}
                       </div>
                     </div>
                   )}
@@ -2657,7 +3015,9 @@ export function App() {
               title="Refresh"
               onClick={() => {
                 setBanner({ text: `Refreshing ${currentViewLabel}…`, isError: false });
-                sendToBackend({ op: "load-category", category: activeKind });
+                setPageLoading(true);
+                setPrevTokensByKind((prev) => ({ ...prev, [activeKind]: [] }));
+                sendToBackend({ op: "load-category", category: activeKind, limit: pageSize, pageIndex: 1 });
                 sendToBackend({ op: "sync-cluster", context: snapshot.current_context });
               }}
             >
@@ -2688,11 +3048,12 @@ export function App() {
                 ["ConfigMap", "Config Maps"],
                 ["Secret", "Secrets"],
               ].map(([k, label]) => {
-                const count = (snapshot.resources || []).filter((r) => r.kind === k).length;
+                const rawCnt = (snapshot.resources || []).filter((r) => r.kind === k).length;
+                const count = snapshot.overview_counts?.[k] ?? rawCnt;
                 return (
                   <div key={k} className="fl-overview-card" onClick={() => handleSelectKind(k)}>
                     <div className="fl-overview-card-title">{label}</div>
-                    <div className="fl-overview-card-count">{count}</div>
+                    <div className="fl-overview-card-count">{count.toLocaleString()}</div>
                   </div>
                 );
               })}
@@ -2885,50 +3246,42 @@ export function App() {
                 </tr>
               </thead>
               <tbody>
-                {(snapshot.events || [])
-                  .slice()
-                  .sort((a, b) => {
-                    if (sortCol === "count") {
-                      const av = Number(a.count) || 0;
-                      const bv = Number(b.count) || 0;
-                      return sortAsc ? av - bv : bv - av;
-                    }
-                    const valOf = (ev: ClusterEvent): string => {
-                      switch (sortCol) {
-                        case "type":
-                          return ev.event_type || "";
-                        case "message":
-                          return ev.message || "";
-                        case "namespace":
-                          return ev.namespace || "";
-                        case "object":
-                          return `${ev.kind}: ${ev.object}`;
-                        case "age":
-                          return ev.last_seen || "";
-                        default:
-                          return ev.last_seen || "";
-                      }
-                    };
-                    const av = valOf(a);
-                    const bv = valOf(b);
-                    return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
-                  })
-                  .map((ev, i) => (
-                    <tr key={i}>
-                      <td>
-                        <span className={`fl-status-text ${ev.event_type === "Warning" ? "warn" : "ok"}`}>
-                          {ev.event_type}
-                        </span>
-                      </td>
-                      <td title={ev.message}>{ev.message}</td>
-                      <td>{ev.namespace}</td>
-                      <td className="fl-link-teal">
-                        {ev.kind}: {ev.object}
-                      </td>
-                      <td>{ev.count}</td>
-                      <td>{formatCompactAge(ev.last_seen)}</td>
-                    </tr>
-                  ))}
+                {filteredEvents.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} style={{ textAlign: "center", padding: "32px 16px", color: "var(--fl-fg-muted)" }}>
+                      {banner && !banner.isError ? banner.text : "No events found."}
+                    </td>
+                  </tr>
+                ) : (
+                  <>
+                    {virtualWin.topPadPx > 0 && (
+                      <tr aria-hidden="true" style={{ height: virtualWin.topPadPx, border: "none" }}>
+                        <td colSpan={6} style={{ padding: 0, border: "none" }} />
+                      </tr>
+                    )}
+                    {visibleEvents.map((ev, i) => (
+                      <tr key={`${ev.namespace}/${ev.object}/${ev.reason}/${virtualWin.start + i}`}>
+                        <td>
+                          <span className={`fl-status-text ${ev.event_type === "Warning" ? "warn" : "ok"}`}>
+                            {ev.event_type}
+                          </span>
+                        </td>
+                        <td title={ev.message}>{ev.message}</td>
+                        <td>{ev.namespace}</td>
+                        <td className="fl-link-teal">
+                          {ev.kind}: {ev.object}
+                        </td>
+                        <td>{ev.count}</td>
+                        <td>{formatCompactAge(ev.last_seen)}</td>
+                      </tr>
+                    ))}
+                    {virtualWin.bottomPadPx > 0 && (
+                      <tr aria-hidden="true" style={{ height: virtualWin.bottomPadPx, border: "none" }}>
+                        <td colSpan={6} style={{ padding: 0, border: "none" }} />
+                      </tr>
+                    )}
+                  </>
+                )}
               </tbody>
             </table>
           ) : activeKind === "Workspace" ? (
@@ -2962,23 +3315,29 @@ export function App() {
                 </tr>
               </thead>
               <tbody>
-                {workspace
-                  .slice()
-                  .sort((a, b) => {
-                    const av = String((a as any)[sortCol] ?? a.name ?? "");
-                    const bv = String((b as any)[sortCol] ?? b.name ?? "");
-                    return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
-                  })
-                  .map((w, i) => (
-                    <tr key={i} onClick={() => sendToBackend({ op: "open-location", path: w.fullPath, line: w.line })}>
-                      <td>{w.kind}</td>
-                      <td>{w.name}</td>
-                      <td>{w.namespace}</td>
-                      <td className="fl-link-teal">
-                        {w.path}:{w.line + 1}
-                      </td>
-                    </tr>
-                  ))}
+                {virtualWin.topPadPx > 0 && (
+                  <tr aria-hidden="true" style={{ height: virtualWin.topPadPx, border: "none" }}>
+                    <td colSpan={4} style={{ padding: 0, border: "none" }} />
+                  </tr>
+                )}
+                {visibleWorkspace.map((w, i) => (
+                  <tr
+                    key={`${w.fullPath}:${w.line}:${virtualWin.start + i}`}
+                    onClick={() => sendToBackend({ op: "open-location", path: w.fullPath, line: w.line })}
+                  >
+                    <td>{w.kind}</td>
+                    <td>{w.name}</td>
+                    <td>{w.namespace}</td>
+                    <td className="fl-link-teal">
+                      {w.path}:{w.line + 1}
+                    </td>
+                  </tr>
+                ))}
+                {virtualWin.bottomPadPx > 0 && (
+                  <tr aria-hidden="true" style={{ height: virtualWin.bottomPadPx, border: "none" }}>
+                    <td colSpan={4} style={{ padding: 0, border: "none" }} />
+                  </tr>
+                )}
               </tbody>
             </table>
           ) : (
@@ -3170,6 +3529,87 @@ export function App() {
             </table>
           )}
         </div>
+
+        {/* Sticky Server-Side Pagination Footer Bar */}
+        {activeKind !== "ClusterCatalog" &&
+          activeKind !== "Workspace" &&
+          activeKind !== "ClusterOverview" &&
+          activeKind !== "WorkloadsOverview" &&
+          activeKind !== "HelmRelease" &&
+          activeKind !== "CustomResourceDefinition" &&
+          (paginationStatus.hasMore ||
+            paginationStatus.pageIndex > 1 ||
+            paginationStatus.isAppend ||
+            rawActiveCategoryCount >= 50) && (
+            <div className="fl-pagination-bar" onClick={(e) => e.stopPropagation()}>
+              <div>
+                <span>{paginationStatus.rangeText}</span>
+                {pageLoading && <span style={{ marginLeft: 10, opacity: 0.75 }}>Loading…</span>}
+              </div>
+              <div className="fl-pagination-controls">
+                <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginRight: 6 }}>
+                  <span>Rows:</span>
+                  <select
+                    className="fl-page-select"
+                    aria-label="Rows per page"
+                    value={pageSize}
+                    onChange={(e) => handleChangePageSize(Number(e.target.value))}
+                  >
+                    {PAGE_SIZE_OPTIONS.map((opt) => (
+                      <option key={opt} value={opt}>
+                        {opt}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {paginationStatus.hasMore && rawActiveCategoryCount < 2000 && (
+                  <button
+                    type="button"
+                    className="fl-page-btn"
+                    disabled={pageLoading}
+                    title={`Append next ${pageSize} items into the current view`}
+                    onClick={handleLoadMore}
+                  >
+                    + Load {pageSize} more
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="fl-page-btn"
+                  disabled={pageLoading || (paginationStatus.pageIndex <= 1 && !paginationStatus.isAppend)}
+                  title="First page"
+                  onClick={handlePageFirst}
+                >
+                  ⟪ First
+                </button>
+                <button
+                  type="button"
+                  className="fl-page-btn"
+                  disabled={pageLoading || paginationStatus.pageIndex <= 1 || paginationStatus.isAppend}
+                  title="Previous page"
+                  onClick={handlePagePrev}
+                >
+                  ‹ Prev
+                </button>
+                <span style={{ padding: "0 6px" }}>
+                  {paginationStatus.isAppend
+                    ? `${rawActiveCategoryCount.toLocaleString()} loaded`
+                    : paginationStatus.totalPages
+                      ? `Page ${paginationStatus.pageIndex.toLocaleString()} of ${paginationStatus.totalPages.toLocaleString()}`
+                      : `Page ${paginationStatus.pageIndex.toLocaleString()}`}
+                </span>
+                <button
+                  type="button"
+                  className="fl-page-btn"
+                  disabled={pageLoading || !paginationStatus.hasMore}
+                  title="Next page"
+                  onClick={handlePageNext}
+                >
+                  Next ›
+                </button>
+              </div>
+            </div>
+          )}
 
         {/* Floating Bulk Remove Button ("Remove selected items (N)") */}
         {selectedCheckedResources.length > 0 &&

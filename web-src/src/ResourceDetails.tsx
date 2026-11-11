@@ -495,7 +495,8 @@ function PodDetailsListSection({
 }) {
   const [sortCol, setSortCol] = useState<"name" | "node" | "namespace" | "cpu" | "memory">("cpu");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
-  const [showAll, setShowAll] = useState<boolean>(false);
+  const [podPage, setPodPage] = useState<number>(1);
+  const DRAWER_PAGE_SIZE = 50;
 
   const hideNode = ownerKind === "Node";
 
@@ -555,7 +556,12 @@ function PodDetailsListSection({
           </tr>
         </thead>
         <tbody>
-          {(showAll ? sortedPods : sortedPods.slice(0, 100)).map((pod) => {
+          {sortedPods
+            .slice(
+              (Math.min(podPage, Math.max(1, Math.ceil(sortedPods.length / DRAWER_PAGE_SIZE))) - 1) * DRAWER_PAGE_SIZE,
+              Math.min(podPage, Math.max(1, Math.ceil(sortedPods.length / DRAWER_PAGE_SIZE))) * DRAWER_PAGE_SIZE,
+            )
+            .map((pod) => {
             const cpuVal = cpuUnitsToNumber(pod.cpu);
             const memBytes = unitsToBytes(pod.memory);
             const readyText = (pod.ready || "0/0").replace("/", " / ");
@@ -615,13 +621,40 @@ function PodDetailsListSection({
           })}
         </tbody>
       </table>
-      {!showAll && sortedPods.length > 100 && (
-        <div style={{ padding: "8px 0", textAlign: "center" }}>
-          <button type="button" className="fl-icon-btn" onClick={() => setShowAll(true)}>
-            Show all {sortedPods.length} pods
-          </button>
-        </div>
-      )}
+      {sortedPods.length > DRAWER_PAGE_SIZE && (() => {
+        const totalPages = Math.max(1, Math.ceil(sortedPods.length / DRAWER_PAGE_SIZE));
+        const curPage = Math.min(podPage, totalPages);
+        const startIdx = (curPage - 1) * DRAWER_PAGE_SIZE + 1;
+        const endIdx = Math.min(sortedPods.length, curPage * DRAWER_PAGE_SIZE);
+        return (
+          <div className="fl-drawer-pager">
+            <span>
+              {startIdx}–{endIdx} of {sortedPods.length.toLocaleString()} pods
+            </span>
+            <div className="fl-pagination-controls">
+              <button
+                type="button"
+                className="fl-page-btn"
+                disabled={curPage <= 1}
+                onClick={() => setPodPage(Math.max(1, curPage - 1))}
+              >
+                ‹ Prev
+              </button>
+              <span>
+                {curPage} / {totalPages}
+              </span>
+              <button
+                type="button"
+                className="fl-page-btn"
+                disabled={curPage >= totalPages}
+                onClick={() => setPodPage(Math.min(totalPages, curPage + 1))}
+              >
+                Next ›
+              </button>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
@@ -1090,6 +1123,8 @@ export function ResourceDetails({
   onPortForward,
 }: ResourceDetailsProps) {
   const [revealedSecrets, setRevealedSecrets] = useState<Record<string, boolean>>({});
+  const [extraResPage, setExtraResPage] = useState<number>(1);
+  const EXTRA_PAGE_SIZE = 50;
 
   const meta = drawerJson?.metadata || {};
   const spec = drawerJson?.spec || {};
@@ -2649,39 +2684,82 @@ export function ResourceDetails({
                 No custom objects found for {selectedResource.name}
               </div>
             ) : (
-              <table className="fl-subtable">
-                <thead>
-                  <tr>
-                    <th>Name</th>
-                    <th>Namespace</th>
-                    <th>Age</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {extraResources.map((cr) => (
-                    <tr key={`${cr.namespace}/${cr.name}`}>
-                      <td>
-                        <span
-                          className="fl-link-teal"
-                          onClick={() => onOpenResourceByRef(cr.kind, cr.name, cr.namespace)}
-                        >
-                          {cr.name}
-                        </span>
-                      </td>
-                      <td>
-                        {cr.namespace ? (
-                          <span className="fl-link-teal" onClick={() => onSelectNamespace(cr.namespace)}>
-                            {cr.namespace}
-                          </span>
-                        ) : (
-                          "-"
-                        )}
-                      </td>
-                      <td>{formatAgeShort(cr.age)}</td>
+              <>
+                <table className="fl-subtable">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Namespace</th>
+                      <th>Age</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {extraResources
+                      .slice(
+                        (Math.min(extraResPage, Math.max(1, Math.ceil(extraResources.length / EXTRA_PAGE_SIZE))) - 1) *
+                          EXTRA_PAGE_SIZE,
+                        Math.min(extraResPage, Math.max(1, Math.ceil(extraResources.length / EXTRA_PAGE_SIZE))) *
+                          EXTRA_PAGE_SIZE,
+                      )
+                      .map((cr) => (
+                        <tr key={`${cr.namespace}/${cr.name}`}>
+                          <td>
+                            <span
+                              className="fl-link-teal"
+                              onClick={() => onOpenResourceByRef(cr.kind, cr.name, cr.namespace)}
+                            >
+                              {cr.name}
+                            </span>
+                          </td>
+                          <td>
+                            {cr.namespace ? (
+                              <span className="fl-link-teal" onClick={() => onSelectNamespace(cr.namespace)}>
+                                {cr.namespace}
+                              </span>
+                            ) : (
+                              "-"
+                            )}
+                          </td>
+                          <td>{formatAgeShort(cr.age)}</td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+                {extraResources.length > EXTRA_PAGE_SIZE && (() => {
+                  const totalPages = Math.max(1, Math.ceil(extraResources.length / EXTRA_PAGE_SIZE));
+                  const curPage = Math.min(extraResPage, totalPages);
+                  return (
+                    <div className="fl-drawer-pager">
+                      <span>
+                        {(curPage - 1) * EXTRA_PAGE_SIZE + 1}–
+                        {Math.min(extraResources.length, curPage * EXTRA_PAGE_SIZE)} of{" "}
+                        {extraResources.length.toLocaleString()}
+                      </span>
+                      <div className="fl-pagination-controls">
+                        <button
+                          type="button"
+                          className="fl-page-btn"
+                          disabled={curPage <= 1}
+                          onClick={() => setExtraResPage(Math.max(1, curPage - 1))}
+                        >
+                          ‹ Prev
+                        </button>
+                        <span>
+                          {curPage} / {totalPages}
+                        </span>
+                        <button
+                          type="button"
+                          className="fl-page-btn"
+                          disabled={curPage >= totalPages}
+                          onClick={() => setExtraResPage(Math.min(totalPages, curPage + 1))}
+                        >
+                          Next ›
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </>
             )}
           </div>
         </>

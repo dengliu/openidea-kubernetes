@@ -4440,61 +4440,35 @@ pub fn fetch_resource_extras(
     let mut events: Vec<ClusterEvent> = Vec::new();
 
     if kind == "Node" {
-        let mut p_args = cfg.base_args(false);
-        p_args.extend([
+        let enc_node = url_encode_component(name);
+        let mut raw_args = cfg.base_args(false);
+        raw_args.extend([
             "get".into(),
-            "pods".into(),
-            "-A".into(),
-            "--field-selector".into(),
-            format!("spec.nodeName={name}"),
-            "-o".into(),
-            CUSTOM_COLUMNS_SPEC.into(),
-            "--no-headers".into(),
+            "--raw".into(),
+            format!("/api/v1/pods?fieldSelector=spec.nodeName%3D{enc_node}&limit=250"),
         ]);
-        if let Ok(out) = run_kubectl(project, &p_args, None)
+        if let Ok(out) = run_kubectl_timed(project, &raw_args, None, Some(5))
             && out.status == Some(0)
+            && out.stdout.trim_start().starts_with('{')
+            && let Some((pods, _, _)) = parse_paged_resource_list_json(&out.stdout, Some("Pod"))
         {
-            related_pods = parse_custom_columns_resources(&out.stdout);
-        }
-        if !related_pods.is_empty() {
-            let mut t_args = cfg.base_args(false);
-            t_args.extend([
-                "top".into(),
+            related_pods = pods;
+        } else {
+            let mut p_args = cfg.base_args(false);
+            p_args.extend([
+                "get".into(),
                 "pods".into(),
                 "-A".into(),
                 "--field-selector".into(),
                 format!("spec.nodeName={name}"),
+                "-o".into(),
+                "wide".into(),
                 "--no-headers".into(),
             ]);
-            if let Ok(out) = run_kubectl(project, &t_args, None)
+            if let Ok(out) = run_kubectl_timed(project, &p_args, None, Some(5))
                 && out.status == Some(0)
             {
-                let mut metrics: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
-                for line in out.stdout.lines() {
-                    let cols: Vec<&str> = line.split_whitespace().collect();
-                    if cols.len() >= 4 {
-                        let ns = cols[0].to_owned();
-                        let pname = cols[1].to_owned();
-                        let raw_cpu = cols[2];
-                        let cpu = if let Some(m) = raw_cpu
-                            .strip_suffix('m')
-                            .and_then(|v| v.parse::<f64>().ok())
-                        {
-                            format!("{:.3}", m / 1000.0)
-                        } else {
-                            raw_cpu.to_owned()
-                        };
-                        metrics.insert((ns, pname), (cpu, cols[3].to_owned()));
-                    }
-                }
-                for pod in &mut related_pods {
-                    if let Some((cpu, mem)) =
-                        metrics.get(&(pod.namespace.clone(), pod.name.clone()))
-                    {
-                        pod.cpu = cpu.clone();
-                        pod.memory = mem.clone();
-                    }
-                }
+                related_pods = parse_pods_wide_table(&out.stdout, true, "default");
             }
         }
     } else if matches!(
@@ -4612,11 +4586,18 @@ pub fn fetch_resource_extras(
         }
     } else if kind == "StorageClass" {
         let mut pv_args = cfg.base_args(false);
-        pv_args.extend(["get".into(), "pv".into(), "-o".into(), "json".into()]);
-        if let Ok(out) = run_kubectl(project, &pv_args, None)
+        pv_args.extend([
+            "get".into(),
+            "--raw".into(),
+            "/api/v1/persistentvolumes?limit=250".into(),
+        ]);
+        if let Ok(out) = run_kubectl_timed(project, &pv_args, None, Some(5))
             && out.status == Some(0)
+            && out.stdout.trim_start().starts_with('{')
+            && let Some((pvs, _, _)) =
+                parse_paged_resource_list_json(&out.stdout, Some("PersistentVolume"))
         {
-            related_resources = parse_resource_list_json(&out.stdout)
+            related_resources = pvs
                 .into_iter()
                 .filter(|r| r.detail.contains(&format!("storageClass: {name}")))
                 .collect();
@@ -4629,7 +4610,7 @@ pub fn fetch_resource_extras(
             "-o".into(),
             "json".into(),
         ]);
-        if let Ok(out) = run_kubectl(project, &rq_args, None)
+        if let Ok(out) = run_kubectl_timed(project, &rq_args, None, Some(4))
             && out.status == Some(0)
         {
             related_resources = parse_resource_list_json(&out.stdout);
@@ -4640,14 +4621,15 @@ pub fn fetch_resource_extras(
             "get".into(),
             name.to_owned(),
             "-A".into(),
-            "-o".into(),
-            CR_INSTANCE_COLUMNS_SPEC.into(),
             "--no-headers".into(),
         ]);
-        if let Ok(out) = run_kubectl(project, &cr_args, None)
+        if let Ok(out) = run_kubectl_timed(project, &cr_args, None, Some(5))
             && out.status == Some(0)
         {
-            related_resources = parse_cr_instance_lines(&out.stdout, name);
+            related_resources = parse_cr_instance_lines(&out.stdout, name)
+                .into_iter()
+                .take(250)
+                .collect();
         }
     } else if kind == "HelmRelease" {
         let mut rel_args = cfg.target_args(Some(namespace));

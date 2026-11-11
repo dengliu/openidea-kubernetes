@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { computePollDelayMs, computeVirtualWindow, formatCompactAge, VIRTUAL_ROW_HEIGHT } from "./App";
+import {
+  computePollDelayMs,
+  computeVirtualWindow,
+  formatCompactAge,
+  formatPaginationStatus,
+  NS_OPTION_ROW_HEIGHT,
+  NS_VIEWPORT_HEIGHT,
+  VIRTUAL_ROW_HEIGHT,
+} from "./App";
 import { bytesToUnits, cpuUnitsToNumber, formatKubeMemory, toYamlLines, unitsToBytes } from "./ResourceDetails";
 
 describe("ResourceDetails helpers", () => {
@@ -15,6 +23,72 @@ describe("ResourceDetails helpers", () => {
     expect(win.end).toBe(540);
     expect(win.topPadPx).toBe(480 * VIRTUAL_ROW_HEIGHT);
     expect(win.bottomPadPx).toBe((10000 - 540) * VIRTUAL_ROW_HEIGHT);
+
+    // Virtualizes 1,007 namespaces in the Namespace Picker dropdown without truncating tail items
+    const nsTailWin = computeVirtualWindow(
+      1007,
+      1007 * NS_OPTION_ROW_HEIGHT - NS_VIEWPORT_HEIGHT,
+      NS_VIEWPORT_HEIGHT,
+      NS_OPTION_ROW_HEIGHT,
+      10,
+      50,
+    );
+    expect(nsTailWin.end).toBe(1007);
+    expect(nsTailWin.end - nsTailWin.start).toBeLessThanOrEqual(40);
+    expect(nsTailWin.bottomPadPx).toBe(0);
+  });
+
+  it("formats server-side pagination ranges and totals across replace and append modes", () => {
+    const p1 = formatPaginationStatus(
+      {
+        category: "Pod",
+        limit: 100,
+        continue_token: "tok-2",
+        remaining_count: 52710,
+        loaded_count: 100,
+        page_index: 1,
+        mode: "replace",
+      },
+      100,
+      100,
+      false,
+    );
+    expect(p1.subheaderText).toBe("1–100 of 52,810 items");
+    expect(p1.totalPages).toBe(529);
+    expect(p1.hasMore).toBe(true);
+
+    const p3Filtered = formatPaginationStatus(
+      {
+        category: "Pod",
+        limit: 100,
+        continue_token: "tok-4",
+        remaining_count: 52510,
+        loaded_count: 100,
+        page_index: 3,
+        mode: "replace",
+      },
+      7,
+      100,
+      true,
+    );
+    expect(p3Filtered.subheaderText).toBe("7 matching (201–300 of 52,810)");
+
+    const appended = formatPaginationStatus(
+      {
+        category: "Event",
+        limit: 100,
+        continue_token: "ev-tok",
+        remaining_count: 133648,
+        loaded_count: 300,
+        page_index: 3,
+        mode: "append",
+      },
+      300,
+      300,
+      false,
+    );
+    expect(appended.subheaderText).toBe("300 of 133,948 loaded");
+    expect(appended.isAppend).toBe(true);
   });
 
   it("preserves server-side table multi-unit duration strings in formatCompactAge", () => {

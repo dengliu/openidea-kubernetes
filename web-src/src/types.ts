@@ -73,6 +73,17 @@ export interface HelmRelease {
   updated: string;
 }
 
+export interface CategoryPageInfo {
+  category: string;
+  limit: number;
+  request_token?: string;
+  continue_token: string;
+  remaining_count?: number | null;
+  loaded_count: number;
+  page_index: number;
+  mode: "replace" | "append" | string;
+}
+
 export interface ClusterSnapshot {
   connected: boolean;
   error?: string | null;
@@ -85,6 +96,8 @@ export interface ClusterSnapshot {
   resources: ClusterResource[];
   events: ClusterEvent[];
   helm_releases: HelmRelease[];
+  page_info?: Record<string, CategoryPageInfo>;
+  overview_counts?: Record<string, number>;
 }
 
 export interface WorkspaceManifest {

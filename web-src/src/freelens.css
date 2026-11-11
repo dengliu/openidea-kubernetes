@@ -1766,8 +1766,8 @@ body,
   position: absolute;
   top: 36px;
   right: 0;
-  width: 260px;
-  max-height: 380px;
+  width: 280px;
+  max-height: 390px;
   display: flex;
   flex-direction: column;
   background: var(--fl-bg);
@@ -1780,6 +1780,7 @@ body,
 
 .fl-ns-search {
   width: 100%;
+  box-sizing: border-box;
   border: none;
   border-bottom: 1px solid var(--fl-border);
   padding: 8px 10px;
@@ -1788,21 +1789,48 @@ body,
   background: var(--fl-bg-elevated);
   color: var(--fl-fg);
   outline: none;
+  flex-shrink: 0;
+}
+
+.fl-ns-pinned {
+  border-bottom: 1px solid var(--fl-border);
+  flex-shrink: 0;
 }
 
 .fl-ns-list {
   flex: 1;
+  max-height: 288px;
   overflow-y: auto;
-  padding: 4px 0;
+  padding: 0;
 }
 
 .fl-ns-opt {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 12px;
+  gap: 8px;
+  height: 30px;
+  box-sizing: border-box;
+  padding: 0 12px;
   font-size: 12.5px;
   cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.fl-ns-opt > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fl-ns-footer {
+  padding: 5px 12px;
+  font-size: 11px;
+  color: var(--fl-fg-muted);
+  border-top: 1px solid var(--fl-border);
+  background: var(--fl-bg-elevated);
+  flex-shrink: 0;
 }
 
 .fl-ns-opt:hover {
@@ -1813,6 +1841,72 @@ body,
   background: color-mix(in srgb, var(--fl-teal) 16%, var(--fl-bg));
   color: var(--fl-teal-text);
   font-weight: 600;
+}
+
+.fl-pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 38px;
+  padding: 0 18px;
+  border-top: 1px solid var(--fl-border);
+  background: var(--fl-bg-elevated);
+  font-size: 12px;
+  color: var(--fl-fg-muted);
+  flex-shrink: 0;
+}
+
+.fl-pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.fl-page-btn {
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--fl-border);
+  border-radius: 4px;
+  background: var(--fl-bg);
+  color: var(--fl-fg);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.fl-page-btn:hover:not(:disabled) {
+  background: var(--fl-bg-hover);
+}
+
+.fl-page-btn:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.fl-page-select {
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--fl-border);
+  border-radius: 4px;
+  background: var(--fl-bg);
+  color: var(--fl-fg);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.fl-drawer-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 2px;
+  font-size: 11.5px;
+  color: var(--fl-fg-muted);
 }
 
 /* Interactive Pod Shell Terminal inside Drawer */
