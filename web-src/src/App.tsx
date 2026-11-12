@@ -1191,6 +1191,10 @@ function DrawerLogViewer({ text }: { text: string }) {
               ref={findInputRef}
               className="fl-log-find-input"
               placeholder="Find"
+              spellCheck={false}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
               value={query}
               onChange={(e) => {
                 setQuery(e.target.value);
@@ -3792,6 +3796,10 @@ export function App() {
                         className="fl-ns-search"
                         type="text"
                         placeholder={`Filter ${allAvailableNamespaces.length.toLocaleString()} namespaces…`}
+                        spellCheck={false}
+                        autoComplete="off"
+                        autoCorrect="off"
+                        autoCapitalize="off"
                         value={nsSearch}
                         onChange={(e) => {
                           setNsSearch(e.target.value);
@@ -3922,6 +3930,10 @@ export function App() {
                 className="fl-search-box"
                 type="text"
                 placeholder={`Search ${currentViewLabel}...`}
+                spellCheck={false}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 onKeyDown={(e) => {
@@ -5558,6 +5570,9 @@ export function App() {
                   value={yamlDraft}
                   onChange={(e) => setYamlDraft(e.target.value)}
                   spellCheck={false}
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
                 />
               </div>
             ) : drawerMode === "logs" ? (
@@ -5726,6 +5741,10 @@ export function App() {
                   <input
                     type="text"
                     className="fl-pf-underline-input"
+                    spellCheck={false}
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
                     value={pfModal.address}
                     onChange={(e) => setPfModal({ ...pfModal, address: e.target.value })}
                   />
@@ -5736,6 +5755,10 @@ export function App() {
                     type="text"
                     className="fl-pf-underline-input"
                     placeholder="Random"
+                    spellCheck={false}
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
                     value={pfModal.localPort}
                     onChange={(e) => setPfModal({ ...pfModal, localPort: e.target.value.replace(/[^\d]/g, "") })}
                     autoFocus
