@@ -87,6 +87,20 @@ export interface CategoryPageInfo {
   watch_supported?: boolean;
 }
 
+export interface RemoteSearchState {
+  requestId: number;
+  category: string;
+  query: string;
+  scopeKey: string;
+  loading: boolean;
+  resources: ClusterResource[];
+  events: ClusterEvent[];
+  totalMatches: number;
+  scannedTotal: number;
+  truncated: boolean;
+  error: string | null;
+}
+
 export interface ClusterSnapshot {
   connected: boolean;
   error?: string | null;

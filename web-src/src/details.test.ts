@@ -4,11 +4,15 @@ import {
   computePollDelayMs,
   computeVirtualWindow,
   formatCompactAge,
+  formatGroundTruthSearchSummary,
   formatNamespaceButtonLabel,
   formatPaginationStatus,
+  matchesEventSearch,
+  matchesResourceSearch,
   NS_OPTION_ROW_HEIGHT,
   NS_VIEWPORT_HEIGHT,
   resolveSelectedNamespaces,
+  shouldRunClusterGroundTruthSearch,
   shouldTriggerAutoLoadMore,
   SOFT_AUTO_LOAD_CAP,
   toggleNamespaceInSelection,
@@ -347,5 +351,99 @@ describe("ResourceDetails helpers", () => {
       "        values:",
       "        - linux",
     ]);
+  });
+
+  it("triggers cluster ground-truth search only when a paged category is partially loaded", () => {
+    const partialPods = {
+      category: "Pod",
+      limit: 200,
+      continue_token: "p2-tok",
+      remaining_count: 45958,
+      loaded_count: 200,
+      page_index: 1,
+      mode: "replace" as const,
+    };
+    const fullyLoadedPods = {
+      ...partialPods,
+      continue_token: "",
+      remaining_count: 0,
+      loaded_count: 320,
+    };
+
+    expect(shouldRunClusterGroundTruthSearch("Pod", "brix", partialPods)).toBe(true);
+    expect(shouldRunClusterGroundTruthSearch("Event", "BackOff", { ...partialPods, category: "Event" })).toBe(true);
+    expect(shouldRunClusterGroundTruthSearch("CR:workloads.kueue.x-k8s.io", "gpu", partialPods)).toBe(true);
+    expect(shouldRunClusterGroundTruthSearch("Pod", "   ", partialPods)).toBe(false);
+    expect(shouldRunClusterGroundTruthSearch("Pod", "brix", fullyLoadedPods)).toBe(false);
+    expect(shouldRunClusterGroundTruthSearch("Workspace", "brix", partialPods)).toBe(false);
+    expect(shouldRunClusterGroundTruthSearch("HelmRelease", "brix", partialPods)).toBe(false);
+  });
+
+  it("matches multi-token, namespace/name, and structured queries consistently with backend search", () => {
+    const pod = {
+      kind: "Pod",
+      name: "brix-runner-7f8b9",
+      namespace: "dayan",
+      status: "CrashLoopBackOff",
+      ready: "0/1",
+      age: "12m",
+      detail: "restarts: 4 • 10.244.99.42 on aks-gpu-77",
+      containers: ["brix"],
+      ports: [],
+      data_keys: [],
+      pod_ip: "10.244.99.42",
+      node_name: "aks-gpu-77",
+    };
+    const knownNs = new Set(["dayan", "adx-mon", "kube-system"]);
+    expect(matchesResourceSearch(pod, "dayan/brix", knownNs)).toBe(true);
+    expect(matchesResourceSearch(pod, "adx-mon/brix", knownNs)).toBe(false);
+    expect(matchesResourceSearch(pod, "dayan crashloop", knownNs)).toBe(true);
+    expect(matchesResourceSearch(pod, "node:gpu-77 status:crashloop ip:10.244.99", knownNs)).toBe(true);
+    expect(matchesResourceSearch(pod, "node:cpu-01", knownNs)).toBe(false);
+
+    const ev = {
+      kind: "Pod",
+      object: "brix-runner-7f8b9",
+      namespace: "dayan",
+      reason: "BackOff",
+      message: "Back-off restarting failed container brix",
+      event_type: "Warning",
+      count: 3,
+      last_seen: "12s",
+    };
+    expect(matchesEventSearch(ev, "ns:dayan restarting failed")).toBe(true);
+    expect(matchesEventSearch(ev, "status:warning brix")).toBe(true);
+    expect(matchesEventSearch(ev, "ns:kube-system brix")).toBe(false);
+  });
+
+  it("formats ground-truth search subheader summaries for loading, exact, and truncated results", () => {
+    expect(
+      formatGroundTruthSearchSummary(
+        { loading: true, totalMatches: 0, scannedTotal: 0, truncated: false, error: null },
+        0,
+        46158,
+      ),
+    ).toBe("Searching 46,158 items…");
+    expect(
+      formatGroundTruthSearchSummary(
+        { loading: false, totalMatches: 14, scannedTotal: 46158, truncated: false, error: null },
+        14,
+        46158,
+      ),
+    ).toBe("14 matches across 46,158 items");
+    expect(
+      formatGroundTruthSearchSummary(
+        { loading: false, totalMatches: 1, scannedTotal: 46158, truncated: false, error: null },
+        1,
+        46158,
+      ),
+    ).toBe("1 match across 46,158 items");
+    expect(
+      formatGroundTruthSearchSummary(
+        { loading: false, totalMatches: 1840, scannedTotal: 46158, truncated: true, error: null },
+        500,
+        46158,
+      ),
+    ).toBe("First 500 of 1,840 matches across 46,158 items");
   });
 });

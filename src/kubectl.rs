@@ -7013,3 +7013,1287 @@ impl WatchManager {
         }
     }
 }
+
+/// Maximum number of matched rows returned to the UI from a ground-truth cluster search.
+/// `total_matches` and `scanned_total` always reflect the exact un-truncated counts across the scope.
+pub const MAX_SEARCH_RESULTS: usize = 500;
+
+/// Outcome of a ground-truth cluster search across an entire category scope when local pagination
+/// holds only a partial window of the cluster's items.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategorySearchOutcome {
+    pub category: String,
+    pub query: String,
+    pub resources: Vec<ClusterResource>,
+    pub events: Vec<ClusterEvent>,
+    pub total_matches: u64,
+    pub scanned_total: u64,
+    pub truncated: bool,
+    pub error: Option<String>,
+}
+
+#[inline]
+pub fn contains_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.is_ascii() {
+        let hb = haystack.as_bytes();
+        let nb = needle_lower.as_bytes();
+        if nb.len() > hb.len() {
+            return false;
+        }
+        let first = nb[0];
+        for i in 0..=(hb.len() - nb.len()) {
+            if hb[i].to_ascii_lowercase() == first && hb[i..i + nb.len()].eq_ignore_ascii_case(nb) {
+                return true;
+            }
+        }
+        false
+    } else {
+        haystack.to_lowercase().contains(needle_lower)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SearchToken {
+    Any(String),
+    Namespace(String),
+    Node(String),
+    Status(String),
+    Ip(String),
+}
+
+fn parse_search_tokens(raw_query: &str) -> Vec<SearchToken> {
+    raw_query
+        .split_whitespace()
+        .filter(|tok| !tok.is_empty())
+        .map(|tok| {
+            let lower = tok.to_lowercase();
+            if let Some(v) = lower
+                .strip_prefix("ns:")
+                .or_else(|| lower.strip_prefix("namespace:"))
+                .filter(|s| !s.is_empty())
+            {
+                SearchToken::Namespace(v.to_owned())
+            } else if let Some(v) = lower.strip_prefix("node:").filter(|s| !s.is_empty()) {
+                SearchToken::Node(v.to_owned())
+            } else if let Some(v) = lower
+                .strip_prefix("status:")
+                .or_else(|| lower.strip_prefix("phase:"))
+                .filter(|s| !s.is_empty())
+            {
+                SearchToken::Status(v.to_owned())
+            } else if let Some(v) = lower.strip_prefix("ip:").filter(|s| !s.is_empty()) {
+                SearchToken::Ip(v.to_owned())
+            } else {
+                SearchToken::Any(lower)
+            }
+        })
+        .collect()
+}
+
+fn pod_fields_match_tokens(
+    tokens: &[SearchToken],
+    namespace: &str,
+    name: &str,
+    status: &str,
+    pod_ip: &str,
+    node_name: &str,
+    detail_hint: &str,
+) -> bool {
+    tokens.iter().all(|tok| match tok {
+        SearchToken::Namespace(v) => contains_case_insensitive(namespace, v),
+        SearchToken::Node(v) => contains_case_insensitive(node_name, v),
+        SearchToken::Status(v) => contains_case_insensitive(status, v),
+        SearchToken::Ip(v) => contains_case_insensitive(pod_ip, v),
+        SearchToken::Any(v) => {
+            contains_case_insensitive(name, v)
+                || contains_case_insensitive(namespace, v)
+                || contains_case_insensitive(status, v)
+                || contains_case_insensitive(node_name, v)
+                || contains_case_insensitive(pod_ip, v)
+                || contains_case_insensitive(detail_hint, v)
+        }
+    })
+}
+
+pub fn resource_matches_search_query(res: &ClusterResource, query: &str) -> bool {
+    let tokens = parse_search_tokens(query);
+    resource_matches_tokens(res, &tokens)
+}
+
+fn resource_matches_tokens(res: &ClusterResource, tokens: &[SearchToken]) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+    tokens.iter().all(|tok| match tok {
+        SearchToken::Namespace(v) => contains_case_insensitive(&res.namespace, v),
+        SearchToken::Node(v) => contains_case_insensitive(&res.node_name, v),
+        SearchToken::Status(v) => contains_case_insensitive(&res.status, v),
+        SearchToken::Ip(v) => contains_case_insensitive(&res.pod_ip, v),
+        SearchToken::Any(v) => {
+            contains_case_insensitive(&res.name, v)
+                || contains_case_insensitive(&res.namespace, v)
+                || contains_case_insensitive(&res.status, v)
+                || contains_case_insensitive(&res.detail, v)
+                || contains_case_insensitive(&res.controlled_by_kind, v)
+                || contains_case_insensitive(&res.controlled_by_name, v)
+                || contains_case_insensitive(&res.pod_ip, v)
+                || contains_case_insensitive(&res.node_name, v)
+        }
+    })
+}
+
+pub fn event_matches_search_query(ev: &ClusterEvent, query: &str) -> bool {
+    let tokens = parse_search_tokens(query);
+    event_matches_tokens(ev, &tokens)
+}
+
+fn event_matches_tokens(ev: &ClusterEvent, tokens: &[SearchToken]) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+    tokens.iter().all(|tok| match tok {
+        SearchToken::Namespace(v) => contains_case_insensitive(&ev.namespace, v),
+        SearchToken::Status(v) => {
+            contains_case_insensitive(&ev.event_type, v) || contains_case_insensitive(&ev.reason, v)
+        }
+        SearchToken::Node(v) | SearchToken::Ip(v) | SearchToken::Any(v) => {
+            contains_case_insensitive(&ev.message, v)
+                || contains_case_insensitive(&ev.reason, v)
+                || contains_case_insensitive(&ev.namespace, v)
+                || contains_case_insensitive(&ev.object, v)
+                || contains_case_insensitive(&ev.kind, v)
+                || contains_case_insensitive(&ev.event_type, v)
+        }
+    })
+}
+
+fn normalize_event_object_kind(raw_kind: &str) -> String {
+    let base = raw_kind.split('.').next().unwrap_or(raw_kind);
+    match base.to_ascii_lowercase().as_str() {
+        "pod" => "Pod".into(),
+        "node" => "Node".into(),
+        "deployment" => "Deployment".into(),
+        "replicaset" => "ReplicaSet".into(),
+        "statefulset" => "StatefulSet".into(),
+        "daemonset" => "DaemonSet".into(),
+        "job" => "Job".into(),
+        "cronjob" => "CronJob".into(),
+        "service" => "Service".into(),
+        "endpoints" => "Endpoints".into(),
+        "ingress" => "Ingress".into(),
+        "configmap" => "ConfigMap".into(),
+        "secret" => "Secret".into(),
+        "persistentvolumeclaim" => "PersistentVolumeClaim".into(),
+        "persistentvolume" => "PersistentVolume".into(),
+        "namespace" => "Namespace".into(),
+        "serviceaccount" => "ServiceAccount".into(),
+        "horizontalpodautoscaler" => "HorizontalPodAutoscaler".into(),
+        _ => {
+            let mut chars = base.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => "Object".into(),
+            }
+        }
+    }
+}
+
+/// Parses a single `kubectl get events [-A] --no-headers` Server-Side Table line.
+pub fn parse_event_table_line(
+    line: &str,
+    all_namespaces: bool,
+    default_ns: &str,
+) -> Option<ClusterEvent> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with("No resources found") {
+        return None;
+    }
+    let expected_prefix_cols = if all_namespaces { 5 } else { 4 };
+    let mut iter = trimmed.split_whitespace();
+    let namespace = if all_namespaces {
+        clean_col(iter.next()?).to_owned()
+    } else {
+        default_ns.to_owned()
+    };
+    let last_seen = clean_col(iter.next()?).to_owned();
+    let event_type = clean_col(iter.next()?).to_owned();
+    let reason = clean_col(iter.next()?).to_owned();
+    let obj_tok = iter.next()?;
+
+    // Extract remainder of `trimmed` after `expected_prefix_cols` whitespace-delimited tokens.
+    let mut rest = trimmed;
+    for _ in 0..expected_prefix_cols {
+        rest = rest.trim_start();
+        let tok_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        rest = &rest[tok_len..];
+    }
+    let message = rest.trim().to_owned();
+
+    let (kind, object) = if let Some((rk, name)) = obj_tok.split_once('/') {
+        (normalize_event_object_kind(rk), name.to_owned())
+    } else {
+        ("Object".into(), obj_tok.to_owned())
+    };
+
+    Some(ClusterEvent {
+        namespace,
+        last_seen,
+        event_type,
+        reason,
+        object,
+        kind,
+        message,
+        count: 1,
+    })
+}
+
+fn parse_secret_table_line(line: &str, default_ns: &str) -> Option<ClusterResource> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with("No resources found") {
+        return None;
+    }
+    let cols: Vec<&str> = trimmed.split_whitespace().collect();
+    if cols.len() >= 5 {
+        let ns = clean_col(cols[0]);
+        let name = cols[1];
+        let sec_type = cols[2];
+        let data_cnt = cols[3];
+        let age = cols[4];
+        Some(ClusterResource {
+            kind: "Secret".into(),
+            name: name.to_owned(),
+            namespace: ns.to_owned(),
+            status: sec_type.to_owned(),
+            ready: format!("{data_cnt} keys"),
+            age: age.to_owned(),
+            detail: format!("type: {sec_type}"),
+            ..Default::default()
+        })
+    } else if cols.len() == 4 {
+        if cols[2].chars().all(|c| c.is_ascii_digit()) {
+            let name = cols[0];
+            let sec_type = cols[1];
+            let data_cnt = cols[2];
+            let age = cols[3];
+            Some(ClusterResource {
+                kind: "Secret".into(),
+                name: name.to_owned(),
+                namespace: default_ns.to_owned(),
+                status: sec_type.to_owned(),
+                ready: format!("{data_cnt} keys"),
+                age: age.to_owned(),
+                detail: format!("type: {sec_type}"),
+                ..Default::default()
+            })
+        } else {
+            let ns = clean_col(cols[0]);
+            let name = cols[1];
+            let sec_type = cols[2];
+            let age = cols[3];
+            Some(ClusterResource {
+                kind: "Secret".into(),
+                name: name.to_owned(),
+                namespace: ns.to_owned(),
+                status: sec_type.to_owned(),
+                ready: "Secret".into(),
+                age: age.to_owned(),
+                detail: format!("type: {sec_type}"),
+                ..Default::default()
+            })
+        }
+    } else {
+        None
+    }
+}
+
+fn parse_cr_server_table_line(
+    line: &str,
+    crd_name: &str,
+    all_namespaces: bool,
+    default_ns: &str,
+    is_cluster_scoped: bool,
+) -> Option<ClusterResource> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with("No resources found") {
+        return None;
+    }
+    let cols: Vec<&str> = trimmed.split_whitespace().collect();
+    let namespaced_with_col = all_namespaces && !is_cluster_scoped;
+    let min_cols = if namespaced_with_col { 2 } else { 1 };
+    if cols.len() < min_cols {
+        return None;
+    }
+    let (namespace, name, extra_start) = if namespaced_with_col {
+        (clean_col(cols[0]).to_owned(), cols[1].to_owned(), 2usize)
+    } else if is_cluster_scoped {
+        (String::new(), cols[0].to_owned(), 1usize)
+    } else {
+        (default_ns.to_owned(), cols[0].to_owned(), 1usize)
+    };
+    let age = if cols.len() > extra_start {
+        cols.last().copied().map(clean_col).unwrap_or("").to_owned()
+    } else {
+        String::new()
+    };
+    let middle_status = if cols.len() > extra_start + 1 {
+        clean_col(cols[extra_start])
+    } else {
+        ""
+    };
+    let status = if middle_status.is_empty() {
+        "Active".to_owned()
+    } else {
+        middle_status.to_owned()
+    };
+    Some(ClusterResource {
+        kind: format!("CR:{crd_name}"),
+        name,
+        namespace,
+        status,
+        age,
+        detail: crd_name.to_owned(),
+        controlled_by_name: crd_name.to_owned(),
+        ..Default::default()
+    })
+}
+
+fn scan_pod_wide_lines_matching(
+    text: &str,
+    all_namespaces: bool,
+    default_ns: &str,
+    tokens: &[SearchToken],
+    prev_metrics: &BTreeMap<(String, String), (String, String)>,
+    outcome: &mut CategorySearchOutcome,
+) {
+    let min_cols = if all_namespaces { 6 } else { 5 };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("No resources found") {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+        if cols.len() < min_cols {
+            continue;
+        }
+        let mut idx = 0usize;
+        let ns = if all_namespaces {
+            let v = clean_col(cols[idx]);
+            idx += 1;
+            v
+        } else {
+            default_ns
+        };
+        let name = cols[idx];
+        if name.starts_with("node-dbg-watch-") {
+            continue;
+        }
+        idx += 1;
+        let ready = cols[idx];
+        idx += 1;
+        let status_raw = cols[idx];
+        if name.starts_with("node-debugger-")
+            && matches!(status_raw, "Succeeded" | "Completed" | "Failed")
+        {
+            continue;
+        }
+        idx += 1;
+        let restarts_tok = cols.get(idx).copied().unwrap_or("0");
+        idx += 1;
+        if cols.get(idx).is_some_and(|t| t.starts_with('(')) {
+            while let Some(&tok) = cols.get(idx) {
+                idx += 1;
+                if tok.ends_with(')') {
+                    break;
+                }
+            }
+        }
+        let age = cols.get(idx).copied().map(clean_col).unwrap_or("");
+        let pod_ip = cols.get(idx + 1).copied().map(clean_col).unwrap_or("");
+        let node_name = cols.get(idx + 2).copied().map(clean_col).unwrap_or("");
+
+        outcome.scanned_total += 1;
+
+        let detail_hint = format!("restarts: {restarts_tok}");
+        if !pod_fields_match_tokens(
+            tokens,
+            ns,
+            name,
+            status_raw,
+            pod_ip,
+            node_name,
+            &detail_hint,
+        ) {
+            continue;
+        }
+
+        outcome.total_matches += 1;
+        if outcome.resources.len() >= MAX_SEARCH_RESULTS {
+            outcome.truncated = true;
+            continue;
+        }
+
+        let restarts = restarts_tok.parse::<u64>().unwrap_or(0);
+        let (rdy_cnt, total_cnt) = ready
+            .split_once('/')
+            .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
+            .unwrap_or((0, 0));
+        let mut container_states = Vec::with_capacity(total_cnt.min(16));
+        let mut containers = Vec::with_capacity(total_cnt.min(16));
+        let is_done = matches!(status_raw, "Completed" | "Succeeded");
+        for i in 0..total_cnt.min(16) {
+            let cname = format!("c{}", i + 1);
+            containers.push(cname.clone());
+            let (cstate, cready, creason) = if is_done {
+                ("terminated".to_owned(), false, "Completed".to_owned())
+            } else if i < rdy_cnt {
+                ("running".to_owned(), true, String::new())
+            } else {
+                ("waiting".to_owned(), false, status_raw.to_owned())
+            };
+            container_states.push(ContainerStateBadge {
+                name: cname,
+                state: cstate,
+                ready: cready,
+                reason: creason,
+                ..Default::default()
+            });
+        }
+        let detail = match (node_name.is_empty(), pod_ip.is_empty()) {
+            (false, false) => format!("restarts: {restarts} • {pod_ip} on {node_name}"),
+            (false, true) => format!("restarts: {restarts} • {node_name}"),
+            _ => format!("restarts: {restarts}"),
+        };
+        let (cpu, memory) = prev_metrics
+            .get(&(ns.to_owned(), name.to_owned()))
+            .cloned()
+            .unwrap_or_default();
+        outcome.resources.push(ClusterResource {
+            kind: "Pod".into(),
+            name: name.to_owned(),
+            namespace: ns.to_owned(),
+            status: status_raw.to_owned(),
+            ready: ready.to_owned(),
+            age: age.to_owned(),
+            detail,
+            containers,
+            container_states,
+            cpu,
+            memory,
+            restarts,
+            pod_ip: pod_ip.to_owned(),
+            node_name: node_name.to_owned(),
+            ..Default::default()
+        });
+    }
+}
+
+fn scan_generic_server_table_lines_matching(
+    kind: &str,
+    text: &str,
+    all_namespaces: bool,
+    default_ns: &str,
+    tokens: &[SearchToken],
+    outcome: &mut CategorySearchOutcome,
+) {
+    // Feed each line individually into `parse_server_table_resources` so the 25,000-row batch guard
+    // never truncates large clusters while still reusing 100% of kind-specific column synthesis.
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("No resources found") {
+            continue;
+        }
+        let mut parsed = parse_server_table_resources(kind, trimmed, all_namespaces, default_ns);
+        let Some(res) = parsed.pop() else {
+            continue;
+        };
+        outcome.scanned_total += 1;
+        if resource_matches_tokens(&res, tokens) {
+            outcome.total_matches += 1;
+            if outcome.resources.len() < MAX_SEARCH_RESULTS {
+                outcome.resources.push(res);
+            } else {
+                outcome.truncated = true;
+            }
+        }
+    }
+}
+
+fn run_kubectl_commands_batch(
+    project: &Project,
+    arg_sets: &[Vec<String>],
+    timeout_secs: u32,
+) -> Vec<Result<ProcessOutput, Error>> {
+    if arg_sets.len() <= 1 {
+        return arg_sets
+            .iter()
+            .map(|args| run_kubectl_timed(project, args, None, Some(timeout_secs)))
+            .collect();
+    }
+    let mut spawned: Vec<Option<host::Child>> = Vec::with_capacity(arg_sets.len());
+    for args in arg_sets {
+        let mut with_timeout = args.clone();
+        with_timeout.push(format!("--request-timeout={timeout_secs}s"));
+        let cmd = host::Command::new("kubectl").args(with_timeout);
+        spawned.push(host::start(&cmd, Some(project)).ok());
+    }
+    let wait_ms = timeout_secs.saturating_mul(1_000).max(1_000);
+    spawned
+        .into_iter()
+        .zip(arg_sets.iter())
+        .map(|(maybe_child, args)| {
+            if let Some(child) = maybe_child {
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                let mut status: Option<i32> = None;
+                let mut overflowed_ring = false;
+                for _ in 0..8 {
+                    match child.wait(wait_ms) {
+                        Ok(chunk) => {
+                            if stdout.len().saturating_add(chunk.stdout.len()) >= 900 * 1024 {
+                                overflowed_ring = true;
+                                break;
+                            }
+                            stdout.push_str(&chunk.stdout);
+                            stderr.push_str(&chunk.stderr);
+                            if chunk.status.is_some() {
+                                status = chunk.status;
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            overflowed_ring = true;
+                            break;
+                        }
+                    }
+                }
+                let _ = child.kill();
+                if !overflowed_ring && status.is_some() {
+                    return Ok(ProcessOutput {
+                        status,
+                        stdout,
+                        stderr,
+                    });
+                }
+            }
+            run_kubectl_timed(project, args, None, Some(timeout_secs))
+        })
+        .collect()
+}
+
+const MULTI_NS_SEARCH_CONCURRENCY: usize = 4;
+
+#[allow(clippy::too_many_arguments)]
+fn search_resources_via_raw_pages(
+    project: &Project,
+    cfg: &KubeConfigState,
+    kind: &str,
+    endpoint: (&str, &str, bool),
+    tokens: &[SearchToken],
+    prev_pod_metrics: &BTreeMap<(String, String), (String, String)>,
+    prev_node_metrics: &BTreeMap<String, (String, String)>,
+    is_cancelled: &dyn Fn() -> bool,
+    outcome: &mut CategorySearchOutcome,
+) -> bool {
+    let mut cursor = String::new();
+    for _ in 0..500 {
+        if is_cancelled() {
+            break;
+        }
+        let opts = FetchOptions {
+            limit: 500,
+            continue_token: cursor.clone(),
+            append: true,
+            ..FetchOptions::default()
+        };
+        match fetch_raw_paged_resources(project, cfg, kind, endpoint, &opts, Some(15)) {
+            RawPageOutcome::Page(page) => {
+                for mut res in page.items {
+                    outcome.scanned_total += 1;
+                    if resource_matches_tokens(&res, tokens) {
+                        outcome.total_matches += 1;
+                        if outcome.resources.len() < MAX_SEARCH_RESULTS {
+                            if res.kind == "Pod"
+                                && let Some((c, m)) =
+                                    prev_pod_metrics.get(&(res.namespace.clone(), res.name.clone()))
+                            {
+                                res.cpu = c.clone();
+                                res.memory = m.clone();
+                            } else if res.kind == "Node"
+                                && let Some((c, m)) = prev_node_metrics.get(&res.name)
+                            {
+                                res.cpu = c.clone();
+                                res.memory = m.clone();
+                            }
+                            outcome.resources.push(res);
+                        } else {
+                            outcome.truncated = true;
+                        }
+                    }
+                }
+                if page.continue_token.is_empty() || page.continue_token == cursor {
+                    return true;
+                }
+                cursor = page.continue_token;
+            }
+            RawPageOutcome::Unsupported | RawPageOutcome::Failed(_) => {
+                return outcome.scanned_total > 0;
+            }
+        }
+    }
+    outcome.scanned_total > 0
+}
+
+fn search_events_via_raw_pages(
+    project: &Project,
+    cfg: &KubeConfigState,
+    tokens: &[SearchToken],
+    is_cancelled: &dyn Fn() -> bool,
+    outcome: &mut CategorySearchOutcome,
+) -> bool {
+    let mut cursor = String::new();
+    for _ in 0..500 {
+        if is_cancelled() {
+            break;
+        }
+        let opts = FetchOptions {
+            limit: 500,
+            continue_token: cursor.clone(),
+            append: true,
+            ..FetchOptions::default()
+        };
+        match fetch_raw_paged_events(project, cfg, &opts, Some(15)) {
+            RawPageOutcome::Page(page) => {
+                for ev in page.items {
+                    outcome.scanned_total += 1;
+                    if event_matches_tokens(&ev, tokens) {
+                        outcome.total_matches += 1;
+                        if outcome.events.len() < MAX_SEARCH_RESULTS {
+                            outcome.events.push(ev);
+                        } else {
+                            outcome.truncated = true;
+                        }
+                    }
+                }
+                if page.continue_token.is_empty() || page.continue_token == cursor {
+                    return true;
+                }
+                cursor = page.continue_token;
+            }
+            RawPageOutcome::Unsupported | RawPageOutcome::Failed(_) => {
+                return outcome.scanned_total > 0;
+            }
+        }
+    }
+    outcome.scanned_total > 0
+}
+
+/// Searches Kubernetes ground truth across the entire active scope (`All Namespaces`, single namespace,
+/// or multiple selected namespaces) when the local UI table holds only a partial paginated window.
+pub fn search_cluster_category_ground_truth(
+    project: &Project,
+    cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+    category: &str,
+    query: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> CategorySearchOutcome {
+    let trimmed_query = query.trim();
+    let mut outcome = CategorySearchOutcome {
+        category: category.to_owned(),
+        query: trimmed_query.to_owned(),
+        ..Default::default()
+    };
+    if trimmed_query.is_empty() {
+        return outcome;
+    }
+
+    let (_, is_builtin_cluster_scoped, _) = kubectl_resource_info(category);
+    let is_cluster_scoped = if let Some(crd_name) = category.strip_prefix("CR:") {
+        snap.resources
+            .iter()
+            .find(|r| r.kind == "CustomResourceDefinition" && r.name == crd_name)
+            .is_some_and(|r| r.status.eq_ignore_ascii_case("Cluster"))
+    } else {
+        is_builtin_cluster_scoped || matches!(category, "Node" | "Namespace")
+    };
+
+    // Fast Path: `namespace/subquery` syntax (e.g. `dayan/brix` or `kube-system/`) narrows a 90k-item
+    // cluster query directly to that namespace whenever the prefix matches a real cluster namespace.
+    let mut effective_cfg = cfg.clone();
+    let mut effective_query = trimmed_query;
+    if !is_cluster_scoped
+        && !matches!(category, "Event" | "Ingress" | "HelmRelease" | "Workspace")
+        && let Some((ns_part, rest_part)) = trimmed_query.split_once('/')
+    {
+        let ns_candidate = ns_part.trim();
+        if !ns_candidate.is_empty()
+            && let Some(matched_ns) = snap
+                .namespaces
+                .iter()
+                .find(|n| n.eq_ignore_ascii_case(ns_candidate))
+                .cloned()
+        {
+            let allowed_in_scope =
+                cfg.all_namespaces || cfg.active_namespaces().iter().any(|n| n == &matched_ns);
+            if !allowed_in_scope {
+                return outcome;
+            }
+            effective_cfg = cfg.with_single_namespace(&matched_ns);
+            effective_query = rest_part.trim();
+        }
+    }
+
+    let tokens = parse_search_tokens(effective_query);
+
+    match category {
+        "Event" => {
+            if effective_cfg.is_multi_namespace() {
+                let active = effective_cfg.active_namespaces();
+                let mut ran_table = false;
+                for chunk in active.chunks(MULTI_NS_SEARCH_CONCURRENCY) {
+                    if is_cancelled() {
+                        break;
+                    }
+                    let arg_sets: Vec<Vec<String>> = chunk
+                        .iter()
+                        .map(|ns| {
+                            let sub = effective_cfg.with_single_namespace(ns);
+                            let mut a = sub.base_args(true);
+                            a.extend(["get".into(), "events".into(), "--no-headers".into()]);
+                            a
+                        })
+                        .collect();
+                    let results = run_kubectl_commands_batch(project, &arg_sets, 20);
+                    for (ns, res) in chunk.iter().zip(results) {
+                        if let Ok(out) = res
+                            && out.status == Some(0)
+                        {
+                            ran_table = true;
+                            for line in out.stdout.lines() {
+                                if let Some(ev) = parse_event_table_line(line, false, ns) {
+                                    outcome.scanned_total += 1;
+                                    if event_matches_tokens(&ev, &tokens) {
+                                        outcome.total_matches += 1;
+                                        if outcome.events.len() < MAX_SEARCH_RESULTS {
+                                            outcome.events.push(ev);
+                                        } else {
+                                            outcome.truncated = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !ran_table {
+                    let _ = search_events_via_raw_pages(
+                        project,
+                        &effective_cfg,
+                        &tokens,
+                        is_cancelled,
+                        &mut outcome,
+                    );
+                }
+            } else {
+                let mut ev_args = effective_cfg.base_args(true);
+                ev_args.extend(["get".into(), "events".into()]);
+                effective_cfg.push_scope_flags(&mut ev_args);
+                ev_args.push("--no-headers".into());
+                match run_kubectl_timed(project, &ev_args, None, Some(25)) {
+                    Ok(out) if out.status == Some(0) => {
+                        for line in out.stdout.lines() {
+                            if let Some(ev) = parse_event_table_line(
+                                line,
+                                effective_cfg.all_namespaces,
+                                &effective_cfg.namespace,
+                            ) {
+                                outcome.scanned_total += 1;
+                                if event_matches_tokens(&ev, &tokens) {
+                                    outcome.total_matches += 1;
+                                    if outcome.events.len() < MAX_SEARCH_RESULTS {
+                                        outcome.events.push(ev);
+                                    } else {
+                                        outcome.truncated = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if !search_events_via_raw_pages(
+                            project,
+                            &effective_cfg,
+                            &tokens,
+                            is_cancelled,
+                            &mut outcome,
+                        ) {
+                            outcome.error = Some("Cluster event search timed out or failed".into());
+                        }
+                    }
+                }
+            }
+        }
+        "Node" => {
+            let prev_metrics: BTreeMap<String, (String, String)> = snap
+                .resources
+                .iter()
+                .filter(|r| r.kind == "Node" && (!r.cpu.is_empty() || !r.memory.is_empty()))
+                .map(|r| (r.name.clone(), (r.cpu.clone(), r.memory.clone())))
+                .collect();
+            let mut wide_args = effective_cfg.base_args(false);
+            wide_args.extend([
+                "get".into(),
+                "nodes".into(),
+                "-o".into(),
+                "wide".into(),
+                "--no-headers".into(),
+            ]);
+            match run_kubectl_timed(project, &wide_args, None, Some(20)) {
+                Ok(out) if out.status == Some(0) => {
+                    for res in parse_nodes_wide_table(&out.stdout, &prev_metrics) {
+                        outcome.scanned_total += 1;
+                        if resource_matches_tokens(&res, &tokens) {
+                            outcome.total_matches += 1;
+                            if outcome.resources.len() < MAX_SEARCH_RESULTS {
+                                outcome.resources.push(res);
+                            } else {
+                                outcome.truncated = true;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if let Some((api_prefix, plural, cs)) = k8s_api_endpoint_info("Node") {
+                        let empty_pod = BTreeMap::new();
+                        let _ = search_resources_via_raw_pages(
+                            project,
+                            &effective_cfg,
+                            "Node",
+                            (api_prefix, plural, cs),
+                            &tokens,
+                            &empty_pod,
+                            &prev_metrics,
+                            is_cancelled,
+                            &mut outcome,
+                        );
+                    }
+                }
+            }
+        }
+        "Namespace" => {
+            let mut ns_args = effective_cfg.base_args(false);
+            ns_args.extend(["get".into(), "namespaces".into(), "--no-headers".into()]);
+            match run_kubectl_timed(project, &ns_args, None, Some(20)) {
+                Ok(out) if out.status == Some(0) => {
+                    for line in out.stdout.lines() {
+                        let cols: Vec<&str> = line.split_whitespace().collect();
+                        let Some(&name) = cols.first() else {
+                            continue;
+                        };
+                        if name == "No" && cols.get(1) == Some(&"resources") {
+                            continue;
+                        }
+                        let res = ClusterResource {
+                            kind: "Namespace".into(),
+                            name: name.to_owned(),
+                            status: cols.get(1).copied().unwrap_or("Active").to_owned(),
+                            age: cols.get(2).copied().unwrap_or("").to_owned(),
+                            ..Default::default()
+                        };
+                        outcome.scanned_total += 1;
+                        if resource_matches_tokens(&res, &tokens) {
+                            outcome.total_matches += 1;
+                            if outcome.resources.len() < MAX_SEARCH_RESULTS {
+                                outcome.resources.push(res);
+                            } else {
+                                outcome.truncated = true;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if let Some((api_prefix, plural, cs)) = k8s_api_endpoint_info("Namespace") {
+                        let empty_pod = BTreeMap::new();
+                        let empty_node = BTreeMap::new();
+                        let _ = search_resources_via_raw_pages(
+                            project,
+                            &effective_cfg,
+                            "Namespace",
+                            (api_prefix, plural, cs),
+                            &tokens,
+                            &empty_pod,
+                            &empty_node,
+                            is_cancelled,
+                            &mut outcome,
+                        );
+                    }
+                }
+            }
+        }
+        "Secret" => {
+            if effective_cfg.is_multi_namespace() {
+                let active = effective_cfg.active_namespaces();
+                let mut ran_table = false;
+                for chunk in active.chunks(MULTI_NS_SEARCH_CONCURRENCY) {
+                    if is_cancelled() {
+                        break;
+                    }
+                    let arg_sets: Vec<Vec<String>> = chunk
+                        .iter()
+                        .map(|ns| {
+                            let sub = effective_cfg.with_single_namespace(ns);
+                            let mut a = sub.base_args(true);
+                            a.extend(["get".into(), "secrets".into(), "--no-headers".into()]);
+                            a
+                        })
+                        .collect();
+                    let results = run_kubectl_commands_batch(project, &arg_sets, 20);
+                    for (ns, res) in chunk.iter().zip(results) {
+                        if let Ok(out) = res
+                            && out.status == Some(0)
+                        {
+                            ran_table = true;
+                            for line in out.stdout.lines() {
+                                if let Some(sec) = parse_secret_table_line(line, ns) {
+                                    outcome.scanned_total += 1;
+                                    if resource_matches_tokens(&sec, &tokens) {
+                                        outcome.total_matches += 1;
+                                        if outcome.resources.len() < MAX_SEARCH_RESULTS {
+                                            outcome.resources.push(sec);
+                                        } else {
+                                            outcome.truncated = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !ran_table
+                    && let Some((api_prefix, plural, cs)) = k8s_api_endpoint_info("Secret")
+                {
+                    let empty_pod = BTreeMap::new();
+                    let empty_node = BTreeMap::new();
+                    let _ = search_resources_via_raw_pages(
+                        project,
+                        &effective_cfg,
+                        "Secret",
+                        (api_prefix, plural, cs),
+                        &tokens,
+                        &empty_pod,
+                        &empty_node,
+                        is_cancelled,
+                        &mut outcome,
+                    );
+                }
+            } else {
+                let mut sec_args = effective_cfg.base_args(true);
+                sec_args.extend(["get".into(), "secrets".into()]);
+                effective_cfg.push_scope_flags(&mut sec_args);
+                sec_args.push("--no-headers".into());
+                match run_kubectl_timed(project, &sec_args, None, Some(25)) {
+                    Ok(out) if out.status == Some(0) => {
+                        for line in out.stdout.lines() {
+                            if let Some(sec) =
+                                parse_secret_table_line(line, &effective_cfg.namespace)
+                            {
+                                outcome.scanned_total += 1;
+                                if resource_matches_tokens(&sec, &tokens) {
+                                    outcome.total_matches += 1;
+                                    if outcome.resources.len() < MAX_SEARCH_RESULTS {
+                                        outcome.resources.push(sec);
+                                    } else {
+                                        outcome.truncated = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some((api_prefix, plural, cs)) = k8s_api_endpoint_info("Secret") {
+                            let empty_pod = BTreeMap::new();
+                            let empty_node = BTreeMap::new();
+                            let _ = search_resources_via_raw_pages(
+                                project,
+                                &effective_cfg,
+                                "Secret",
+                                (api_prefix, plural, cs),
+                                &tokens,
+                                &empty_pod,
+                                &empty_node,
+                                is_cancelled,
+                                &mut outcome,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        kind if kind.starts_with("CR:") => {
+            let crd_name = kind.strip_prefix("CR:").unwrap_or(kind);
+            if !is_cluster_scoped && effective_cfg.is_multi_namespace() {
+                let active = effective_cfg.active_namespaces();
+                let mut ran_table = false;
+                for chunk in active.chunks(MULTI_NS_SEARCH_CONCURRENCY) {
+                    if is_cancelled() {
+                        break;
+                    }
+                    let arg_sets: Vec<Vec<String>> = chunk
+                        .iter()
+                        .map(|ns| {
+                            let sub = effective_cfg.with_single_namespace(ns);
+                            let mut a = sub.base_args(true);
+                            a.extend(["get".into(), crd_name.to_owned(), "--no-headers".into()]);
+                            a
+                        })
+                        .collect();
+                    let results = run_kubectl_commands_batch(project, &arg_sets, 20);
+                    for (ns, res) in chunk.iter().zip(results) {
+                        if let Ok(out) = res
+                            && out.status == Some(0)
+                        {
+                            ran_table = true;
+                            for line in out.stdout.lines() {
+                                if let Some(cr) =
+                                    parse_cr_server_table_line(line, crd_name, false, ns, false)
+                                {
+                                    outcome.scanned_total += 1;
+                                    if resource_matches_tokens(&cr, &tokens) {
+                                        outcome.total_matches += 1;
+                                        if outcome.resources.len() < MAX_SEARCH_RESULTS {
+                                            outcome.resources.push(cr);
+                                        } else {
+                                            outcome.truncated = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !ran_table
+                    && let Some((api_prefix, plural, cs)) =
+                        resolve_crd_api_endpoint(project, &effective_cfg, snap, crd_name, Some(6))
+                {
+                    let empty_pod = BTreeMap::new();
+                    let empty_node = BTreeMap::new();
+                    let _ = search_resources_via_raw_pages(
+                        project,
+                        &effective_cfg,
+                        kind,
+                        (&api_prefix, &plural, cs),
+                        &tokens,
+                        &empty_pod,
+                        &empty_node,
+                        is_cancelled,
+                        &mut outcome,
+                    );
+                }
+            } else {
+                let mut cr_args = effective_cfg.base_args(!is_cluster_scoped);
+                cr_args.extend(["get".into(), crd_name.to_owned()]);
+                if !is_cluster_scoped {
+                    effective_cfg.push_scope_flags(&mut cr_args);
+                }
+                cr_args.push("--no-headers".into());
+                match run_kubectl_timed(project, &cr_args, None, Some(25)) {
+                    Ok(out) if out.status == Some(0) => {
+                        for line in out.stdout.lines() {
+                            if let Some(cr) = parse_cr_server_table_line(
+                                line,
+                                crd_name,
+                                effective_cfg.all_namespaces,
+                                &effective_cfg.namespace,
+                                is_cluster_scoped,
+                            ) {
+                                outcome.scanned_total += 1;
+                                if resource_matches_tokens(&cr, &tokens) {
+                                    outcome.total_matches += 1;
+                                    if outcome.resources.len() < MAX_SEARCH_RESULTS {
+                                        outcome.resources.push(cr);
+                                    } else {
+                                        outcome.truncated = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some((api_prefix, plural, cs)) = resolve_crd_api_endpoint(
+                            project,
+                            &effective_cfg,
+                            snap,
+                            crd_name,
+                            Some(6),
+                        ) {
+                            let empty_pod = BTreeMap::new();
+                            let empty_node = BTreeMap::new();
+                            let _ = search_resources_via_raw_pages(
+                                project,
+                                &effective_cfg,
+                                kind,
+                                (&api_prefix, &plural, cs),
+                                &tokens,
+                                &empty_pod,
+                                &empty_node,
+                                is_cancelled,
+                                &mut outcome,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        kind => {
+            let (kubectl_type, cluster_scoped, _) = kubectl_resource_info(kind);
+            let prev_pod_metrics: BTreeMap<(String, String), (String, String)> = if kind == "Pod" {
+                snap.resources
+                    .iter()
+                    .filter(|r| r.kind == "Pod" && (!r.cpu.is_empty() || !r.memory.is_empty()))
+                    .map(|r| {
+                        (
+                            (r.namespace.clone(), r.name.clone()),
+                            (r.cpu.clone(), r.memory.clone()),
+                        )
+                    })
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+
+            if !cluster_scoped && effective_cfg.is_multi_namespace() {
+                let active = effective_cfg.active_namespaces();
+                let mut ran_table = false;
+                for chunk in active.chunks(MULTI_NS_SEARCH_CONCURRENCY) {
+                    if is_cancelled() {
+                        break;
+                    }
+                    let arg_sets: Vec<Vec<String>> = chunk
+                        .iter()
+                        .map(|ns| {
+                            let sub = effective_cfg.with_single_namespace(ns);
+                            let mut a = sub.base_args(true);
+                            a.extend(["get".into(), kubectl_type.to_owned()]);
+                            if kind == "Pod" {
+                                a.extend(["-o".into(), "wide".into()]);
+                            }
+                            a.push("--no-headers".into());
+                            a
+                        })
+                        .collect();
+                    let results = run_kubectl_commands_batch(project, &arg_sets, 20);
+                    for (ns, res) in chunk.iter().zip(results) {
+                        if let Ok(out) = res
+                            && out.status == Some(0)
+                        {
+                            ran_table = true;
+                            if kind == "Pod" {
+                                scan_pod_wide_lines_matching(
+                                    &out.stdout,
+                                    false,
+                                    ns,
+                                    &tokens,
+                                    &prev_pod_metrics,
+                                    &mut outcome,
+                                );
+                            } else {
+                                scan_generic_server_table_lines_matching(
+                                    kind,
+                                    &out.stdout,
+                                    false,
+                                    ns,
+                                    &tokens,
+                                    &mut outcome,
+                                );
+                            }
+                        }
+                    }
+                }
+                if !ran_table && let Some((api_prefix, plural, cs)) = k8s_api_endpoint_info(kind) {
+                    let empty_node = BTreeMap::new();
+                    let _ = search_resources_via_raw_pages(
+                        project,
+                        &effective_cfg,
+                        kind,
+                        (api_prefix, plural, cs),
+                        &tokens,
+                        &prev_pod_metrics,
+                        &empty_node,
+                        is_cancelled,
+                        &mut outcome,
+                    );
+                }
+            } else {
+                let mut args = effective_cfg.base_args(!cluster_scoped);
+                args.extend(["get".into(), kubectl_type.to_owned()]);
+                if !cluster_scoped {
+                    effective_cfg.push_scope_flags(&mut args);
+                }
+                if kind == "Pod" {
+                    args.extend(["-o".into(), "wide".into()]);
+                }
+                args.push("--no-headers".into());
+
+                match run_kubectl_timed(project, &args, None, Some(25)) {
+                    Ok(out) if out.status == Some(0) => {
+                        if kind == "Pod" {
+                            scan_pod_wide_lines_matching(
+                                &out.stdout,
+                                effective_cfg.all_namespaces,
+                                &effective_cfg.namespace,
+                                &tokens,
+                                &prev_pod_metrics,
+                                &mut outcome,
+                            );
+                        } else {
+                            let use_all_ns_col = !cluster_scoped && effective_cfg.all_namespaces;
+                            let default_ns = if cluster_scoped {
+                                ""
+                            } else {
+                                effective_cfg.namespace.as_str()
+                            };
+                            scan_generic_server_table_lines_matching(
+                                kind,
+                                &out.stdout,
+                                use_all_ns_col,
+                                default_ns,
+                                &tokens,
+                                &mut outcome,
+                            );
+                        }
+                    }
+                    _ => {
+                        let empty_node = BTreeMap::new();
+                        let ok = if let Some((api_prefix, plural, cs)) = k8s_api_endpoint_info(kind)
+                        {
+                            search_resources_via_raw_pages(
+                                project,
+                                &effective_cfg,
+                                kind,
+                                (api_prefix, plural, cs),
+                                &tokens,
+                                &prev_pod_metrics,
+                                &empty_node,
+                                is_cancelled,
+                                &mut outcome,
+                            )
+                        } else {
+                            false
+                        };
+                        if !ok {
+                            outcome.error = Some(format!(
+                                "Cluster search for {kind} timed out or exceeded transfer limit"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    outcome
+}

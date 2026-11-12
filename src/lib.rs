@@ -199,7 +199,9 @@ impl KubernetesPlugin {
                     && let Some(ns) = ctx_ns
                     && !ns.is_empty()
                 {
+                    let keep_all = cfg.all_namespaces;
                     cfg.set_namespaces([ns.as_str()]);
+                    cfg.all_namespaces = keep_all;
                     cfg.persist_scope();
                 }
                 snap.current_context = if cfg.context.is_empty() {
@@ -904,8 +906,11 @@ impl KubernetesPlugin {
     fn handle_page_message(&mut self, raw: &str, ctx: &Invocation) -> Result<(), Error> {
         let v: Value = serde_json::from_str(raw).map_err(|e| Error::Invalid(e.to_string()))?;
         let op = v.get("op").and_then(Value::as_str).unwrap_or("");
-        let _task = (!matches!(op, "poll-category" | "poll-watch" | "stop-drawer-watch"))
-            .then(|| host::begin_task("Kubernetes", false));
+        let _task = match op {
+            "poll-category" | "poll-watch" | "stop-drawer-watch" => None,
+            "search-category" => Some(host::begin_task("Kubernetes: Searching cluster…", true)),
+            _ => Some(host::begin_task("Kubernetes", false)),
+        };
         match op {
             "init" => {
                 let project = resolve_project(ctx).ok();
@@ -1267,6 +1272,49 @@ impl KubernetesPlugin {
             }
             "stop-drawer-watch" => {
                 self.watches.stop_drawer();
+            }
+            "search-category" => {
+                let project = resolve_project(ctx)?;
+                let mut cfg = KubeConfigState::load();
+                self.ensure_catalog_loaded(&project, &mut cfg);
+                let cat = v.get("category").and_then(Value::as_str).unwrap_or("Pod");
+                let query = v.get("query").and_then(Value::as_str).unwrap_or("");
+                let request_id = v.get("requestId").and_then(Value::as_u64).unwrap_or(0);
+                let is_cancelled = || _task.as_ref().is_some_and(|t| t.is_cancelled());
+                let outcome = if let Some(ref mut snap) = self.snapshot {
+                    kubectl::search_cluster_category_ground_truth(
+                        &project,
+                        &cfg,
+                        snap,
+                        cat,
+                        query,
+                        &is_cancelled,
+                    )
+                } else {
+                    let mut snap = ClusterSnapshot::default();
+                    let out = kubectl::search_cluster_category_ground_truth(
+                        &project,
+                        &cfg,
+                        &mut snap,
+                        cat,
+                        query,
+                        &is_cancelled,
+                    );
+                    self.snapshot = Some(snap);
+                    out
+                };
+                Self::send_view_payload(json!({
+                    "op": "search-results",
+                    "requestId": request_id,
+                    "category": outcome.category,
+                    "query": outcome.query,
+                    "resources": outcome.resources,
+                    "events": outcome.events,
+                    "totalMatches": outcome.total_matches,
+                    "scannedTotal": outcome.scanned_total,
+                    "truncated": outcome.truncated,
+                    "error": outcome.error,
+                }));
             }
             "set-namespace" | "set-namespaces" => {
                 self.watches.stop_all();
@@ -4146,5 +4194,195 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
         assert_eq!(snap_lg.page_info["Service"].continue_token, "svc-big-2");
         assert!(!snap_lg.page_info["Service"].watch_supported);
         assert!(plugin.watches.category_streams.is_empty());
+    }
+
+    #[test]
+    fn ground_truth_cluster_search_finds_items_beyond_loaded_page_and_preserves_base_snapshot() {
+        let seen_args = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let seen_clone = seen_args.clone();
+        let host = install_mock_with_kubectl();
+        host.on_process("kubectl", move |args, _stdin| {
+            seen_clone.lock().unwrap().push(args.to_vec());
+            let joined = args.join(" ");
+            let stdout = if joined.contains("config view") {
+                KUBECONFIG_JSON.to_owned()
+            } else if joined.contains("get namespaces --no-headers") {
+                "adx-mon Active 30d\ndayan Active 30d\nproduction Active 30d\n".to_owned()
+            } else if joined.contains("/api/v1/pods?limit=200") {
+                r#"{"kind":"PodList","metadata":{"resourceVersion":"9500","continue":"p2-tok","remainingItemCount":29999},"items":[{"metadata":{"name":"ingestor-0","namespace":"adx-mon","creationTimestamp":"2026-11-12T10:00:00Z"},"status":{"phase":"Running"}}]}"#.to_owned()
+            } else if joined.contains("get pods --all-namespaces -o wide --no-headers") {
+                let mut lines = String::with_capacity(30_000 * 80);
+                for i in 0..29_999 {
+                    lines.push_str(&format!(
+                        "adx-mon ingestor-{i} 1/1 Running 0 5d 10.244.1.10 aks-pool-01 <none> <none>\n"
+                    ));
+                }
+                // Place target pod at index 29,999 (past the 25,000 batch-parse guard!)
+                lines.push_str(
+                    "dayan brix-runner-29999 2/2 Running 1 12m 10.244.99.42 aks-gpu-77 <none> <none>\n",
+                );
+                lines
+            } else if joined.contains("-n dayan get pods -o wide --no-headers") {
+                "brix-runner-29999 2/2 Running 1 12m 10.244.99.42 aks-gpu-77 <none> <none>\nother-pod 1/1 Running 0 1d 10.244.99.10 aks-cpu-01 <none> <none>\n".to_owned()
+            } else if joined.contains("get events --all-namespaces --no-headers") {
+                "adx-mon 5m Normal Pulled pod/ingestor-0 Container image already present\ndayan 12s Warning BackOff pod/brix-runner-29999 Back-off restarting failed container brix\n".to_owned()
+            } else if joined.contains("get configmaps --all-namespaces --no-headers") {
+                return Err(openidea_plugin::Error::Failed(
+                    "process stdout exceeded 16 MiB limit".into(),
+                ));
+            } else if joined.contains("/api/v1/configmaps?limit=500&continue=cm-tok-2") {
+                r#"{"kind":"ConfigMapList","metadata":{"resourceVersion":"9602"},"items":[{"metadata":{"name":"brix-feature-flags","namespace":"dayan","creationTimestamp":"2026-11-12T10:00:00Z"},"data":{"ENABLE_GPU":"true"}}]}"#.to_owned()
+            } else if joined.contains("/api/v1/configmaps?limit=500") {
+                r#"{"kind":"ConfigMapList","metadata":{"resourceVersion":"9601","continue":"cm-tok-2","remainingItemCount":1},"items":[{"metadata":{"name":"adx-config","namespace":"adx-mon","creationTimestamp":"2026-11-12T10:00:00Z"},"data":{"A":"1"}}]}"#.to_owned()
+            } else {
+                String::new()
+            };
+            Ok(ProcessOutput {
+                status: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        });
+        host.add_file("k8s/app.yaml", SAMPLE_MANIFEST);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        // Load All-Namespaces Pods page 1 (only 1 pod loaded out of 30,000)
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"set-all-namespaces","all":true,"category":"Pod","limit":200}"#.into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        assert_eq!(
+            plugin
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .resources
+                .iter()
+                .filter(|r| r.kind == "Pod")
+                .count(),
+            1
+        );
+
+        // 1. Ground-truth cluster search scans all 30,000 pods, finds pod #29,999, and leaves base snapshot intact
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"search-category","requestId":41,"category":"Pod","query":"dayan brix"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        let search_msg = host
+            .view_messages()
+            .into_iter()
+            .rev()
+            .find_map(|(v, m)| {
+                (v == VIEW_ID && m.contains(r#""op":"search-results""#)).then_some(m)
+            })
+            .expect("search-results message");
+        let parsed_msg: serde_json::Value = serde_json::from_str(&search_msg).unwrap();
+        assert_eq!(parsed_msg["requestId"], 41);
+        assert_eq!(parsed_msg["scannedTotal"], 30_000);
+        assert_eq!(parsed_msg["totalMatches"], 1);
+        assert_eq!(parsed_msg["resources"][0]["name"], "brix-runner-29999");
+        assert_eq!(parsed_msg["resources"][0]["namespace"], "dayan");
+        assert_eq!(parsed_msg["resources"][0]["node_name"], "aks-gpu-77");
+        // Base snapshot still holds only its original page-1 pod (`ingestor-0`)!
+        let base_pods: Vec<&str> = plugin
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .resources
+            .iter()
+            .filter(|r| r.kind == "Pod")
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(base_pods, vec!["ingestor-0"]);
+
+        // 2. `dayan/brix` fast-path narrows directly to `-n dayan` instead of `--all-namespaces`
+        seen_args.lock().unwrap().clear();
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"search-category","requestId":42,"category":"Pod","query":"dayan/brix"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        let fast_calls = seen_args.lock().unwrap().clone();
+        assert!(
+            fast_calls
+                .iter()
+                .any(|a| a.windows(2).any(|w| w == ["-n", "dayan"])),
+            "expected single-namespace fast path for dayan/brix, got {fast_calls:?}"
+        );
+        assert!(
+            !fast_calls
+                .iter()
+                .any(|a| a.iter().any(|x| x == "--all-namespaces")),
+            "must not scan --all-namespaces on dayan/brix fast path"
+        );
+
+        // 3. Ground-truth Event table search parses object kind/name + multi-word message
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"search-category","requestId":43,"category":"Event","query":"restarting failed"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        let ev_msg: serde_json::Value = serde_json::from_str(
+            &host
+                .view_messages()
+                .into_iter()
+                .rev()
+                .find_map(|(v, m)| (v == VIEW_ID && m.contains(r#""requestId":43"#)).then_some(m))
+                .expect("event search-results"),
+        )
+        .unwrap();
+        assert_eq!(ev_msg["scannedTotal"], 2);
+        assert_eq!(ev_msg["totalMatches"], 1);
+        assert_eq!(ev_msg["events"][0]["kind"], "Pod");
+        assert_eq!(ev_msg["events"][0]["object"], "brix-runner-29999");
+
+        // 4. 16 MiB stdout limit fallback walks `--raw ...?limit=500&continue=...` pages seamlessly
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"search-category","requestId":44,"category":"ConfigMap","query":"brix-feature"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        let cm_msg: serde_json::Value = serde_json::from_str(
+            &host
+                .view_messages()
+                .into_iter()
+                .rev()
+                .find_map(|(v, m)| (v == VIEW_ID && m.contains(r#""requestId":44"#)).then_some(m))
+                .expect("configmap fallback search-results"),
+        )
+        .unwrap();
+        assert_eq!(cm_msg["scannedTotal"], 2);
+        assert_eq!(cm_msg["totalMatches"], 1);
+        assert_eq!(cm_msg["resources"][0]["name"], "brix-feature-flags");
     }
 }

@@ -558,15 +558,50 @@ body,
 }
 
 .fl-search-box {
-  width: 210px;
-  padding-right: 28px;
+  width: 230px;
+  padding-right: 48px;
 }
 
 .fl-search-icon {
   position: absolute;
   right: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   color: var(--fl-fg-muted);
   pointer-events: none;
+}
+
+.fl-search-clear-btn {
+  position: absolute;
+  right: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--fl-fg-muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.fl-search-clear-btn:hover {
+  background: var(--fl-hover-bg, rgba(255, 255, 255, 0.08));
+  color: var(--fl-fg);
+}
+
+.fl-search-spinner {
+  width: 13px;
+  height: 13px;
+  border: 1.8px solid var(--fl-border);
+  border-top-color: var(--fl-accent, #3d90ce);
+  border-radius: 50%;
+  animation: fl-spin 0.75s linear infinite;
 }
 
 .fl-icon-btn {

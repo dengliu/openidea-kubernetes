@@ -9,6 +9,7 @@ import type {
   ClusterSnapshot,
   ColumnDef,
   ContainerStateBadge,
+  RemoteSearchState,
   WorkspaceManifest,
 } from "./types";
 
@@ -909,6 +910,148 @@ export function computePollDelayMs(durationMs: number, itemCount: number): numbe
   return 5000;
 }
 
+const NON_PAGED_LOCAL_CATEGORIES = new Set<string>([
+  "ClusterCatalog",
+  "Workspace",
+  "ClusterOverview",
+  "WorkloadsOverview",
+  "HelmRelease",
+  "CustomResourceDefinition",
+]);
+
+export function shouldRunClusterGroundTruthSearch(
+  category: string,
+  rawQuery: string,
+  pageInfo: CategoryPageInfo | undefined,
+): boolean {
+  if (!rawQuery.trim()) return false;
+  if (NON_PAGED_LOCAL_CATEGORIES.has(category)) return false;
+  return Boolean(pageInfo?.continue_token);
+}
+
+export function matchesResourceSearch(
+  r: ClusterResource,
+  rawQuery: string,
+  knownNamespacesLower?: Set<string>,
+): boolean {
+  let effectiveQuery = rawQuery.trim();
+  if (!effectiveQuery) return true;
+
+  if (
+    knownNamespacesLower &&
+    r.kind !== "Ingress" &&
+    r.kind !== "Node" &&
+    r.kind !== "Namespace"
+  ) {
+    const slashIdx = effectiveQuery.indexOf("/");
+    if (slashIdx > 0) {
+      const nsPart = effectiveQuery.slice(0, slashIdx).trim().toLowerCase();
+      if (knownNamespacesLower.has(nsPart)) {
+        if ((r.namespace || "").toLowerCase() !== nsPart) return false;
+        effectiveQuery = effectiveQuery.slice(slashIdx + 1).trim();
+        if (!effectiveQuery) return true;
+      }
+    }
+  }
+
+  const tokens = effectiveQuery.toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return true;
+
+  const name = (r.name || "").toLowerCase();
+  const ns = (r.namespace || "").toLowerCase();
+  const status = (r.status || "").toLowerCase();
+  const detail = (r.detail || "").toLowerCase();
+  const ownerKind = (r.controlled_by_kind || "").toLowerCase();
+  const ownerName = (r.controlled_by_name || "").toLowerCase();
+  const podIp = (r.pod_ip || "").toLowerCase();
+  const nodeName = (r.node_name || "").toLowerCase();
+
+  return tokens.every((tok) => {
+    if (tok.startsWith("ns:") || tok.startsWith("namespace:")) {
+      const v = tok.slice(tok.indexOf(":") + 1);
+      return !v || ns.includes(v);
+    }
+    if (tok.startsWith("node:")) {
+      const v = tok.slice(5);
+      return !v || nodeName.includes(v);
+    }
+    if (tok.startsWith("status:") || tok.startsWith("phase:")) {
+      const v = tok.slice(tok.indexOf(":") + 1);
+      return !v || status.includes(v);
+    }
+    if (tok.startsWith("ip:")) {
+      const v = tok.slice(3);
+      return !v || podIp.includes(v);
+    }
+    return (
+      name.includes(tok) ||
+      ns.includes(tok) ||
+      status.includes(tok) ||
+      detail.includes(tok) ||
+      ownerKind.includes(tok) ||
+      ownerName.includes(tok) ||
+      podIp.includes(tok) ||
+      nodeName.includes(tok)
+    );
+  });
+}
+
+export function matchesEventSearch(ev: ClusterEvent, rawQuery: string): boolean {
+  const tokens = rawQuery.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return true;
+  const msg = (ev.message || "").toLowerCase();
+  const reason = (ev.reason || "").toLowerCase();
+  const ns = (ev.namespace || "").toLowerCase();
+  const obj = (ev.object || "").toLowerCase();
+  const kind = (ev.kind || "").toLowerCase();
+  const evType = (ev.event_type || "").toLowerCase();
+
+  return tokens.every((tok) => {
+    if (tok.startsWith("ns:") || tok.startsWith("namespace:")) {
+      const v = tok.slice(tok.indexOf(":") + 1);
+      return !v || ns.includes(v);
+    }
+    if (tok.startsWith("status:") || tok.startsWith("phase:")) {
+      const v = tok.slice(tok.indexOf(":") + 1);
+      return !v || evType.includes(v) || reason.includes(v);
+    }
+    const v = tok.includes(":") && (tok.startsWith("node:") || tok.startsWith("ip:"))
+      ? tok.slice(tok.indexOf(":") + 1)
+      : tok;
+    return (
+      msg.includes(v) ||
+      reason.includes(v) ||
+      ns.includes(v) ||
+      obj.includes(v) ||
+      kind.includes(v) ||
+      evType.includes(v)
+    );
+  });
+}
+
+export function formatGroundTruthSearchSummary(
+  remote: Pick<RemoteSearchState, "loading" | "totalMatches" | "scannedTotal" | "truncated" | "error">,
+  shownCount: number,
+  estTotal: number,
+): string {
+  const corpus = Math.max(remote.scannedTotal || 0, estTotal || 0);
+  if (remote.loading) {
+    return corpus > 0 ? `Searching ${corpus.toLocaleString()} items…` : "Searching cluster…";
+  }
+  if (remote.error) {
+    return `${shownCount.toLocaleString()} local matches (cluster search unavailable)`;
+  }
+  if (remote.truncated) {
+    return corpus > 0
+      ? `First ${shownCount.toLocaleString()} of ${remote.totalMatches.toLocaleString()} matches across ${corpus.toLocaleString()} items`
+      : `First ${shownCount.toLocaleString()} of ${remote.totalMatches.toLocaleString()} matches`;
+  }
+  const matchWord = remote.totalMatches === 1 ? "match" : "matches";
+  return corpus > 0
+    ? `${remote.totalMatches.toLocaleString()} ${matchWord} across ${corpus.toLocaleString()} items`
+    : `${remote.totalMatches.toLocaleString()} ${matchWord}`;
+}
+
 function sendToBackend(payload: Record<string, unknown>) {
   if (typeof window !== "undefined" && window.openidea) {
     window.openidea.postMessage(JSON.stringify(payload));
@@ -1238,6 +1381,11 @@ export function App() {
   const nsListRef = useRef<HTMLDivElement>(null);
   const nsApplyTimerRef = useRef<number | null>(null);
   const pendingNsScopeRef = useRef<{ allNamespaces: boolean; selectedNamespaces: string[] } | null>(null);
+
+  // Cluster ground-truth search state when a category has unloaded server pages (`continue_token != ""`)
+  const [remoteSearch, setRemoteSearch] = useState<RemoteSearchState | null>(null);
+  const searchReqIdRef = useRef<number>(0);
+  const searchTimerRef = useRef<number | null>(null);
 
   const selectedNamespaces = useMemo(() => resolveSelectedNamespaces(snapshot), [
     snapshot.all_namespaces,
@@ -1590,6 +1738,28 @@ export function App() {
           } else if (m.needsClusterFetch) {
             sendToBackend({ op: "load-category", category: "Pod", limit: pageSizeRef.current });
           }
+        } else if (m.op === "search-results") {
+          const replyReqId = Number(m.requestId) || 0;
+          if (replyReqId !== searchReqIdRef.current) {
+            return;
+          }
+          setRemoteSearch((prev) => {
+            if (!prev || prev.requestId !== replyReqId) return prev;
+            return {
+              ...prev,
+              loading: false,
+              resources: Array.isArray(m.resources) ? m.resources : [],
+              events: Array.isArray(m.events) ? m.events : [],
+              totalMatches: typeof m.totalMatches === "number" ? m.totalMatches : 0,
+              scannedTotal: typeof m.scannedTotal === "number" ? m.scannedTotal : 0,
+              truncated: Boolean(m.truncated),
+              error: typeof m.error === "string" && m.error ? m.error : null,
+            };
+          });
+          if (tableContainerRef.current) {
+            tableContainerRef.current.scrollTop = 0;
+          }
+          setTableScrollTop(0);
         } else if (m.op === "resource-json") {
           setDrawerWatching(Boolean(m.drawerWatching));
           try {
@@ -2055,11 +2225,134 @@ export function App() {
     window.addEventListener("mouseup", onUp);
   }
 
+  const activePageInfo: CategoryPageInfo | undefined = snapshot.page_info?.[activeKind];
+  const currentScopeKey = `${snapshot.current_context}|${selectedNsSignature}`;
+
+  const knownNamespacesLower = useMemo(() => {
+    const set = new Set<string>();
+    for (const ns of snapshot.namespaces || []) {
+      if (ns) set.add(ns.toLowerCase());
+    }
+    if (snapshot.current_namespace) set.add(snapshot.current_namespace.toLowerCase());
+    for (const ns of snapshot.selected_namespaces || []) {
+      if (ns) set.add(ns.toLowerCase());
+    }
+    return set;
+  }, [snapshot.namespaces, snapshot.current_namespace, snapshot.selected_namespaces]);
+
+  const activeRemoteSearch: RemoteSearchState | null = useMemo(() => {
+    const trimmed = searchQuery.trim();
+    if (!trimmed || !remoteSearch) return null;
+    if (
+      remoteSearch.category !== activeKind ||
+      remoteSearch.query !== trimmed ||
+      remoteSearch.scopeKey !== currentScopeKey
+    ) {
+      return null;
+    }
+    return remoteSearch;
+  }, [remoteSearch, searchQuery, activeKind, currentScopeKey]);
+
+  function triggerGroundTruthSearch(rawQuery: string, immediate: boolean) {
+    const trimmed = rawQuery.trim();
+    if (searchTimerRef.current !== null) {
+      window.clearTimeout(searchTimerRef.current);
+      searchTimerRef.current = null;
+    }
+    if (!trimmed) {
+      searchReqIdRef.current += 1;
+      setRemoteSearch(null);
+      return;
+    }
+    const reqId = ++searchReqIdRef.current;
+    setRemoteSearch({
+      requestId: reqId,
+      category: activeKind,
+      query: trimmed,
+      scopeKey: currentScopeKey,
+      loading: true,
+      resources: [],
+      events: [],
+      totalMatches: 0,
+      scannedTotal: 0,
+      truncated: false,
+      error: null,
+    });
+    const dispatch = () => {
+      searchTimerRef.current = null;
+      sendToBackend({
+        op: "search-category",
+        requestId: reqId,
+        category: activeKind,
+        query: trimmed,
+      });
+    };
+    if (immediate) {
+      dispatch();
+    } else {
+      searchTimerRef.current = window.setTimeout(dispatch, 260);
+    }
+  }
+
+  function removeDeletedFromRemoteSearch(removedKeys: Set<string>) {
+    if (removedKeys.size === 0) return;
+    setRemoteSearch((prev) => {
+      if (!prev || prev.resources.length === 0) return prev;
+      const nextResources = prev.resources.filter(
+        (r) => !removedKeys.has(`${r.kind}:${r.namespace}/${r.name}`),
+      );
+      const diff = prev.resources.length - nextResources.length;
+      if (diff <= 0) return prev;
+      return {
+        ...prev,
+        resources: nextResources,
+        totalMatches: Math.max(0, prev.totalMatches - diff),
+      };
+    });
+  }
+
+  const categoryHasContinueToken = Boolean(activePageInfo?.continue_token);
+  useEffect(() => {
+    const trimmed = searchQuery.trim();
+    if (!shouldRunClusterGroundTruthSearch(activeKind, trimmed, activePageInfo)) {
+      if (searchTimerRef.current !== null) {
+        window.clearTimeout(searchTimerRef.current);
+        searchTimerRef.current = null;
+      }
+      searchReqIdRef.current += 1;
+      setRemoteSearch(null);
+      return;
+    }
+    if (
+      remoteSearch &&
+      remoteSearch.category === activeKind &&
+      remoteSearch.query === trimmed &&
+      remoteSearch.scopeKey === currentScopeKey
+    ) {
+      return;
+    }
+    triggerGroundTruthSearch(trimmed, false);
+    return () => {
+      if (searchTimerRef.current !== null) {
+        window.clearTimeout(searchTimerRef.current);
+        searchTimerRef.current = null;
+      }
+    };
+  }, [searchQuery, activeKind, currentScopeKey, categoryHasContinueToken]);
+
   // Filtered and sorted rows for the active view
   const filteredResources = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    const baseItems: ClusterResource[] =
-      activeKind === "HelmRelease"
+    const q = searchQuery.trim();
+    const useRemoteItems =
+      Boolean(q) &&
+      activeRemoteSearch !== null &&
+      !activeRemoteSearch.loading &&
+      !activeRemoteSearch.error &&
+      activeKind !== "HelmRelease" &&
+      activeKind !== "Event";
+    const baseItems: ClusterResource[] = useRemoteItems
+      ? activeRemoteSearch!.resources
+      : activeKind === "HelmRelease"
         ? (snapshot.helm_releases || []).map((rel) => ({
             kind: "HelmRelease",
             name: rel.name,
@@ -2084,16 +2377,13 @@ export function App() {
             labels: [],
           }))
         : snapshot.resources || [];
-    const list = baseItems.filter(
-      (r) =>
-        r.kind === activeKind &&
-        (!q ||
-          r.name.toLowerCase().includes(q) ||
-          (r.namespace || "").toLowerCase().includes(q) ||
-          (r.status || "").toLowerCase().includes(q) ||
-          (r.detail || "").toLowerCase().includes(q) ||
-          (r.controlled_by_kind || "").toLowerCase().includes(q)),
-    );
+    const list = useRemoteItems
+      ? baseItems.filter((r) => r.kind === activeKind)
+      : baseItems.filter(
+          (r) =>
+            r.kind === activeKind &&
+            (!q || matchesResourceSearch(r, q, knownNamespacesLower)),
+        );
     return list.slice().sort((a, b) => {
       if (sortCol === "cpu" || sortCol === "node_cpu") {
         const av = cpuUnitsToNumber((a.cpu || "").split("/")[0]);
@@ -2142,7 +2432,16 @@ export function App() {
       const bv = valOf(b);
       return sortAsc ? av.localeCompare(bv, undefined, { numeric: true }) : bv.localeCompare(av, undefined, { numeric: true });
     });
-  }, [snapshot.resources, snapshot.helm_releases, activeKind, searchQuery, sortCol, sortAsc]);
+  }, [
+    snapshot.resources,
+    snapshot.helm_releases,
+    activeRemoteSearch,
+    knownNamespacesLower,
+    activeKind,
+    searchQuery,
+    sortCol,
+    sortAsc,
+  ]);
 
   const selectedResource: ClusterResource | null = useMemo(() => {
     if (!selectedRowKey) return null;
@@ -2188,6 +2487,7 @@ export function App() {
         (rel) => !removedSet.has(`HelmRelease:${rel.namespace || "default"}/${rel.name}`),
       ),
     }));
+    removeDeletedFromRemoteSearch(removedSet);
     sendToBackend({
       op: "delete-batch",
       force: forceDelete,
@@ -2242,19 +2542,19 @@ export function App() {
   );
 
   const filteredEvents = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    const base = snapshot.events || [];
-    const matched = q
-      ? base.filter(
-          (ev) =>
-            (ev.message || "").toLowerCase().includes(q) ||
-            (ev.reason || "").toLowerCase().includes(q) ||
-            (ev.namespace || "").toLowerCase().includes(q) ||
-            (ev.object || "").toLowerCase().includes(q) ||
-            (ev.kind || "").toLowerCase().includes(q) ||
-            (ev.event_type || "").toLowerCase().includes(q),
-        )
-      : base.slice();
+    const q = searchQuery.trim();
+    const useRemoteEvents =
+      Boolean(q) &&
+      activeKind === "Event" &&
+      activeRemoteSearch !== null &&
+      !activeRemoteSearch.loading &&
+      !activeRemoteSearch.error;
+    const base = useRemoteEvents ? activeRemoteSearch!.events : snapshot.events || [];
+    const matched = useRemoteEvents
+      ? base.slice()
+      : q
+        ? base.filter((ev) => matchesEventSearch(ev, q))
+        : base.slice();
     matched.sort((a, b) => {
       if (sortCol === "count") {
         const av = Number(a.count) || 0;
@@ -2282,7 +2582,7 @@ export function App() {
       return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
     });
     return matched;
-  }, [snapshot.events, searchQuery, sortCol, sortAsc]);
+  }, [snapshot.events, activeKind, activeRemoteSearch, searchQuery, sortCol, sortAsc]);
 
   const filteredWorkspace = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -2336,18 +2636,26 @@ export function App() {
     return (snapshot.resources || []).filter((r) => r.kind === activeKind).length;
   }, [snapshot.events, snapshot.helm_releases, snapshot.resources, activeKind]);
 
-  const activePageInfo: CategoryPageInfo | undefined = snapshot.page_info?.[activeKind];
   const hasSearchQuery = Boolean(searchQuery.trim());
-  const paginationStatus = useMemo(
-    () =>
-      formatPaginationStatus(
-        activePageInfo,
-        activeKind === "Event" ? filteredEvents.length : filteredResources.length,
-        rawActiveCategoryCount,
-        hasSearchQuery,
-      ),
-    [activePageInfo, activeKind, filteredEvents.length, filteredResources.length, rawActiveCategoryCount, hasSearchQuery],
-  );
+  const paginationStatus = useMemo(() => {
+    const shownCount = activeKind === "Event" ? filteredEvents.length : filteredResources.length;
+    const base = formatPaginationStatus(activePageInfo, shownCount, rawActiveCategoryCount, hasSearchQuery);
+    if (activeRemoteSearch) {
+      return {
+        ...base,
+        subheaderText: formatGroundTruthSearchSummary(activeRemoteSearch, shownCount, base.estTotal),
+      };
+    }
+    return base;
+  }, [
+    activePageInfo,
+    activeKind,
+    activeRemoteSearch,
+    filteredEvents.length,
+    filteredResources.length,
+    rawActiveCategoryCount,
+    hasSearchQuery,
+  ]);
 
   function maybeAutoLoadMore(el: HTMLDivElement | null) {
     if (!el) return;
@@ -2441,6 +2749,49 @@ export function App() {
     }
 
     if (hasMore && hasSearchQuery) {
+      if (activeRemoteSearch?.loading) {
+        return (
+          <tr className="fl-table-sentinel-row">
+            <td colSpan={colSpan}>
+              <div className="fl-table-sentinel">
+                <span className="fl-sentinel-spinner" aria-hidden="true" />
+                <span>
+                  Searching all {estTotal.toLocaleString()} {labelLower} in cluster for "{activeRemoteSearch.query}"…
+                </span>
+              </div>
+            </td>
+          </tr>
+        );
+      }
+      if (activeRemoteSearch && !activeRemoteSearch.error) {
+        const scanned = Math.max(activeRemoteSearch.scannedTotal || 0, estTotal);
+        if (filteredCount === 0) {
+          return (
+            <tr className="fl-table-sentinel-row">
+              <td colSpan={colSpan}>
+                <div className="fl-table-sentinel fl-table-sentinel-end">
+                  <span>
+                    No matching {labelLower} found across all {scanned.toLocaleString()} items in cluster.
+                  </span>
+                </div>
+              </td>
+            </tr>
+          );
+        }
+        return (
+          <tr className="fl-table-sentinel-row">
+            <td colSpan={colSpan}>
+              <div className="fl-table-sentinel fl-table-sentinel-end">
+                <span>
+                  {activeRemoteSearch.truncated
+                    ? `Showing first ${filteredCount.toLocaleString()} of ${activeRemoteSearch.totalMatches.toLocaleString()} matching ${labelLower} across ${scanned.toLocaleString()} items · Add another keyword or namespace to narrow`
+                    : `Cluster search complete · All ${activeRemoteSearch.totalMatches.toLocaleString()} matching ${labelLower} across ${scanned.toLocaleString()} items shown`}
+                </span>
+              </div>
+            </td>
+          </tr>
+        );
+      }
       return (
         <tr className="fl-table-sentinel-row">
           <td colSpan={colSpan}>
@@ -2455,10 +2806,10 @@ export function App() {
                 disabled={pageLoading || loadingMore}
                 onClick={(e) => {
                   e.stopPropagation();
-                  requestNextStreamBatch("append");
+                  triggerGroundTruthSearch(searchQuery.trim(), true);
                 }}
               >
-                Scan next {pageSize}
+                Retry cluster search
               </button>
             </div>
           </td>
@@ -3573,11 +3924,35 @@ export function App() {
                 placeholder={`Search ${currentViewLabel}...`}
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && shouldRunClusterGroundTruthSearch(activeKind, searchQuery, activePageInfo)) {
+                    e.preventDefault();
+                    triggerGroundTruthSearch(searchQuery.trim(), true);
+                  } else if (e.key === "Escape" && searchQuery) {
+                    e.preventDefault();
+                    setSearchQuery("");
+                  }
+                }}
               />
+              {searchQuery && (
+                <button
+                  type="button"
+                  className="fl-search-clear-btn"
+                  aria-label="Clear search"
+                  title="Clear search (Esc)"
+                  onClick={() => setSearchQuery("")}
+                >
+                  ×
+                </button>
+              )}
               <span className="fl-search-icon">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                  <path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" />
-                </svg>
+                {activeRemoteSearch?.loading ? (
+                  <span className="fl-search-spinner" aria-hidden="true" />
+                ) : (
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" />
+                  </svg>
+                )}
               </span>
             </div>
             <button
@@ -3591,6 +3966,9 @@ export function App() {
                 resetScrollToTop();
                 sendToBackend({ op: "load-category", category: activeKind, limit: pageSize, pageIndex: 1 });
                 sendToBackend({ op: "sync-cluster", context: snapshot.current_context });
+                if (shouldRunClusterGroundTruthSearch(activeKind, searchQuery, activePageInfo)) {
+                  triggerGroundTruthSearch(searchQuery.trim(), true);
+                }
               }}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -4543,6 +4921,7 @@ export function App() {
                       (rel) => `HelmRelease:${rel.namespace || "default"}/${rel.name}` !== removedKey,
                     ),
                   }));
+                  removeDeletedFromRemoteSearch(new Set([removedKey]));
                   sendToBackend({
                     op: "delete",
                     kind: target.kind,
@@ -4580,6 +4959,7 @@ export function App() {
                       (r) => `${r.kind}:${r.namespace}/${r.name}` !== removedKey,
                     ),
                   }));
+                  removeDeletedFromRemoteSearch(new Set([removedKey]));
                   sendToBackend({
                     op: "delete",
                     kind: target.kind,
@@ -5041,6 +5421,7 @@ export function App() {
                         (r) => `${r.kind}:${r.namespace}/${r.name}` !== removedKey,
                       ),
                     }));
+                    removeDeletedFromRemoteSearch(new Set([removedKey]));
                     sendToBackend({
                       op: "delete",
                       kind: selectedResource.kind,
@@ -5070,6 +5451,7 @@ export function App() {
                           (r) => `${r.kind}:${r.namespace}/${r.name}` !== removedKey,
                         ),
                       }));
+                      removeDeletedFromRemoteSearch(new Set([removedKey]));
                       sendToBackend({
                         op: "delete",
                         kind: selectedResource.kind,
