@@ -1,16 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
   applyWatchDeltaToSnapshot,
+  classifyIncomingNamespaceSnapshot,
+  computeNamespaceScopeSignature,
   computePollDelayMs,
   computeVirtualWindow,
   formatCompactAge,
   formatGroundTruthSearchSummary,
   formatNamespaceButtonLabel,
   formatPaginationStatus,
+  isResourceInNamespaceScope,
   matchesEventSearch,
   matchesResourceSearch,
   NS_OPTION_ROW_HEIGHT,
   NS_VIEWPORT_HEIGHT,
+  pruneSnapshotToNamespaceScope,
   resolveSelectedNamespaces,
   shouldRunClusterGroundTruthSearch,
   shouldTriggerAutoLoadMore,
@@ -445,5 +449,149 @@ describe("ResourceDetails helpers", () => {
         46158,
       ),
     ).toBe("First 500 of 1,840 matches across 46,158 items");
+  });
+
+  it("prunes out-of-scope namespaces immediately and rejects stale in-flight poll snapshots", () => {
+    const baseSnap = {
+      connected: true,
+      current_context: "falcon-phx-ca",
+      contexts: ["falcon-phx-ca"],
+      cluster_catalog: [],
+      current_namespace: "default",
+      all_namespaces: true,
+      selected_namespaces: ["default"],
+      namespaces: ["default", "kube-system"],
+      resources: [
+        {
+          kind: "Pod",
+          name: "abhaldar-fc-sydney",
+          namespace: "abhaldar",
+          status: "Failed",
+          ready: "0/4",
+          age: "3d",
+          detail: "",
+          containers: [],
+          ports: [],
+          data_keys: [],
+        },
+        {
+          kind: "Pod",
+          name: "brix-git",
+          namespace: "dengliu",
+          status: "Running",
+          ready: "1/1",
+          age: "5d",
+          detail: "",
+          containers: [],
+          ports: [],
+          data_keys: [],
+        },
+        {
+          kind: "CustomResourceDefinition",
+          name: "pools.falcon.io",
+          namespace: "",
+          status: "Namespaced",
+          ready: "falcon.io",
+          age: "90d",
+          detail: "",
+          containers: [],
+          ports: [],
+          data_keys: [],
+        },
+      ],
+      events: [
+        {
+          kind: "Pod",
+          object: "abhaldar-fc-sydney",
+          namespace: "abhaldar",
+          reason: "BackOff",
+          message: "failed",
+          event_type: "Warning",
+          count: 1,
+          last_seen: "1m",
+        },
+        {
+          kind: "Pod",
+          object: "brix-git",
+          namespace: "dengliu",
+          reason: "Started",
+          message: "ok",
+          event_type: "Normal",
+          count: 1,
+          last_seen: "2m",
+        },
+      ],
+      helm_releases: [
+        {
+          name: "other-rel",
+          namespace: "abhaldar",
+          revision: "1",
+          status: "deployed",
+          chart: "app-1.0",
+          app_version: "1.0",
+          updated: "1d",
+        },
+      ],
+      overview_counts: { Namespace: 952, Pod: 50000 },
+    };
+
+    // 1. Optimistic switch to `dengliu` removes `abhaldar` rows immediately while preserving CRDs and discovered namespace names
+    const pruned = pruneSnapshotToNamespaceScope(baseSnap, {
+      allNamespaces: false,
+      selectedNamespaces: ["dengliu"],
+    });
+    expect(pruned.all_namespaces).toBe(false);
+    expect(pruned.selected_namespaces).toEqual(["dengliu"]);
+    expect(pruned.current_namespace).toEqual("dengliu");
+    expect(pruned.resources.map((r) => `${r.kind}:${r.namespace}/${r.name}`)).toEqual([
+      "Pod:dengliu/brix-git",
+      "CustomResourceDefinition:/pools.falcon.io",
+    ]);
+    expect(pruned.events.map((e) => e.namespace)).toEqual(["dengliu"]);
+    expect(pruned.helm_releases).toEqual([]);
+    expect(pruned.namespaces).toContain("abhaldar");
+    expect(pruned.namespaces).toContain("dengliu");
+    expect(pruned.overview_counts).toEqual({ Namespace: 952 });
+
+    // 2. Scope check helper filters namespaced kinds strictly while keeping cluster-scoped kinds
+    const dengSet = new Set(["dengliu"]);
+    expect(isResourceInNamespaceScope({ kind: "Pod", namespace: "abhaldar" }, false, dengSet)).toBe(false);
+    expect(isResourceInNamespaceScope({ kind: "Pod", namespace: "dengliu" }, false, dengSet)).toBe(true);
+    expect(isResourceInNamespaceScope({ kind: "Node", namespace: "" }, false, dengSet)).toBe(true);
+    expect(isResourceInNamespaceScope({ kind: "CR:clusterpolicies.kyverno.io", namespace: "" }, false, dengSet)).toBe(
+      true,
+    );
+    expect(isResourceInNamespaceScope({ kind: "CR:pools.falcon.io", namespace: "abhaldar" }, false, dengSet)).toBe(
+      false,
+    );
+
+    // 3. Stale `All Namespaces` background poll arriving while `dengliu` switch is in flight is classified as `"stale"`
+    const guard = {
+      context: "falcon-phx-ca",
+      signature: computeNamespaceScopeSignature(false, ["dengliu"]),
+      sentAt: 1000,
+    };
+    expect(classifyIncomingNamespaceSnapshot(baseSnap, true, guard, false, 1500)).toBe("stale");
+    expect(classifyIncomingNamespaceSnapshot(pruned, false, guard, false, 1800)).toBe("accept_and_clear_guard");
+
+    // 4. Watch deltas from another namespace are ignored when scoped to `dengliu`
+    const afterStaleWatch = applyWatchDeltaToSnapshot(pruned, {
+      category: "Pod",
+      upserts: [
+        {
+          kind: "Pod",
+          name: "intruder-pod",
+          namespace: "abhaldar",
+          status: "Running",
+          ready: "1/1",
+          age: "1s",
+          detail: "",
+          containers: [],
+          ports: [],
+          data_keys: [],
+        },
+      ],
+    });
+    expect(afterStaleWatch.resources.some((r) => r.namespace === "abhaldar")).toBe(false);
   });
 });

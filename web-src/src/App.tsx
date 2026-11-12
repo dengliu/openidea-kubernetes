@@ -799,6 +799,128 @@ export function formatNamespaceButtonLabel(
   };
 }
 
+export const CLUSTER_SCOPED_KINDS = new Set<string>([
+  "Node",
+  "Namespace",
+  "PersistentVolume",
+  "StorageClass",
+  "CustomResourceDefinition",
+  "ClusterRole",
+  "ClusterRoleBinding",
+  "IngressClass",
+  "PriorityClass",
+  "RuntimeClass",
+  "MutatingWebhookConfiguration",
+  "ValidatingWebhookConfiguration",
+]);
+
+export function isClusterScopedResource(r: Pick<ClusterResource, "kind" | "namespace">): boolean {
+  if (CLUSTER_SCOPED_KINDS.has(r.kind)) return true;
+  if (r.kind.startsWith("CR:") && !r.namespace) return true;
+  return false;
+}
+
+export function isResourceInNamespaceScope(
+  r: Pick<ClusterResource, "kind" | "namespace">,
+  allNamespaces: boolean,
+  selectedNamespaceSet: ReadonlySet<string>,
+): boolean {
+  if (allNamespaces || isClusterScopedResource(r)) return true;
+  return Boolean(r.namespace) && selectedNamespaceSet.has(r.namespace);
+}
+
+export function computeNamespaceScopeSignature(
+  allNamespaces: boolean,
+  selectedNamespaces: string[],
+): string {
+  if (allNamespaces || selectedNamespaces.length === 0) return "*";
+  const uniq = Array.from(new Set(selectedNamespaces.map((s) => s.trim()).filter(Boolean))).sort();
+  return uniq.length === 0 ? "*" : uniq.join(",");
+}
+
+export function pruneSnapshotToNamespaceScope(
+  prev: ClusterSnapshot,
+  nextScope: { allNamespaces: boolean; selectedNamespaces: string[] },
+): ClusterSnapshot {
+  const normalizedSelected = Array.from(
+    new Set(nextScope.selectedNamespaces.map((s) => s.trim()).filter(Boolean)),
+  );
+  const effectiveAll = nextScope.allNamespaces || normalizedSelected.length === 0;
+  const allowedSet = new Set(normalizedSelected);
+
+  const mergedNamespacesSet = new Set<string>(prev.namespaces || []);
+  for (const ns of normalizedSelected) {
+    mergedNamespacesSet.add(ns);
+  }
+  for (const r of prev.resources || []) {
+    if (r.kind === "Namespace" && r.name) mergedNamespacesSet.add(r.name);
+    else if (r.namespace) mergedNamespacesSet.add(r.namespace);
+  }
+  const mergedNamespaces = Array.from(mergedNamespacesSet).filter(Boolean).sort();
+
+  const nextResources = effectiveAll
+    ? prev.resources || []
+    : (prev.resources || []).filter((r) => isResourceInNamespaceScope(r, false, allowedSet));
+  const nextEvents = effectiveAll
+    ? prev.events || []
+    : (prev.events || []).filter((ev) => Boolean(ev.namespace) && allowedSet.has(ev.namespace));
+  const nextHelm = effectiveAll
+    ? prev.helm_releases || []
+    : (prev.helm_releases || []).filter((rel) => allowedSet.has(rel.namespace || "default"));
+  const preservedNsCount = prev.overview_counts?.Namespace;
+
+  return {
+    ...prev,
+    namespaces: mergedNamespaces,
+    all_namespaces: effectiveAll,
+    selected_namespaces: effectiveAll
+      ? prev.selected_namespaces && prev.selected_namespaces.length > 0
+        ? prev.selected_namespaces
+        : [prev.current_namespace || "default"]
+      : normalizedSelected,
+    current_namespace: effectiveAll
+      ? prev.current_namespace || "default"
+      : normalizedSelected[0] || prev.current_namespace || "default",
+    resources: nextResources,
+    events: nextEvents,
+    helm_releases: nextHelm,
+    page_info: {},
+    overview_counts: preservedNsCount !== undefined ? { Namespace: preservedNsCount } : {},
+  };
+}
+
+export interface InFlightNamespaceSwitch {
+  context: string;
+  signature: string;
+  sentAt: number;
+}
+
+export function classifyIncomingNamespaceSnapshot(
+  incoming: ClusterSnapshot | undefined,
+  pollCompleted: boolean,
+  guard: InFlightNamespaceSwitch | null,
+  hasPendingDebounce: boolean,
+  nowMs: number,
+): "accept" | "stale" | "accept_and_clear_guard" {
+  if (!incoming || !guard) return "accept";
+  if (incoming.current_context !== guard.context) return "accept_and_clear_guard";
+  if (nowMs - guard.sentAt > 30_000) return "accept_and_clear_guard";
+  if (hasPendingDebounce) return "stale";
+
+  const incomingSig = computeNamespaceScopeSignature(
+    Boolean(incoming.all_namespaces),
+    resolveSelectedNamespaces(incoming),
+  );
+  if (incomingSig === guard.signature) {
+    return "accept_and_clear_guard";
+  }
+  // Allow explicit server-side large-cluster Overview fallback (`all_namespaces: true` -> scoped with warning)
+  if (!pollCompleted && guard.signature === "*" && Boolean(incoming.error)) {
+    return "accept_and_clear_guard";
+  }
+  return "stale";
+}
+
 export function applyWatchDeltaToSnapshot(
   prev: ClusterSnapshot,
   delta: {
@@ -808,9 +930,16 @@ export function applyWatchDeltaToSnapshot(
     eventUpserts?: ClusterEvent[];
   },
 ): ClusterSnapshot {
-  const upserts = Array.isArray(delta.upserts) ? delta.upserts : [];
+  const allowedNsSet = prev.all_namespaces ? null : new Set(resolveSelectedNamespaces(prev));
+  const rawUpserts = Array.isArray(delta.upserts) ? delta.upserts : [];
+  const upserts = allowedNsSet
+    ? rawUpserts.filter((item) => isResourceInNamespaceScope(item, false, allowedNsSet))
+    : rawUpserts;
   const deleted = Array.isArray(delta.deleted) ? delta.deleted : [];
-  const eventUpserts = Array.isArray(delta.eventUpserts) ? delta.eventUpserts : [];
+  const rawEventUpserts = Array.isArray(delta.eventUpserts) ? delta.eventUpserts : [];
+  const eventUpserts = allowedNsSet
+    ? rawEventUpserts.filter((ev) => Boolean(ev.namespace) && allowedNsSet.has(ev.namespace))
+    : rawEventUpserts;
   if (upserts.length === 0 && deleted.length === 0 && eventUpserts.length === 0) {
     return prev;
   }
@@ -1385,6 +1514,7 @@ export function App() {
   const nsListRef = useRef<HTMLDivElement>(null);
   const nsApplyTimerRef = useRef<number | null>(null);
   const pendingNsScopeRef = useRef<{ allNamespaces: boolean; selectedNamespaces: string[] } | null>(null);
+  const inFlightNsSwitchRef = useRef<InFlightNamespaceSwitch | null>(null);
 
   // Cluster ground-truth search state when a category has unloaded server pages (`continue_token != ""`)
   const [remoteSearch, setRemoteSearch] = useState<RemoteSearchState | null>(null);
@@ -1691,9 +1821,6 @@ export function App() {
         if (m.op === "state") {
           pollInFlightSinceRef.current = 0;
           watchInFlightSinceRef.current = 0;
-          setPageLoading(false);
-          setLoadingMore(false);
-          autoLoadTokenInFlightRef.current = "";
           if (typeof m.pollDurationMs === "number" && Number.isFinite(m.pollDurationMs)) {
             lastPollDurationMsRef.current = m.pollDurationMs;
           }
@@ -1706,6 +1833,45 @@ export function App() {
           if (Array.isArray(m.hotbarItems)) {
             setCustomHotbar((prev) => (prev === null ? m.hotbarItems : prev));
           }
+          if (Array.isArray(m.workspace)) {
+            setWorkspace(m.workspace);
+          }
+
+          const verdict = classifyIncomingNamespaceSnapshot(
+            m.snapshot,
+            Boolean(m.pollCompleted),
+            inFlightNsSwitchRef.current,
+            pendingNsScopeRef.current !== null,
+            Date.now(),
+          );
+          if (verdict === "stale") {
+            // Preserve the user's optimistic namespace selection and pruned rows while ignoring
+            // out-of-date background polls or snapshots from the previous namespace scope.
+            setSnapshot((prev) => {
+              const inc: ClusterSnapshot | undefined = m.snapshot;
+              if (!inc || inc.current_context !== prev.current_context) return prev;
+              return {
+                ...prev,
+                cluster_catalog:
+                  inc.cluster_catalog && inc.cluster_catalog.length > 0
+                    ? inc.cluster_catalog
+                    : prev.cluster_catalog,
+                contexts: inc.contexts && inc.contexts.length > 0 ? inc.contexts : prev.contexts,
+                namespaces:
+                  inc.namespaces && inc.namespaces.length > prev.namespaces.length
+                    ? inc.namespaces
+                    : prev.namespaces,
+              };
+            });
+            return;
+          }
+          if (verdict === "accept_and_clear_guard") {
+            inFlightNsSwitchRef.current = null;
+          }
+
+          setPageLoading(false);
+          setLoadingMore(false);
+          autoLoadTokenInFlightRef.current = "";
           setSnapshot((prev) => {
             const next: ClusterSnapshot = m.snapshot || prev;
             if ((!next.cluster_catalog || next.cluster_catalog.length === 0) && prev.cluster_catalog.length > 0) {
@@ -1721,16 +1887,8 @@ export function App() {
             ) {
               next.namespaces = prev.namespaces;
             }
-            if (pendingNsScopeRef.current !== null && next.current_context === prev.current_context) {
-              next.all_namespaces = prev.all_namespaces;
-              next.selected_namespaces = prev.selected_namespaces;
-              next.current_namespace = prev.current_namespace;
-            }
             return { ...next };
           });
-          if (Array.isArray(m.workspace)) {
-            setWorkspace(m.workspace);
-          }
           if (m.snapshot?.error) {
             setBanner({ text: m.snapshot.error, isError: true, sticky: true });
           } else {
@@ -1955,6 +2113,8 @@ export function App() {
       namespaces: Array.from(new Set([defaultNs, "default", "kube-system"])),
     }));
     setBanner({ text: `Connecting to ${chosen} (${defaultNs})…`, isError: false });
+    inFlightNsSwitchRef.current = null;
+    pendingNsScopeRef.current = null;
     sendToBackend({ op: "set-context", context: chosen, category: nextKind, limit: pageSize });
   }
 
@@ -2020,6 +2180,11 @@ export function App() {
     const pending = pendingNsScopeRef.current;
     if (pending) {
       pendingNsScopeRef.current = null;
+      inFlightNsSwitchRef.current = {
+        context: snapshot.current_context,
+        signature: computeNamespaceScopeSignature(pending.allNamespaces, pending.selectedNamespaces),
+        sentAt: Date.now(),
+      };
       sendNamespaceScopeToBackend(pending);
     }
   }
@@ -2050,19 +2215,13 @@ export function App() {
     setCheckedRows({});
     setBulkDeleteConfirmOpen(false);
     setDrawerOpen(false);
-    setSnapshot((prev) => ({
-      ...prev,
-      all_namespaces: nextScope.allNamespaces,
-      selected_namespaces: nextScope.allNamespaces
-        ? prev.selected_namespaces && prev.selected_namespaces.length > 0
-          ? prev.selected_namespaces
-          : [prev.current_namespace || "default"]
-        : nextScope.selectedNamespaces,
-      current_namespace: nextScope.allNamespaces
-        ? prev.current_namespace || "default"
-        : nextScope.selectedNamespaces[0] || prev.current_namespace || "default",
-      page_info: {},
-    }));
+    resetScrollToTop();
+    inFlightNsSwitchRef.current = {
+      context: snapshot.current_context,
+      signature: computeNamespaceScopeSignature(nextScope.allNamespaces, nextScope.selectedNamespaces),
+      sentAt: Date.now(),
+    };
+    setSnapshot((prev) => pruneSnapshotToNamespaceScope(prev, nextScope));
     if (nsApplyTimerRef.current !== null) {
       window.clearTimeout(nsApplyTimerRef.current);
       nsApplyTimerRef.current = null;
@@ -2077,6 +2236,11 @@ export function App() {
         const pending = pendingNsScopeRef.current;
         if (pending) {
           pendingNsScopeRef.current = null;
+          inFlightNsSwitchRef.current = {
+            context: snapshot.current_context,
+            signature: computeNamespaceScopeSignature(pending.allNamespaces, pending.selectedNamespaces),
+            sentAt: Date.now(),
+          };
           sendNamespaceScopeToBackend(pending);
         }
       }, 180);
@@ -2382,10 +2546,15 @@ export function App() {
           }))
         : snapshot.resources || [];
     const list = useRemoteItems
-      ? baseItems.filter((r) => r.kind === activeKind)
+      ? baseItems.filter(
+          (r) =>
+            r.kind === activeKind &&
+            isResourceInNamespaceScope(r, snapshot.all_namespaces, selectedNamespaceSet),
+        )
       : baseItems.filter(
           (r) =>
             r.kind === activeKind &&
+            isResourceInNamespaceScope(r, snapshot.all_namespaces, selectedNamespaceSet) &&
             (!q || matchesResourceSearch(r, q, knownNamespacesLower)),
         );
     return list.slice().sort((a, b) => {
@@ -2439,6 +2608,8 @@ export function App() {
   }, [
     snapshot.resources,
     snapshot.helm_releases,
+    snapshot.all_namespaces,
+    selectedNamespaceSet,
     activeRemoteSearch,
     knownNamespacesLower,
     activeKind,
@@ -2554,11 +2725,14 @@ export function App() {
       !activeRemoteSearch.loading &&
       !activeRemoteSearch.error;
     const base = useRemoteEvents ? activeRemoteSearch!.events : snapshot.events || [];
+    const scopedBase = snapshot.all_namespaces
+      ? base
+      : base.filter((ev) => Boolean(ev.namespace) && selectedNamespaceSet.has(ev.namespace));
     const matched = useRemoteEvents
-      ? base.slice()
+      ? scopedBase.slice()
       : q
-        ? base.filter((ev) => matchesEventSearch(ev, q))
-        : base.slice();
+        ? scopedBase.filter((ev) => matchesEventSearch(ev, q))
+        : scopedBase.slice();
     matched.sort((a, b) => {
       if (sortCol === "count") {
         const av = Number(a.count) || 0;
@@ -2586,7 +2760,16 @@ export function App() {
       return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
     });
     return matched;
-  }, [snapshot.events, activeKind, activeRemoteSearch, searchQuery, sortCol, sortAsc]);
+  }, [
+    snapshot.events,
+    snapshot.all_namespaces,
+    selectedNamespaceSet,
+    activeKind,
+    activeRemoteSearch,
+    searchQuery,
+    sortCol,
+    sortAsc,
+  ]);
 
   const filteredWorkspace = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -2635,10 +2818,27 @@ export function App() {
   );
 
   const rawActiveCategoryCount = useMemo(() => {
-    if (activeKind === "Event") return (snapshot.events || []).length;
-    if (activeKind === "HelmRelease") return (snapshot.helm_releases || []).length;
-    return (snapshot.resources || []).filter((r) => r.kind === activeKind).length;
-  }, [snapshot.events, snapshot.helm_releases, snapshot.resources, activeKind]);
+    if (activeKind === "Event") {
+      return (snapshot.events || []).filter(
+        (ev) => snapshot.all_namespaces || (Boolean(ev.namespace) && selectedNamespaceSet.has(ev.namespace)),
+      ).length;
+    }
+    if (activeKind === "HelmRelease") {
+      return (snapshot.helm_releases || []).filter(
+        (rel) => snapshot.all_namespaces || selectedNamespaceSet.has(rel.namespace || "default"),
+      ).length;
+    }
+    return (snapshot.resources || []).filter(
+      (r) => r.kind === activeKind && isResourceInNamespaceScope(r, snapshot.all_namespaces, selectedNamespaceSet),
+    ).length;
+  }, [
+    snapshot.events,
+    snapshot.helm_releases,
+    snapshot.resources,
+    snapshot.all_namespaces,
+    selectedNamespaceSet,
+    activeKind,
+  ]);
 
   const hasSearchQuery = Boolean(searchQuery.trim());
   const paginationStatus = useMemo(() => {
