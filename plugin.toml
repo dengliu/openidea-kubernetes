@@ -26,6 +26,7 @@ required = [
     "events",
     "storage",
     "clipboard",
+    "net:127.0.0.1",
     "process:kubectl",
 ]
 optional = ["process:helm", "process:kustomize"]

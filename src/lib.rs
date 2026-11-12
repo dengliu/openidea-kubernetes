@@ -1284,6 +1284,7 @@ impl KubernetesPlugin {
                 let outcome = if let Some(ref mut snap) = self.snapshot {
                     kubectl::search_cluster_category_ground_truth(
                         &project,
+                        &mut self.watches,
                         &cfg,
                         snap,
                         cat,
@@ -1294,6 +1295,7 @@ impl KubernetesPlugin {
                     let mut snap = ClusterSnapshot::default();
                     let out = kubectl::search_cluster_category_ground_truth(
                         &project,
+                        &mut self.watches,
                         &cfg,
                         &mut snap,
                         cat,
@@ -1317,7 +1319,7 @@ impl KubernetesPlugin {
                 }));
             }
             "set-namespace" | "set-namespaces" => {
-                self.watches.stop_all();
+                self.watches.stop_watches();
                 let requested: Vec<String> = if op == "set-namespaces" {
                     v.get("namespaces")
                         .and_then(Value::as_array)
@@ -1392,7 +1394,7 @@ impl KubernetesPlugin {
                 }
             }
             "set-all-namespaces" => {
-                self.watches.stop_all();
+                self.watches.stop_watches();
                 let all = v.get("all").and_then(Value::as_bool).unwrap_or(false);
                 let mut cfg = KubeConfigState::load();
                 cfg.all_namespaces = all;
@@ -3036,6 +3038,7 @@ spec:
             "events",
             "storage",
             "clipboard",
+            "net:127.0.0.1",
             "process:kubectl",
             "process:helm",
             "process:kustomize",
@@ -4384,5 +4387,210 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
         assert_eq!(cm_msg["scannedTotal"], 2);
         assert_eq!(cm_msg["totalMatches"], 1);
         assert_eq!(cm_msg["resources"][0]["name"], "brix-feature-flags");
+    }
+
+    #[test]
+    fn watch_cache_table_proxy_search_scans_gzipped_88k_pods_and_resolves_namespaces() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use openidea_plugin::HttpResponse;
+        use std::io::Write as _;
+
+        fn gzip_json(s: &str) -> Vec<u8> {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+            enc.write_all(s.as_bytes()).unwrap();
+            enc.finish().unwrap()
+        }
+
+        // Build an 88,049-row Kubernetes `Table` (`includeObject=None`) payload and gzip it (~1.5 MiB style)
+        let mut all_pods_table = String::with_capacity(88_100 * 115);
+        all_pods_table.push_str(
+            r#"{"kind":"Table","apiVersion":"meta.k8s.io/v1","columnDefinitions":[{"name":"Name","priority":0},{"name":"Ready","priority":0},{"name":"Status","priority":0},{"name":"Restarts","priority":0},{"name":"Age","priority":0},{"name":"IP","priority":0},{"name":"Node","priority":0}],"rows":["#,
+        );
+        for i in 0..88_047 {
+            if i > 0 {
+                all_pods_table.push(',');
+            }
+            all_pods_table.push_str(&format!(
+                r#"{{"cells":["worker-{i}","1/1","Running",0,"5d","10.20.{}.{}","aks-pool-01"],"object":null}}"#,
+                (i / 250) % 250,
+                (i % 250) + 1
+            ));
+        }
+        // Row 88,047: pod inside `dengliu` namespace named `brix-git` (only matches `"deng"` via its namespace!)
+        all_pods_table.push_str(
+            r#",{"cells":["brix-git","1/1","Running",0,"14d","10.26.75.178","aks-gpu-01"],"object":null}"#,
+        );
+        // Row 88,048: pod in `shared-jobs` namespace named `deng-eval-job-9` (matches `"deng"` via pod name, needs Step 3 namespace resolution!)
+        all_pods_table.push_str(
+            r#",{"cells":["deng-eval-job-9","2/2","Running","1 (3m ago)","8m","10.26.99.9","aks-gpu-88"],"object":null}]}"#,
+        );
+        let gz_88k = gzip_json(&all_pods_table);
+        assert!(
+            gz_88k.len() < 3 * 1024 * 1024,
+            "gzipped 88k Table stays well below 8 MiB fetch cap: {} bytes",
+            gz_88k.len()
+        );
+
+        let host = install_mock_with_kubectl();
+        host.on_process("kubectl", move |args, _stdin| {
+            let joined = args.join(" ");
+            if joined.contains("get pods --all-namespaces") {
+                panic!("must use watch-cache Table proxy instead of slow 177-chunk kubectl get -A: {joined}");
+            }
+            let stdout = if joined.contains("config view") {
+                KUBECONFIG_JSON.to_owned()
+            } else if joined.contains("get namespaces --no-headers") {
+                "adx-mon Active 30d\ndengliu Active 30d\nproduction Active 30d\nshared-jobs Active 30d\n".to_owned()
+            } else if joined.contains("/api/v1/pods?limit=200") {
+                r#"{"kind":"PodList","metadata":{"resourceVersion":"9500","continue":"p2-tok","remainingItemCount":88048},"items":[{"metadata":{"name":"worker-0","namespace":"adx-mon","creationTimestamp":"2026-11-12T10:00:00Z"},"status":{"phase":"Running"}}]}"#.to_owned()
+            } else {
+                String::new()
+            };
+            Ok(ProcessOutput {
+                status: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        });
+
+        host.on_fetch(move |req| {
+            assert!(
+                req.headers
+                    .iter()
+                    .any(|(k, v)| k.eq_ignore_ascii_case("Accept") && v.contains("as=Table")),
+                "expected Table Accept header: {:?}",
+                req.headers
+            );
+            assert!(
+                req.headers
+                    .iter()
+                    .any(|(k, v)| k.eq_ignore_ascii_case("Accept-Encoding") && v == "gzip"),
+                "expected explicit gzip Accept-Encoding: {:?}",
+                req.headers
+            );
+            let body = if req
+                .url
+                .contains("/api/v1/namespaces/dengliu/pods?resourceVersion=0&includeObject=Metadata")
+            {
+                br#"{"kind":"Table","apiVersion":"meta.k8s.io/v1","columnDefinitions":[{"name":"Name","priority":0}],"rows":[{"cells":["brix-git","1/1","Running",0,"14d","10.26.75.178","aks-gpu-01"],"object":{"metadata":{"name":"brix-git","namespace":"dengliu","ownerReferences":[{"kind":"StatefulSet","name":"brix"}]}}}]}"#.to_vec()
+            } else if req
+                .url
+                .contains("/api/v1/pods?resourceVersion=0&includeObject=None")
+            {
+                gz_88k.clone()
+            } else if req
+                .url
+                .contains("fieldSelector=metadata.name%3Ddeng-eval-job-9&includeObject=Metadata")
+            {
+                br#"{"kind":"Table","apiVersion":"meta.k8s.io/v1","columnDefinitions":[{"name":"Name","priority":0}],"rows":[{"cells":["deng-eval-job-9","2/2","Running","1 (3m ago)","8m","10.26.99.9","aks-gpu-88"],"object":{"metadata":{"name":"deng-eval-job-9","namespace":"shared-jobs","ownerReferences":[{"kind":"Job","name":"deng-eval"}]}}}]}"#.to_vec()
+            } else if req
+                .url
+                .contains("/api/v1/secrets?resourceVersion=0&includeObject=Metadata")
+            {
+                gzip_json(
+                    r#"{"kind":"Table","apiVersion":"meta.k8s.io/v1","columnDefinitions":[{"name":"Name","priority":0},{"name":"Type","priority":0},{"name":"Data","priority":0},{"name":"Age","priority":0}],"rows":[{"cells":["deng-tls-cert","kubernetes.io/tls",2,"10d"],"object":{"metadata":{"name":"deng-tls-cert","namespace":"dengliu"}}}]}"#,
+                )
+            } else {
+                panic!("unexpected proxy URL: {}", req.url);
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body,
+            })
+        });
+        host.add_file("k8s/app.yaml", SAMPLE_MANIFEST);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        // Load All-Namespaces Pods page 1 (1 loaded + 88,048 remaining = 88,049 > 40,000)
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"set-all-namespaces","all":true,"category":"Pod","limit":200}"#.into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+
+        // Install a live mock proxy child for `prod-east`
+        let proxy_child = host::start(
+            &host::Command::new("kubectl").args(["proxy", "--port=0"]),
+            None,
+        )
+        .unwrap();
+        plugin
+            .watches
+            .install_test_proxy("", "prod-east", 51466, proxy_child);
+
+        // 1. Search `"deng"` across all 88,049 pods:
+        //    - Step 1 finds `dengliu/brix-git` (matched via namespace `dengliu`!)
+        //    - Step 2 streams all 88,049 gzipped pods and finds `deng-eval-job-9`
+        //    - Step 3 resolves `shared-jobs` + `Job/deng-eval` via `fieldSelector=metadata.name=deng-eval-job-9`
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"search-category","requestId":91,"category":"Pod","query":"deng"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        let pod_msg: serde_json::Value = serde_json::from_str(
+            &host
+                .view_messages()
+                .into_iter()
+                .rev()
+                .find_map(|(v, m)| (v == VIEW_ID && m.contains(r#""requestId":91"#)).then_some(m))
+                .expect("88k pod search-results"),
+        )
+        .unwrap();
+        assert_eq!(pod_msg["scannedTotal"], 88_049);
+        assert_eq!(pod_msg["totalMatches"], 2);
+        assert_eq!(pod_msg["resources"][0]["namespace"], "dengliu");
+        assert_eq!(pod_msg["resources"][0]["name"], "brix-git");
+        assert_eq!(pod_msg["resources"][0]["controlled_by_kind"], "StatefulSet");
+        assert_eq!(pod_msg["resources"][1]["namespace"], "shared-jobs");
+        assert_eq!(pod_msg["resources"][1]["name"], "deng-eval-job-9");
+        assert_eq!(pod_msg["resources"][1]["restarts"], 1);
+        assert_eq!(pod_msg["resources"][1]["controlled_by_kind"], "Job");
+
+        // 2. Search `"deng"` on Secrets (<= 40,000 items -> single `includeObject=Metadata` request, numeric Data cell `2`)
+        plugin
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .overview_counts
+            .insert("Secret".into(), 6_247);
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"search-category","requestId":92,"category":"Secret","query":"tls"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        let sec_msg: serde_json::Value = serde_json::from_str(
+            &host
+                .view_messages()
+                .into_iter()
+                .rev()
+                .find_map(|(v, m)| (v == VIEW_ID && m.contains(r#""requestId":92"#)).then_some(m))
+                .expect("secret search-results"),
+        )
+        .unwrap();
+        assert_eq!(sec_msg["scannedTotal"], 1);
+        assert_eq!(sec_msg["totalMatches"], 1);
+        assert_eq!(sec_msg["resources"][0]["name"], "deng-tls-cert");
+        assert_eq!(sec_msg["resources"][0]["namespace"], "dengliu");
+        assert_eq!(sec_msg["resources"][0]["ready"], "2 keys");
     }
 }

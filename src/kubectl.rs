@@ -2,10 +2,12 @@
 //! cluster state parsing, and interactive terminal session launching.
 
 use openidea_plugin::host::{self, storage};
-use openidea_plugin::{Error, Invocation, ProcessOutput, Project};
+use openidea_plugin::{Error, HttpRequest, Invocation, ProcessOutput, Project};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{BufReader, Read};
 
 pub const DEFAULT_DEBUGGER_IMAGE: &str = "dengliu/k8sdebugger:3cfd912";
 
@@ -6986,17 +6988,41 @@ impl ActiveWatchStream {
     }
 }
 
+/// Persistent `kubectl proxy --port=0 --address=127.0.0.1` loopback tunnel for the active context,
+/// allowing `host::fetch` (`net:127.0.0.1`) to send custom `Accept: application/json;as=Table` +
+/// `Accept-Encoding: gzip` + `?resourceVersion=0&includeObject=None` queries to `kube-apiserver`'s
+/// watch cache (~2.3s / 1.6 MiB for 88k pods instead of 880 MB across 177 `kubectl get` chunks).
+pub struct KubeApiProxy {
+    pub kubeconfig: String,
+    pub context: String,
+    pub port: u16,
+    child: host::Child,
+}
+
+impl KubeApiProxy {
+    pub fn stop(self) {
+        let _ = self.child.kill();
+    }
+}
+
 /// Manages concurrent `kubectl --raw ?watch=true` child processes
-/// (up to `MAX_MULTI_NAMESPACE_WATCHES` for the active table category when `total <= 1,000`
-/// plus 1 for the open Drawer resource), staying safely within OpenIDEA's 8-child-per-plugin cap.
+/// (up to `MAX_MULTI_NAMESPACE_WATCHES` for the active table category when `total <= 1,000`,
+/// 1 for the open Drawer resource, and 1 reusable `kubectl proxy` tunnel), staying safely within
+/// OpenIDEA's 8-child-per-plugin cap.
 #[derive(Default)]
 pub struct WatchManager {
     pub category_streams: Vec<ActiveWatchStream>,
     pub drawer_stream: Option<ActiveWatchStream>,
+    pub api_proxy: Option<KubeApiProxy>,
 }
 
 impl WatchManager {
     pub fn stop_all(&mut self) {
+        self.stop_watches();
+        self.stop_proxy();
+    }
+
+    pub fn stop_watches(&mut self) {
         self.stop_category();
         self.stop_drawer();
     }
@@ -7012,6 +7038,90 @@ impl WatchManager {
             s.stop();
         }
     }
+
+    pub fn stop_proxy(&mut self) {
+        if let Some(p) = self.api_proxy.take() {
+            p.stop();
+        }
+    }
+
+    pub fn ensure_api_proxy(&mut self, project: &Project, cfg: &KubeConfigState) -> Option<u16> {
+        let want_kc = cfg.kubeconfig.trim();
+        let want_ctx = cfg.context.trim();
+        if let Some(ref existing) = self.api_proxy
+            && existing.kubeconfig == want_kc
+            && existing.context == want_ctx
+            && let Ok(chunk) = existing.child.wait(0)
+            && chunk.status.is_none()
+        {
+            return Some(existing.port);
+        }
+        self.stop_proxy();
+
+        let mut args = cfg.base_args(false);
+        args.extend([
+            "proxy".into(),
+            "--port=0".into(),
+            "--address=127.0.0.1".into(),
+        ]);
+        let cmd = host::Command::new("kubectl").args(args);
+        let child = host::start(&cmd, Some(project)).ok()?;
+        let mut banner = String::new();
+        for _ in 0..6 {
+            match child.wait(400) {
+                Ok(chunk) => {
+                    banner.push_str(&chunk.stdout);
+                    if let Some(port) = parse_kubectl_proxy_port(&banner) {
+                        self.api_proxy = Some(KubeApiProxy {
+                            kubeconfig: want_kc.to_owned(),
+                            context: want_ctx.to_owned(),
+                            port,
+                            child,
+                        });
+                        return Some(port);
+                    }
+                    if chunk.status.is_some() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        None
+    }
+
+    #[cfg(test)]
+    pub fn install_test_proxy(
+        &mut self,
+        kubeconfig: &str,
+        context: &str,
+        port: u16,
+        child: host::Child,
+    ) {
+        self.stop_proxy();
+        self.api_proxy = Some(KubeApiProxy {
+            kubeconfig: kubeconfig.trim().to_owned(),
+            context: context.trim().to_owned(),
+            port,
+            child,
+        });
+    }
+}
+
+fn parse_kubectl_proxy_port(stdout: &str) -> Option<u16> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(colon_pos) = trimmed.rfind(':') {
+            let tail = trimmed[colon_pos + 1..].trim();
+            if let Ok(port) = tail.parse::<u16>()
+                && port > 0
+            {
+                return Some(port);
+            }
+        }
+    }
+    None
 }
 
 /// Maximum number of matched rows returned to the UI from a ground-truth cluster search.
@@ -7691,10 +7801,1136 @@ fn search_events_via_raw_pages(
     outcome.scanned_total > 0
 }
 
+const K8S_TABLE_ACCEPT: &str = "application/json;as=Table;v=v1;g=meta.k8s.io,application/json;as=Table;v=v1beta1;g=meta.k8s.io";
+const METADATA_TABLE_MAX_EST_ITEMS: u64 = 40_000;
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct TableColDefWire {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    priority: i32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct TableOwnerRefWire {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct TableObjectMetaWire {
+    #[serde(default)]
+    namespace: String,
+    #[serde(default, rename = "ownerReferences")]
+    owner_references: Vec<TableOwnerRefWire>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct TableObjectWire {
+    #[serde(default)]
+    metadata: TableObjectMetaWire,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct TableRowWire {
+    #[serde(default)]
+    cells: Vec<Value>,
+    #[serde(default)]
+    object: Option<TableObjectWire>,
+}
+
+fn cell_cow(cells: &[Value], idx: usize) -> Cow<'_, str> {
+    match cells.get(idx) {
+        Some(Value::String(s)) => Cow::Borrowed(s.as_str()),
+        Some(Value::Number(n)) => Cow::Owned(n.to_string()),
+        Some(Value::Bool(b)) => Cow::Borrowed(if *b { "true" } else { "false" }),
+        _ => Cow::Borrowed(""),
+    }
+}
+
+fn clean_cell_cow(cells: &[Value], idx: usize) -> Cow<'_, str> {
+    let v = cell_cow(cells, idx);
+    if matches!(v.as_ref(), "<none>" | "<unknown>") {
+        Cow::Borrowed("")
+    } else {
+        v
+    }
+}
+
+fn parse_leading_u64(raw: &str) -> u64 {
+    let tok = raw.split_whitespace().next().unwrap_or("0");
+    tok.parse::<u64>().unwrap_or(0)
+}
+
+/// Streams a Kubernetes `meta.k8s.io/v1` `Table` response (raw JSON or gzip-compressed bytes)
+/// row-by-row via `serde::de::Visitor`, avoiding allocating an 88k-row `Vec` or a full decompressed buffer.
+fn stream_k8s_table_rows<F>(raw_bytes: &[u8], mut on_row: F) -> Result<(), String>
+where
+    F: FnMut(&[TableColDefWire], TableRowWire),
+{
+    struct RowsSeqVisitor<'a, CB> {
+        cols: &'a [TableColDefWire],
+        on_row: &'a mut CB,
+    }
+
+    impl<'de, CB> serde::de::Visitor<'de> for RowsSeqVisitor<'_, CB>
+    where
+        CB: FnMut(&[TableColDefWire], TableRowWire),
+    {
+        type Value = ();
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a Kubernetes Table rows array")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            while let Some(row) = seq.next_element::<TableRowWire>()? {
+                (self.on_row)(self.cols, row);
+            }
+            Ok(())
+        }
+    }
+
+    struct RowsSeed<'a, CB> {
+        cols: &'a [TableColDefWire],
+        on_row: &'a mut CB,
+    }
+
+    impl<'de, CB> serde::de::DeserializeSeed<'de> for RowsSeed<'_, CB>
+    where
+        CB: FnMut(&[TableColDefWire], TableRowWire),
+    {
+        type Value = ();
+
+        fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_seq(RowsSeqVisitor {
+                cols: self.cols,
+                on_row: self.on_row,
+            })
+        }
+    }
+
+    struct TableDocVisitor<'a, CB> {
+        on_row: &'a mut CB,
+    }
+
+    impl<'de, CB> serde::de::Visitor<'de> for TableDocVisitor<'_, CB>
+    where
+        CB: FnMut(&[TableColDefWire], TableRowWire),
+    {
+        type Value = bool;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a Kubernetes Table object")
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut cols: Vec<TableColDefWire> = Vec::new();
+            let mut saw_table = false;
+            while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                match key.as_ref() {
+                    "kind" => {
+                        let k: String = map.next_value()?;
+                        if k == "Table" {
+                            saw_table = true;
+                        }
+                    }
+                    "columnDefinitions" => {
+                        cols = map.next_value()?;
+                        saw_table = true;
+                    }
+                    "rows" => {
+                        saw_table = true;
+                        map.next_value_seed(RowsSeed {
+                            cols: &cols,
+                            on_row: self.on_row,
+                        })?;
+                    }
+                    _ => {
+                        let _: serde::de::IgnoredAny = map.next_value()?;
+                    }
+                }
+            }
+            Ok(saw_table)
+        }
+    }
+
+    use serde::Deserializer as _;
+    let saw_table = if raw_bytes.starts_with(&[0x1f, 0x8b]) {
+        let gz = flate2::read::GzDecoder::new(raw_bytes).take(96 * 1024 * 1024);
+        let reader = BufReader::with_capacity(64 * 1024, gz);
+        let mut de = serde_json::Deserializer::from_reader(reader);
+        de.deserialize_map(TableDocVisitor {
+            on_row: &mut on_row,
+        })
+        .map_err(|e| e.to_string())?
+    } else {
+        let mut de = serde_json::Deserializer::from_slice(raw_bytes);
+        de.deserialize_map(TableDocVisitor {
+            on_row: &mut on_row,
+        })
+        .map_err(|e| e.to_string())?
+    };
+
+    if saw_table {
+        Ok(())
+    } else {
+        Err("response was not a Kubernetes Table".into())
+    }
+}
+
+fn proxy_fetch_table_bytes(
+    watches: &mut WatchManager,
+    port: u16,
+    uri: &str,
+    timeout_ms: u32,
+) -> Result<Vec<u8>, Error> {
+    let url = format!("http://127.0.0.1:{port}{uri}");
+    let mut req = HttpRequest::get(&url)
+        .header("Accept", K8S_TABLE_ACCEPT)
+        .header("Accept-Encoding", "gzip");
+    req.timeout_ms = Some(timeout_ms);
+    match host::fetch(&req) {
+        Ok(resp) if resp.status == 200 => Ok(resp.body),
+        Ok(resp) => Err(Error::Failed(format!(
+            "HTTP {} from kubectl proxy for {uri}",
+            resp.status
+        ))),
+        Err(err) => {
+            let msg = err.to_string();
+            if msg.contains("connect") || msg.contains("refused") || msg.contains("closed") {
+                watches.stop_proxy();
+            }
+            Err(err)
+        }
+    }
+}
+
+fn table_row_to_event(row: &TableRowWire, default_ns: &str) -> Option<ClusterEvent> {
+    if row.cells.len() < 4 {
+        return None;
+    }
+    let ns = row
+        .object
+        .as_ref()
+        .map(|o| o.metadata.namespace.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_ns)
+        .to_owned();
+    let last_seen = clean_col(&cell_cow(&row.cells, 0)).to_owned();
+    let event_type = clean_col(&cell_cow(&row.cells, 1)).to_owned();
+    let reason = clean_col(&cell_cow(&row.cells, 2)).to_owned();
+    let obj_tok = cell_cow(&row.cells, 3);
+    let message = if row.cells.len() >= 7 {
+        cell_cow(&row.cells, 6).trim().to_owned()
+    } else {
+        cell_cow(&row.cells, 4).trim().to_owned()
+    };
+    let count = if row.cells.len() >= 9 {
+        parse_leading_u64(&cell_cow(&row.cells, 8)).max(1)
+    } else {
+        1
+    };
+    let (kind, object) = if let Some((rk, name)) = obj_tok.split_once('/') {
+        (normalize_event_object_kind(rk), name.to_owned())
+    } else {
+        ("Object".into(), obj_tok.into_owned())
+    };
+    Some(ClusterEvent {
+        namespace: ns,
+        last_seen,
+        event_type,
+        reason,
+        object,
+        kind,
+        message,
+        count,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_pod_resource_from_table_parts(
+    ns: &str,
+    name: &str,
+    ready: &str,
+    status_raw: &str,
+    restarts_raw: &str,
+    age: &str,
+    pod_ip: &str,
+    node_name: &str,
+    owner: Option<(&str, &str)>,
+    prev_metrics: &BTreeMap<(String, String), (String, String)>,
+) -> ClusterResource {
+    let restarts = parse_leading_u64(restarts_raw);
+    let (rdy_cnt, total_cnt) = ready
+        .split_once('/')
+        .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
+        .unwrap_or((0, 0));
+    let mut container_states = Vec::with_capacity(total_cnt.min(16));
+    let mut containers = Vec::with_capacity(total_cnt.min(16));
+    let is_done = matches!(status_raw, "Completed" | "Succeeded");
+    for i in 0..total_cnt.min(16) {
+        let cname = format!("c{}", i + 1);
+        containers.push(cname.clone());
+        let (cstate, cready, creason) = if is_done {
+            ("terminated".to_owned(), false, "Completed".to_owned())
+        } else if i < rdy_cnt {
+            ("running".to_owned(), true, String::new())
+        } else {
+            ("waiting".to_owned(), false, status_raw.to_owned())
+        };
+        container_states.push(ContainerStateBadge {
+            name: cname,
+            state: cstate,
+            ready: cready,
+            reason: creason,
+            ..Default::default()
+        });
+    }
+    let detail = match (node_name.is_empty(), pod_ip.is_empty()) {
+        (false, false) => format!("restarts: {restarts} • {pod_ip} on {node_name}"),
+        (false, true) => format!("restarts: {restarts} • {node_name}"),
+        _ => format!("restarts: {restarts}"),
+    };
+    let (cpu, memory) = if !ns.is_empty() {
+        prev_metrics
+            .get(&(ns.to_owned(), name.to_owned()))
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        (String::new(), String::new())
+    };
+    let (controlled_by_kind, controlled_by_name) = owner
+        .map(|(k, n)| (k.to_owned(), n.to_owned()))
+        .unwrap_or_default();
+    ClusterResource {
+        kind: "Pod".into(),
+        name: name.to_owned(),
+        namespace: ns.to_owned(),
+        status: status_raw.to_owned(),
+        ready: ready.to_owned(),
+        age: age.to_owned(),
+        detail,
+        containers,
+        container_states,
+        cpu,
+        memory,
+        restarts,
+        controlled_by_kind,
+        controlled_by_name,
+        pod_ip: pod_ip.to_owned(),
+        node_name: node_name.to_owned(),
+        ..Default::default()
+    }
+}
+
+fn table_row_to_resource(
+    kind: &str,
+    cols: &[TableColDefWire],
+    row: &TableRowWire,
+    default_ns: &str,
+    prev_pod_metrics: &BTreeMap<(String, String), (String, String)>,
+    prev_node_metrics: &BTreeMap<String, (String, String)>,
+) -> Option<ClusterResource> {
+    if row.cells.is_empty() {
+        return None;
+    }
+    let ns = row
+        .object
+        .as_ref()
+        .map(|o| o.metadata.namespace.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_ns);
+    let owner = row
+        .object
+        .as_ref()
+        .and_then(|o| o.metadata.owner_references.first())
+        .map(|or| (or.kind.as_str(), or.name.as_str()));
+
+    match kind {
+        "Pod" => {
+            if row.cells.len() < 5 {
+                return None;
+            }
+            let name = cell_cow(&row.cells, 0);
+            if name.starts_with("node-dbg-watch-") {
+                return None;
+            }
+            let ready = cell_cow(&row.cells, 1);
+            let status_raw = cell_cow(&row.cells, 2);
+            if name.starts_with("node-debugger-")
+                && matches!(status_raw.as_ref(), "Succeeded" | "Completed" | "Failed")
+            {
+                return None;
+            }
+            let restarts_raw = cell_cow(&row.cells, 3);
+            let age = clean_cell_cow(&row.cells, 4);
+            let pod_ip = clean_cell_cow(&row.cells, 5);
+            let node_name = clean_cell_cow(&row.cells, 6);
+            Some(build_pod_resource_from_table_parts(
+                ns,
+                &name,
+                &ready,
+                &status_raw,
+                &restarts_raw,
+                &age,
+                &pod_ip,
+                &node_name,
+                owner,
+                prev_pod_metrics,
+            ))
+        }
+        "Node" => {
+            let name = cell_cow(&row.cells, 0);
+            let status_raw = cell_cow(&row.cells, 1);
+            let roles = clean_cell_cow(&row.cells, 2);
+            let age = clean_cell_cow(&row.cells, 3);
+            let version = clean_cell_cow(&row.cells, 4);
+            let internal_ip = clean_cell_cow(&row.cells, 5);
+            let kernel = clean_cell_cow(&row.cells, 8);
+            let schedulable = if status_raw.contains("SchedulingDisabled") {
+                "False"
+            } else {
+                "True"
+            };
+            let (cpu, memory) = prev_node_metrics
+                .get(name.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            Some(ClusterResource {
+                kind: "Node".into(),
+                name: name.into_owned(),
+                status: status_raw.replace(',', ", "),
+                ready: version.into_owned(),
+                age: age.into_owned(),
+                detail: internal_ip.clone().into_owned(),
+                cpu,
+                memory,
+                pod_ip: internal_ip.into_owned(),
+                host_ip: if roles == "agent" {
+                    String::new()
+                } else {
+                    roles.into_owned()
+                },
+                node_name: kernel.into_owned(),
+                qos: schedulable.to_owned(),
+                ..Default::default()
+            })
+        }
+        "Namespace" => {
+            let name = cell_cow(&row.cells, 0);
+            let status = cell_cow(&row.cells, 1);
+            let age = clean_cell_cow(&row.cells, 2);
+            Some(ClusterResource {
+                kind: "Namespace".into(),
+                name: name.into_owned(),
+                status: if status.is_empty() {
+                    "Active".into()
+                } else {
+                    status.into_owned()
+                },
+                age: age.into_owned(),
+                ..Default::default()
+            })
+        }
+        "Secret" => {
+            let name = cell_cow(&row.cells, 0);
+            let sec_type = cell_cow(&row.cells, 1);
+            let data_cnt = cell_cow(&row.cells, 2);
+            let age = clean_cell_cow(&row.cells, 3);
+            let (controlled_by_kind, controlled_by_name) = owner
+                .map(|(k, n)| (k.to_owned(), n.to_owned()))
+                .unwrap_or_default();
+            Some(ClusterResource {
+                kind: "Secret".into(),
+                name: name.into_owned(),
+                namespace: ns.to_owned(),
+                status: sec_type.clone().into_owned(),
+                ready: format!("{data_cnt} keys"),
+                age: age.into_owned(),
+                detail: format!("type: {sec_type}"),
+                controlled_by_kind,
+                controlled_by_name,
+                ..Default::default()
+            })
+        }
+        crd if crd.starts_with("CR:") => {
+            let crd_name = crd.strip_prefix("CR:").unwrap_or(crd);
+            let name = cell_cow(&row.cells, 0).into_owned();
+            let age_idx = cols
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case("Age"))
+                .or_else(|| cols.iter().rposition(|c| c.priority == 0))
+                .unwrap_or(row.cells.len().saturating_sub(1));
+            let age = if age_idx > 0 {
+                clean_col(&cell_cow(&row.cells, age_idx)).to_owned()
+            } else {
+                String::new()
+            };
+            let status_idx = cols.iter().position(|c| {
+                matches!(
+                    c.name.to_ascii_lowercase().as_str(),
+                    "status" | "phase" | "state" | "ready"
+                )
+            });
+            let status = status_idx
+                .map(|i| clean_col(&cell_cow(&row.cells, i)).to_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Active".into());
+            let (owner_k, owner_n) = owner
+                .map(|(k, n)| (k.to_owned(), n.to_owned()))
+                .unwrap_or_else(|| (String::new(), crd_name.to_owned()));
+            Some(ClusterResource {
+                kind: crd.to_owned(),
+                name,
+                namespace: ns.to_owned(),
+                status,
+                age,
+                detail: crd_name.to_owned(),
+                controlled_by_kind: owner_k,
+                controlled_by_name: if owner_n.is_empty() {
+                    crd_name.to_owned()
+                } else {
+                    owner_n
+                },
+                ..Default::default()
+            })
+        }
+        _ => {
+            let std_tokens: Vec<String> = if cols.is_empty() {
+                row.cells
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let s = cell_cow(&row.cells, i);
+                        if s.is_empty() {
+                            "<none>".to_owned()
+                        } else {
+                            s.replace(' ', "")
+                        }
+                    })
+                    .collect()
+            } else {
+                cols.iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.priority == 0)
+                    .map(|(i, _)| {
+                        let s = cell_cow(&row.cells, i);
+                        if s.is_empty() {
+                            "<none>".to_owned()
+                        } else {
+                            s.replace(' ', "")
+                        }
+                    })
+                    .collect()
+            };
+            let synthetic_line = std_tokens.join(" ");
+            let mut parsed = parse_server_table_resources(kind, &synthetic_line, false, ns);
+            let mut res = parsed.pop()?;
+            if let Some((ok, on)) = owner {
+                res.controlled_by_kind = ok.to_owned();
+                res.controlled_by_name = on.to_owned();
+            }
+            Some(res)
+        }
+    }
+}
+
+fn resource_identity_without_ns(res: &ClusterResource) -> (String, String, String) {
+    (
+        res.name.clone(),
+        res.pod_ip.clone(),
+        if !res.node_name.is_empty() {
+            res.node_name.clone()
+        } else {
+            res.age.clone()
+        },
+    )
+}
+
+fn event_identity_without_ns(ev: &ClusterEvent) -> (String, String, String) {
+    (
+        format!("{}/{}", ev.kind, ev.object),
+        ev.reason.clone(),
+        ev.message.clone(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_missing_resource_namespaces_via_proxy(
+    watches: &mut WatchManager,
+    port: u16,
+    category: &str,
+    api_prefix: &str,
+    plural: &str,
+    prev_pod_metrics: &BTreeMap<(String, String), (String, String)>,
+    is_cancelled: &dyn Fn() -> bool,
+    resources: &mut [ClusterResource],
+) {
+    let unresolved_indices: Vec<usize> = resources
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.namespace.is_empty().then_some(i))
+        .collect();
+    if unresolved_indices.is_empty() {
+        return;
+    }
+
+    let mut distinct_names: Vec<String> = Vec::new();
+    let mut seen_names = BTreeSet::new();
+    let mut distinct_nodes: Vec<String> = Vec::new();
+    let mut seen_nodes = BTreeSet::new();
+    let mut all_non_running = true;
+
+    for &idx in &unresolved_indices {
+        let r = &resources[idx];
+        if seen_names.insert(r.name.clone()) {
+            distinct_names.push(r.name.clone());
+        }
+        if category == "Pod" {
+            if !r.node_name.is_empty() && seen_nodes.insert(r.node_name.clone()) {
+                distinct_nodes.push(r.node_name.clone());
+            }
+            if matches!(r.status.as_str(), "Running" | "Succeeded" | "Completed") {
+                all_non_running = false;
+            }
+        }
+    }
+
+    let mut selector_uris: Vec<String> = Vec::new();
+    if distinct_names.len() <= 10 {
+        for name in &distinct_names {
+            let sel = url_encode_component(&format!("metadata.name={name}"));
+            selector_uris.push(format!(
+                "{api_prefix}/{plural}?resourceVersion=0&fieldSelector={sel}&includeObject=Metadata"
+            ));
+        }
+    } else if category == "Pod" && all_non_running {
+        let sel = url_encode_component("status.phase!=Running,status.phase!=Succeeded");
+        selector_uris.push(format!(
+            "{api_prefix}/{plural}?resourceVersion=0&fieldSelector={sel}&includeObject=Metadata"
+        ));
+    } else if category == "Pod" && !distinct_nodes.is_empty() && distinct_nodes.len() <= 10 {
+        for node in &distinct_nodes {
+            let sel = url_encode_component(&format!("spec.nodeName={node}"));
+            selector_uris.push(format!(
+                "{api_prefix}/{plural}?resourceVersion=0&fieldSelector={sel}&includeObject=Metadata"
+            ));
+        }
+    } else if category == "Pod" && !distinct_nodes.is_empty() {
+        for node in distinct_nodes.iter().take(10) {
+            let sel = url_encode_component(&format!("spec.nodeName={node}"));
+            selector_uris.push(format!(
+                "{api_prefix}/{plural}?resourceVersion=0&fieldSelector={sel}&includeObject=Metadata"
+            ));
+        }
+    } else {
+        for name in distinct_names.iter().take(10) {
+            let sel = url_encode_component(&format!("metadata.name={name}"));
+            selector_uris.push(format!(
+                "{api_prefix}/{plural}?resourceVersion=0&fieldSelector={sel}&includeObject=Metadata"
+            ));
+        }
+    }
+
+    type ResolvedMeta = (String, String, String);
+    let mut by_exact_key: HashMap<(String, String, String), Vec<ResolvedMeta>> = HashMap::new();
+    let mut by_name_only: HashMap<String, Vec<ResolvedMeta>> = HashMap::new();
+    let empty_node = BTreeMap::new();
+
+    for uri in selector_uris {
+        if is_cancelled() {
+            break;
+        }
+        let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &uri, 8_000) else {
+            continue;
+        };
+        let _ = stream_k8s_table_rows(&bytes, |cols, row| {
+            let Some(resolved) =
+                table_row_to_resource(category, cols, &row, "", prev_pod_metrics, &empty_node)
+            else {
+                return;
+            };
+            if resolved.namespace.is_empty() {
+                return;
+            }
+            let meta = (
+                resolved.namespace.clone(),
+                resolved.controlled_by_kind.clone(),
+                resolved.controlled_by_name.clone(),
+            );
+            by_exact_key
+                .entry(resource_identity_without_ns(&resolved))
+                .or_default()
+                .push(meta.clone());
+            by_name_only.entry(resolved.name).or_default().push(meta);
+        });
+    }
+
+    for idx in unresolved_indices {
+        let key = resource_identity_without_ns(&resources[idx]);
+        let found = by_exact_key
+            .get_mut(&key)
+            .and_then(|v| (!v.is_empty()).then(|| v.remove(0)))
+            .or_else(|| {
+                by_name_only
+                    .get_mut(&resources[idx].name)
+                    .and_then(|v| (!v.is_empty()).then(|| v.remove(0)))
+            });
+        if let Some((ns, ok, on)) = found {
+            if category == "Pod"
+                && let Some((c, m)) =
+                    prev_pod_metrics.get(&(ns.clone(), resources[idx].name.clone()))
+            {
+                resources[idx].cpu = c.clone();
+                resources[idx].memory = m.clone();
+            }
+            resources[idx].namespace = ns;
+            if !ok.is_empty() {
+                resources[idx].controlled_by_kind = ok;
+            }
+            if !on.is_empty() {
+                resources[idx].controlled_by_name = on;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_via_watch_cache_table_proxy(
+    project: &Project,
+    watches: &mut WatchManager,
+    effective_cfg: &KubeConfigState,
+    snap: &mut ClusterSnapshot,
+    category: &str,
+    is_cluster_scoped: bool,
+    tokens: &[SearchToken],
+    prev_pod_metrics: &BTreeMap<(String, String), (String, String)>,
+    prev_node_metrics: &BTreeMap<String, (String, String)>,
+    is_cancelled: &dyn Fn() -> bool,
+    outcome: &mut CategorySearchOutcome,
+) -> bool {
+    let endpoint = if category == "Event" {
+        ("/api/v1".to_owned(), "events".to_owned(), false)
+    } else if let Some(ep) = resolve_watch_endpoint(project, effective_cfg, snap, category) {
+        ep
+    } else {
+        return false;
+    };
+    let (api_prefix, plural, _) = endpoint;
+
+    let Some(port) = watches.ensure_api_proxy(project, effective_cfg) else {
+        return false;
+    };
+
+    let scan_table_bytes = |bytes: &[u8],
+                            default_ns: &str,
+                            out: &mut CategorySearchOutcome,
+                            mut dedup_res: Option<
+        &mut HashMap<(String, String, String), usize>,
+    >,
+                            mut dedup_ev: Option<&mut HashMap<(String, String, String), usize>>|
+     -> Result<u64, String> {
+        let mut rows_seen = 0u64;
+        stream_k8s_table_rows(bytes, |cols, row| {
+            if category == "Event" {
+                let Some(ev) = table_row_to_event(&row, default_ns) else {
+                    return;
+                };
+                rows_seen += 1;
+                if event_matches_tokens(&ev, tokens) {
+                    if let Some(ref mut map) = dedup_ev {
+                        let k = event_identity_without_ns(&ev);
+                        if let Some(cnt) = map.get_mut(&k)
+                            && *cnt > 0
+                        {
+                            *cnt -= 1;
+                            return;
+                        }
+                    }
+                    out.total_matches += 1;
+                    if out.events.len() < MAX_SEARCH_RESULTS {
+                        out.events.push(ev);
+                    } else {
+                        out.truncated = true;
+                    }
+                }
+            } else if category == "Pod" {
+                if row.cells.len() < 5 {
+                    return;
+                }
+                let name = cell_cow(&row.cells, 0);
+                if name.starts_with("node-dbg-watch-") {
+                    return;
+                }
+                let ready = cell_cow(&row.cells, 1);
+                let status_raw = cell_cow(&row.cells, 2);
+                if name.starts_with("node-debugger-")
+                    && matches!(status_raw.as_ref(), "Succeeded" | "Completed" | "Failed")
+                {
+                    return;
+                }
+                let restarts_raw = cell_cow(&row.cells, 3);
+                let age = clean_cell_cow(&row.cells, 4);
+                let pod_ip = clean_cell_cow(&row.cells, 5);
+                let node_name = clean_cell_cow(&row.cells, 6);
+                let ns = row
+                    .object
+                    .as_ref()
+                    .map(|o| o.metadata.namespace.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(default_ns);
+                let owner = row
+                    .object
+                    .as_ref()
+                    .and_then(|o| o.metadata.owner_references.first())
+                    .map(|or| (or.kind.as_str(), or.name.as_str()));
+
+                rows_seen += 1;
+                let restarts_num = parse_leading_u64(&restarts_raw);
+                let detail_hint = format!("restarts: {restarts_num}");
+                let owner_matches = owner.is_some_and(|(ok, on)| {
+                    tokens.iter().any(|t| {
+                        matches!(t, SearchToken::Any(v) if contains_case_insensitive(ok, v) || contains_case_insensitive(on, v))
+                    })
+                });
+                let matched = if owner_matches {
+                    let probe = build_pod_resource_from_table_parts(
+                        ns,
+                        &name,
+                        &ready,
+                        &status_raw,
+                        &restarts_raw,
+                        &age,
+                        &pod_ip,
+                        &node_name,
+                        owner,
+                        prev_pod_metrics,
+                    );
+                    resource_matches_tokens(&probe, tokens)
+                } else {
+                    pod_fields_match_tokens(
+                        tokens,
+                        ns,
+                        &name,
+                        &status_raw,
+                        &pod_ip,
+                        &node_name,
+                        &detail_hint,
+                    )
+                };
+                if !matched {
+                    return;
+                }
+                if let Some(ref mut map) = dedup_res {
+                    let k = (
+                        name.clone().into_owned(),
+                        pod_ip.clone().into_owned(),
+                        if !node_name.is_empty() {
+                            node_name.clone().into_owned()
+                        } else {
+                            age.clone().into_owned()
+                        },
+                    );
+                    if let Some(cnt) = map.get_mut(&k)
+                        && *cnt > 0
+                    {
+                        *cnt -= 1;
+                        return;
+                    }
+                }
+                out.total_matches += 1;
+                if out.resources.len() < MAX_SEARCH_RESULTS {
+                    out.resources.push(build_pod_resource_from_table_parts(
+                        ns,
+                        &name,
+                        &ready,
+                        &status_raw,
+                        &restarts_raw,
+                        &age,
+                        &pod_ip,
+                        &node_name,
+                        owner,
+                        prev_pod_metrics,
+                    ));
+                } else {
+                    out.truncated = true;
+                }
+            } else {
+                let Some(res) = table_row_to_resource(
+                    category,
+                    cols,
+                    &row,
+                    default_ns,
+                    prev_pod_metrics,
+                    prev_node_metrics,
+                ) else {
+                    return;
+                };
+                rows_seen += 1;
+                if resource_matches_tokens(&res, tokens) {
+                    if let Some(ref mut map) = dedup_res {
+                        let k = resource_identity_without_ns(&res);
+                        if let Some(cnt) = map.get_mut(&k)
+                            && *cnt > 0
+                        {
+                            *cnt -= 1;
+                            return;
+                        }
+                    }
+                    out.total_matches += 1;
+                    if out.resources.len() < MAX_SEARCH_RESULTS {
+                        out.resources.push(res);
+                    } else {
+                        out.truncated = true;
+                    }
+                }
+            }
+        })?;
+        Ok(rows_seen)
+    };
+
+    // 1. Cluster-scoped resources (`Node`, `Namespace`, `PersistentVolume`, `ClusterRole`, etc.)
+    if is_cluster_scoped {
+        let uri = format!("{api_prefix}/{plural}?resourceVersion=0&includeObject=None");
+        if let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &uri, 20_000)
+            && let Ok(rows) = scan_table_bytes(&bytes, "", outcome, None, None)
+        {
+            outcome.scanned_total = rows;
+            return true;
+        }
+        return false;
+    }
+
+    // 2. Single or multi-namespace scope: query each selected namespace's watch cache directly (`includeObject=Metadata`)
+    if !effective_cfg.all_namespaces {
+        let active = effective_cfg.active_namespaces();
+        let mut any_ok = false;
+        for ns in &active {
+            if is_cancelled() {
+                break;
+            }
+            let uri = format!(
+                "{api_prefix}/namespaces/{ns}/{plural}?resourceVersion=0&includeObject=Metadata"
+            );
+            if let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &uri, 15_000)
+                && let Ok(rows) = scan_table_bytes(&bytes, ns, outcome, None, None)
+            {
+                any_ok = true;
+                outcome.scanned_total += rows;
+            }
+        }
+        return any_ok;
+    }
+
+    // 3. All Namespaces:
+    // 3a. Explicit `ns:<subquery>` token narrows directly to matching namespaces in `snap.namespaces` (~0.2s)
+    let explicit_ns_filters: Vec<&str> = tokens
+        .iter()
+        .filter_map(|t| match t {
+            SearchToken::Namespace(v) => Some(v.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !explicit_ns_filters.is_empty() && !snap.namespaces.is_empty() {
+        let target_namespaces: Vec<String> = snap
+            .namespaces
+            .iter()
+            .filter(|ns| {
+                explicit_ns_filters
+                    .iter()
+                    .all(|pat| contains_case_insensitive(ns, pat))
+            })
+            .cloned()
+            .collect();
+        if target_namespaces.is_empty() {
+            return true;
+        }
+        if target_namespaces.len() <= 24 {
+            let mut any_ok = false;
+            for ns in &target_namespaces {
+                if is_cancelled() {
+                    break;
+                }
+                let uri = format!(
+                    "{api_prefix}/namespaces/{ns}/{plural}?resourceVersion=0&includeObject=Metadata"
+                );
+                if let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &uri, 12_000)
+                    && let Ok(rows) = scan_table_bytes(&bytes, ns, outcome, None, None)
+                {
+                    any_ok = true;
+                    outcome.scanned_total += rows;
+                }
+            }
+            if any_ok {
+                return true;
+            }
+        }
+    }
+
+    let est_total = snap
+        .page_info
+        .get(category)
+        .map(|pi| pi.loaded_count + pi.remaining_count.unwrap_or(0))
+        .or_else(|| snap.overview_counts.get(category).copied())
+        .unwrap_or(0);
+
+    // 3b. Medium/large scopes up to 40,000 items (`Deployments`, `Secrets`, `ConfigMaps`, `Events`, `CR:*`):
+    //     fetch `includeObject=Metadata` in a single gzipped watch-cache request so every row carries exact `namespace`.
+    if est_total > 0 && est_total <= METADATA_TABLE_MAX_EST_ITEMS {
+        let meta_uri = format!("{api_prefix}/{plural}?resourceVersion=0&includeObject=Metadata");
+        if let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &meta_uri, 22_000) {
+            let mut trial = CategorySearchOutcome {
+                category: outcome.category.clone(),
+                query: outcome.query.clone(),
+                ..Default::default()
+            };
+            if let Ok(rows) = scan_table_bytes(&bytes, "", &mut trial, None, None) {
+                trial.scanned_total = rows;
+                *outcome = trial;
+                return true;
+            }
+        }
+    }
+
+    // 3c. Massive scopes (`> 40,000` items, e.g. 88k+ Pods on `falcon-phx-ga`):
+    //     Step 1: Fan out to any namespaces in `snap.namespaces` matching query tokens (~0.2s, exact `namespace`).
+    let mut dedup_res_without_ns: HashMap<(String, String, String), usize> = HashMap::new();
+    let mut dedup_ev_without_ns: HashMap<(String, String, String), usize> = HashMap::new();
+    if !snap.namespaces.is_empty() {
+        let any_tokens: Vec<&str> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                SearchToken::Any(v) if !v.is_empty() => Some(v.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !any_tokens.is_empty() {
+            let matching_ns: Vec<String> = snap
+                .namespaces
+                .iter()
+                .filter(|ns| {
+                    any_tokens
+                        .iter()
+                        .any(|tok| contains_case_insensitive(ns, tok))
+                })
+                .cloned()
+                .collect();
+            if !matching_ns.is_empty() && matching_ns.len() <= 16 {
+                for ns in &matching_ns {
+                    if is_cancelled() {
+                        break;
+                    }
+                    let ns_uri = format!(
+                        "{api_prefix}/namespaces/{ns}/{plural}?resourceVersion=0&includeObject=Metadata"
+                    );
+                    let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &ns_uri, 8_000) else {
+                        continue;
+                    };
+                    let _ = stream_k8s_table_rows(&bytes, |cols, row| {
+                        if category == "Event" {
+                            let Some(ev) = table_row_to_event(&row, ns) else {
+                                return;
+                            };
+                            let mut ev_no_ns = ev.clone();
+                            ev_no_ns.namespace.clear();
+                            if event_matches_tokens(&ev_no_ns, tokens) {
+                                *dedup_ev_without_ns
+                                    .entry(event_identity_without_ns(&ev))
+                                    .or_insert(0) += 1;
+                            }
+                            if event_matches_tokens(&ev, tokens) {
+                                outcome.total_matches += 1;
+                                if outcome.events.len() < MAX_SEARCH_RESULTS {
+                                    outcome.events.push(ev);
+                                } else {
+                                    outcome.truncated = true;
+                                }
+                            }
+                        } else if let Some(res) = table_row_to_resource(
+                            category,
+                            cols,
+                            &row,
+                            ns,
+                            prev_pod_metrics,
+                            prev_node_metrics,
+                        ) {
+                            let mut res_no_ns = res.clone();
+                            res_no_ns.namespace.clear();
+                            if resource_matches_tokens(&res_no_ns, tokens) {
+                                *dedup_res_without_ns
+                                    .entry(resource_identity_without_ns(&res))
+                                    .or_insert(0) += 1;
+                            }
+                            if resource_matches_tokens(&res, tokens) {
+                                outcome.total_matches += 1;
+                                if outcome.resources.len() < MAX_SEARCH_RESULTS {
+                                    outcome.resources.push(res);
+                                } else {
+                                    outcome.truncated = true;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    if is_cancelled() {
+        return outcome.total_matches > 0;
+    }
+
+    //     Step 2: Full-cluster `?resourceVersion=0&includeObject=None` watch-cache scan (~2.3s / 1.6 MiB gzipped for 88k pods).
+    let none_uri = format!("{api_prefix}/{plural}?resourceVersion=0&includeObject=None");
+    let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &none_uri, 25_000) else {
+        return false;
+    };
+    let Ok(total_rows) = scan_table_bytes(
+        &bytes,
+        "",
+        outcome,
+        Some(&mut dedup_res_without_ns),
+        Some(&mut dedup_ev_without_ns),
+    ) else {
+        return false;
+    };
+    outcome.scanned_total = total_rows;
+
+    //     Step 3: Resolve `metadata.namespace` + `ownerReferences` for any non-Event matched rows (~0.3s).
+    if category != "Event" && !is_cancelled() {
+        resolve_missing_resource_namespaces_via_proxy(
+            watches,
+            port,
+            category,
+            &api_prefix,
+            &plural,
+            prev_pod_metrics,
+            is_cancelled,
+            &mut outcome.resources,
+        );
+    }
+
+    true
+}
+
 /// Searches Kubernetes ground truth across the entire active scope (`All Namespaces`, single namespace,
 /// or multiple selected namespaces) when the local UI table holds only a partial paginated window.
 pub fn search_cluster_category_ground_truth(
     project: &Project,
+    watches: &mut WatchManager,
     cfg: &KubeConfigState,
     snap: &mut ClusterSnapshot,
     category: &str,
@@ -7748,6 +8984,47 @@ pub fn search_cluster_category_ground_truth(
     }
 
     let tokens = parse_search_tokens(effective_query);
+
+    let prev_pod_metrics_for_proxy: BTreeMap<(String, String), (String, String)> =
+        if category == "Pod" {
+            snap.resources
+                .iter()
+                .filter(|r| r.kind == "Pod" && (!r.cpu.is_empty() || !r.memory.is_empty()))
+                .map(|r| {
+                    (
+                        (r.namespace.clone(), r.name.clone()),
+                        (r.cpu.clone(), r.memory.clone()),
+                    )
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+    let prev_node_metrics_for_proxy: BTreeMap<String, (String, String)> = if category == "Node" {
+        snap.resources
+            .iter()
+            .filter(|r| r.kind == "Node" && (!r.cpu.is_empty() || !r.memory.is_empty()))
+            .map(|r| (r.name.clone(), (r.cpu.clone(), r.memory.clone())))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+
+    if search_via_watch_cache_table_proxy(
+        project,
+        watches,
+        &effective_cfg,
+        snap,
+        category,
+        is_cluster_scoped,
+        &tokens,
+        &prev_pod_metrics_for_proxy,
+        &prev_node_metrics_for_proxy,
+        is_cancelled,
+        &mut outcome,
+    ) {
+        return outcome;
+    }
 
     match category {
         "Event" => {
