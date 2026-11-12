@@ -1743,7 +1743,7 @@ body,
 .fl-ns-picker-btn {
   height: 32px;
   min-width: 200px;
-  max-width: 280px;
+  max-width: 310px;
   padding: 0 10px;
   border: 1px solid var(--fl-border);
   border-radius: 4px;
@@ -1766,8 +1766,8 @@ body,
   position: absolute;
   top: 36px;
   right: 0;
-  width: 280px;
-  max-height: 390px;
+  width: 300px;
+  max-height: 430px;
   display: flex;
   flex-direction: column;
   background: var(--fl-bg);
@@ -1797,6 +1797,70 @@ body,
   flex-shrink: 0;
 }
 
+.fl-ns-chips-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 8px 6px 10px;
+  border-top: 1px solid var(--fl-border);
+  background: var(--fl-bg-elevated);
+}
+
+.fl-ns-chips-scroll {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-height: 52px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.fl-ns-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 130px;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--fl-teal) 42%, var(--fl-border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--fl-teal) 14%, var(--fl-bg));
+  color: var(--fl-teal-text);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.fl-ns-chip:hover {
+  background: color-mix(in srgb, var(--fl-teal) 24%, var(--fl-bg));
+}
+
+.fl-ns-chip-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fl-ns-clear-btn {
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid var(--fl-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fl-fg-muted);
+  font-family: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.fl-ns-clear-btn:hover {
+  color: var(--fl-fg);
+  border-color: var(--fl-teal);
+}
+
 .fl-ns-list {
   flex: 1;
   max-height: 288px;
@@ -1811,17 +1875,72 @@ body,
   gap: 8px;
   height: 30px;
   box-sizing: border-box;
-  padding: 0 12px;
+  padding: 0 10px;
   font-size: 12.5px;
   cursor: pointer;
   white-space: nowrap;
   overflow: hidden;
+  user-select: none;
 }
 
-.fl-ns-opt > span:first-child {
+.fl-ns-opt-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.fl-ns-check {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  border: 1px solid var(--fl-border);
+  background: var(--fl-bg);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.fl-ns-check.checked {
+  background: var(--fl-teal);
+  border-color: var(--fl-teal);
+}
+
+.fl-ns-opt-label {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.fl-ns-only-btn {
+  opacity: 0;
+  height: 19px;
+  padding: 0 6px;
+  border: 1px solid var(--fl-border);
+  border-radius: 3px;
+  background: var(--fl-bg-elevated);
+  color: var(--fl-fg-muted);
+  font-family: inherit;
+  font-size: 10.5px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: opacity 0.1s ease;
+}
+
+.fl-ns-opt:hover .fl-ns-only-btn {
+  opacity: 1;
+}
+
+.fl-ns-only-btn:hover {
+  color: var(--fl-teal-text);
+  border-color: var(--fl-teal);
 }
 
 .fl-ns-footer {
@@ -1838,40 +1957,61 @@ body,
 }
 
 .fl-ns-opt.active {
-  background: color-mix(in srgb, var(--fl-teal) 16%, var(--fl-bg));
+  background: color-mix(in srgb, var(--fl-teal) 14%, var(--fl-bg));
   color: var(--fl-teal-text);
   font-weight: 600;
 }
 
-.fl-pagination-bar {
+.fl-table-sentinel-row > td {
+  padding: 12px 16px !important;
+  border-bottom: none !important;
+  background: transparent !important;
+}
+
+.fl-table-sentinel-row:hover > td {
+  background: transparent !important;
+}
+
+.fl-table-sentinel {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  height: 38px;
-  padding: 0 18px;
-  border-top: 1px solid var(--fl-border);
-  background: var(--fl-bg-elevated);
-  font-size: 12px;
+  justify-content: center;
+  gap: 8px;
+  font-size: 11.5px;
   color: var(--fl-fg-muted);
+  user-select: none;
+}
+
+.fl-table-sentinel-end {
+  opacity: 0.72;
+}
+
+.fl-sentinel-spinner {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 1.8px solid color-mix(in srgb, var(--fl-teal) 28%, transparent);
+  border-top-color: var(--fl-teal);
+  animation: fl-sentinel-spin 0.75s linear infinite;
   flex-shrink: 0;
 }
 
-.fl-pagination-controls {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+@keyframes fl-sentinel-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
-.fl-page-btn {
-  height: 26px;
+.fl-sentinel-btn {
+  height: 23px;
   padding: 0 9px;
-  border: 1px solid var(--fl-border);
-  border-radius: 4px;
-  background: var(--fl-bg);
-  color: var(--fl-fg);
+  border: 1px solid color-mix(in srgb, var(--fl-teal) 45%, var(--fl-border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--fl-teal) 12%, var(--fl-bg));
+  color: var(--fl-teal-text);
   font-family: inherit;
-  font-size: 12px;
+  font-size: 11.5px;
+  font-weight: 500;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
@@ -1879,25 +2019,38 @@ body,
   white-space: nowrap;
 }
 
-.fl-page-btn:hover:not(:disabled) {
-  background: var(--fl-bg-hover);
+.fl-sentinel-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--fl-teal) 22%, var(--fl-bg));
 }
 
-.fl-page-btn:disabled {
-  opacity: 0.42;
+.fl-sentinel-btn:disabled {
+  opacity: 0.45;
   cursor: default;
 }
 
-.fl-page-select {
-  height: 26px;
-  padding: 0 6px;
+.fl-scroll-top-fab {
+  position: fixed;
+  bottom: 22px;
+  height: 30px;
+  padding: 0 11px;
   border: 1px solid var(--fl-border);
-  border-radius: 4px;
-  background: var(--fl-bg);
+  border-radius: 15px;
+  background: var(--fl-bg-elevated);
   color: var(--fl-fg);
   font-family: inherit;
-  font-size: 12px;
+  font-size: 11.5px;
+  font-weight: 500;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.22);
   cursor: pointer;
+  z-index: 95;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.fl-scroll-top-fab:hover {
+  border-color: var(--fl-teal);
+  color: var(--fl-teal-text);
 }
 
 .fl-watch-pill {

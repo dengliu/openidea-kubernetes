@@ -127,16 +127,19 @@ impl KubernetesPlugin {
         } else {
             "k8s"
         };
+        let active_ns = cfg.active_namespaces();
         let ns_name = if cfg.all_namespaces {
-            "all"
+            "all".to_owned()
+        } else if active_ns.len() > 1 {
+            format!("{} +{}", active_ns[0], active_ns.len() - 1)
         } else if let Some(ref snap) = self.snapshot
             && !snap.current_namespace.is_empty()
         {
-            snap.current_namespace.as_str()
+            snap.current_namespace.clone()
         } else if !cfg.namespace.is_empty() {
-            cfg.namespace.as_str()
+            cfg.namespace.clone()
         } else {
-            "default"
+            "default".to_owned()
         };
         let text = format!("k8s: {ctx_name}/{ns_name}");
         host::set_status_item(
@@ -166,6 +169,7 @@ impl KubernetesPlugin {
                 }
                 snap.current_namespace = cfg.namespace.clone();
                 snap.all_namespaces = cfg.all_namespaces;
+                snap.selected_namespaces = cfg.active_namespaces();
             }
             return;
         }
@@ -177,6 +181,7 @@ impl KubernetesPlugin {
             cluster_catalog: Vec::new(),
             current_namespace: cfg.namespace.clone(),
             all_namespaces: cfg.all_namespaces,
+            selected_namespaces: cfg.active_namespaces(),
             namespaces: vec!["default".into(), "kube-system".into()],
             resources: Vec::new(),
             events: Vec::new(),
@@ -190,11 +195,12 @@ impl KubernetesPlugin {
                     let _ = storage::set("context", &cfg.context);
                 }
                 if cfg.namespace == "default"
+                    && cfg.selected_namespaces.len() <= 1
                     && let Some(ns) = ctx_ns
                     && !ns.is_empty()
                 {
-                    cfg.namespace = ns.clone();
-                    let _ = storage::set("namespace", &ns);
+                    cfg.set_namespaces([ns.as_str()]);
+                    cfg.persist_scope();
                 }
                 snap.current_context = if cfg.context.is_empty() {
                     current_ctx
@@ -205,10 +211,14 @@ impl KubernetesPlugin {
                 snap.cluster_catalog = catalog;
                 snap.current_namespace = cfg.namespace.clone();
                 snap.all_namespaces = cfg.all_namespaces;
-                if !snap.namespaces.contains(&cfg.namespace) {
-                    snap.namespaces.push(cfg.namespace.clone());
-                    snap.namespaces.sort();
+                snap.selected_namespaces = cfg.active_namespaces();
+                for ns in cfg.active_namespaces() {
+                    if !snap.namespaces.contains(&ns) {
+                        snap.namespaces.push(ns);
+                    }
                 }
+                snap.namespaces.sort();
+                snap.namespaces.dedup();
             }
             Err(e) => {
                 snap.error = Some(e.to_string());
@@ -360,28 +370,90 @@ impl KubernetesPlugin {
             self.watches.stop_category();
             return;
         };
-        let spec = WatchSpec {
-            context: snap.current_context.clone(),
-            kubeconfig: cfg.kubeconfig.clone(),
-            namespace: snap.current_namespace.clone(),
-            all_namespaces: snap.all_namespaces,
-            kind: cat.to_owned(),
-            api_prefix,
-            plural,
-            cluster_scoped,
-            field_selector_name: None,
-        };
-        if let Some(ref cur) = self.watches.category_stream
-            && cur.spec == spec
+        let active_ns = cfg.active_namespaces();
+        let desired: Vec<(WatchSpec, String)> =
+            if cluster_scoped || snap.all_namespaces || active_ns.len() <= 1 {
+                let target_ns = if cluster_scoped || snap.all_namespaces {
+                    String::new()
+                } else {
+                    active_ns
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| snap.current_namespace.clone())
+                };
+                vec![(
+                    WatchSpec {
+                        context: snap.current_context.clone(),
+                        kubeconfig: cfg.kubeconfig.clone(),
+                        namespace: target_ns,
+                        all_namespaces: snap.all_namespaces,
+                        kind: cat.to_owned(),
+                        api_prefix,
+                        plural,
+                        cluster_scoped,
+                        field_selector_name: None,
+                    },
+                    pi.resource_version,
+                )]
+            } else if active_ns.len() <= kubectl::MAX_MULTI_NAMESPACE_WATCHES {
+                let mut specs = Vec::with_capacity(active_ns.len());
+                for ns in &active_ns {
+                    let Some(rv) = pi.namespace_versions.get(ns).filter(|v| !v.is_empty()) else {
+                        self.watches.stop_category();
+                        if let Some(entry) = snap.page_info.get_mut(cat) {
+                            entry.watch_supported = false;
+                        }
+                        return;
+                    };
+                    specs.push((
+                        WatchSpec {
+                            context: snap.current_context.clone(),
+                            kubeconfig: cfg.kubeconfig.clone(),
+                            namespace: ns.clone(),
+                            all_namespaces: false,
+                            kind: cat.to_owned(),
+                            api_prefix: api_prefix.clone(),
+                            plural: plural.clone(),
+                            cluster_scoped: false,
+                            field_selector_name: None,
+                        },
+                        rv.clone(),
+                    ));
+                }
+                specs
+            } else {
+                self.watches.stop_category();
+                return;
+            };
+
+        if self.watches.category_streams.len() == desired.len()
+            && self
+                .watches
+                .category_streams
+                .iter()
+                .zip(desired.iter())
+                .all(|(cur, (spec, _))| &cur.spec == spec)
         {
             return;
         }
+
         self.watches.stop_category();
-        if let Ok(stream) = ActiveWatchStream::start(project, cfg, spec, pi.resource_version) {
-            self.watches.category_stream = Some(stream);
-        } else if let Some(entry) = snap.page_info.get_mut(cat) {
-            entry.watch_supported = false;
+        let mut started_streams = Vec::with_capacity(desired.len());
+        for (spec, rv) in desired {
+            match ActiveWatchStream::start(project, cfg, spec, rv) {
+                Ok(stream) => started_streams.push(stream),
+                Err(_) => {
+                    for s in started_streams {
+                        s.stop();
+                    }
+                    if let Some(entry) = snap.page_info.get_mut(cat) {
+                        entry.watch_supported = false;
+                    }
+                    return;
+                }
+            }
         }
+        self.watches.category_streams = started_streams;
     }
 
     /// Starts or replaces the single-object `fieldSelector=metadata.name=<name>` watch for the open Drawer.
@@ -467,16 +539,19 @@ impl KubernetesPlugin {
         let mut drawer_deleted: Option<(String, String, String)> = None;
         let mut category_resync_needed = false;
 
-        // 1. Drain category watch stream if active for `active_cat`
+        // 1. Drain category watch streams if active for `active_cat`
         if self
             .watches
-            .category_stream
-            .as_ref()
-            .is_some_and(|s| s.spec.kind != active_cat)
+            .category_streams
+            .iter()
+            .any(|s| s.spec.kind != active_cat)
         {
             self.watches.stop_category();
         }
-        if let Some(mut stream) = self.watches.category_stream.take() {
+        let existing_streams = std::mem::take(&mut self.watches.category_streams);
+        let mut retained_streams: Vec<ActiveWatchStream> =
+            Vec::with_capacity(existing_streams.len());
+        for mut stream in existing_streams {
             let (frames, ended, gone) = stream.drain_frames();
             if let Some(ref mut snap) = self.snapshot {
                 for frame in frames {
@@ -567,7 +642,14 @@ impl KubernetesPlugin {
                 if let Some(pi) = snap.page_info.get_mut(active_cat) {
                     pi.loaded_count = cat_cnt;
                     if !stream.resource_version.is_empty() {
-                        pi.resource_version = stream.resource_version.clone();
+                        if !stream.spec.namespace.is_empty() && !pi.namespace_versions.is_empty() {
+                            pi.namespace_versions.insert(
+                                stream.spec.namespace.clone(),
+                                stream.resource_version.clone(),
+                            );
+                        } else {
+                            pi.resource_version = stream.resource_version.clone();
+                        }
                     }
                 }
             }
@@ -580,20 +662,27 @@ impl KubernetesPlugin {
                 let spec = stream.spec.clone();
                 stream.stop();
                 if let Ok(reopened) = ActiveWatchStream::start(project, cfg, spec, rv) {
-                    self.watches.category_stream = Some(reopened);
+                    retained_streams.push(reopened);
                 } else {
                     category_resync_needed = true;
                 }
             } else {
-                self.watches.category_stream = Some(stream);
+                retained_streams.push(stream);
             }
+        }
+        if category_resync_needed {
+            for s in retained_streams {
+                s.stop();
+            }
+        } else {
+            self.watches.category_streams = retained_streams;
         }
 
         // Optional lightweight `kubectl top pods` refresh on small watched Pod scopes
         if refresh_metrics
             && !category_resync_needed
             && active_cat == "Pod"
-            && self.watches.category_stream.is_some()
+            && !self.watches.category_streams.is_empty()
             && let Some(ref mut snap) = self.snapshot
         {
             let pod_cnt = snap.resources.iter().filter(|r| r.kind == "Pod").count();
@@ -699,7 +788,7 @@ impl KubernetesPlugin {
             return;
         }
 
-        let cat_watching = self.watches.category_stream.is_some();
+        let cat_watching = !self.watches.category_streams.is_empty();
         let drawer_watching = self.watches.drawer_stream.is_some();
         let mut msg = json!({
             "op": "watch-delta",
@@ -949,14 +1038,12 @@ impl KubernetesPlugin {
                         .map(|item| item.namespace.clone())
                         .unwrap_or_else(|| "default".into());
                     let _ = storage::set("context", c);
-                    let _ = storage::set("namespace", &default_ns);
-                    let _ = storage::set("allNamespaces", "false");
+                    let mut cfg = KubeConfigState::load();
+                    cfg.context = c.to_owned();
+                    cfg.set_namespaces([default_ns.as_str()]);
+                    cfg.persist_scope();
 
                     if let Some(cat) = v.get("category").and_then(Value::as_str) {
-                        let mut cfg = KubeConfigState::load();
-                        cfg.context = c.to_owned();
-                        cfg.namespace = default_ns.clone();
-                        cfg.all_namespaces = false;
                         let req_limit = v
                             .get("limit")
                             .and_then(Value::as_u64)
@@ -970,6 +1057,7 @@ impl KubernetesPlugin {
                             cluster_catalog: prev_catalog,
                             current_namespace: default_ns.clone(),
                             all_namespaces: false,
+                            selected_namespaces: vec![default_ns.clone()],
                             namespaces: vec![default_ns, "default".into(), "kube-system".into()],
                             resources: Vec::new(),
                             events: Vec::new(),
@@ -1180,58 +1268,27 @@ impl KubernetesPlugin {
             "stop-drawer-watch" => {
                 self.watches.stop_drawer();
             }
-            "set-namespace" => {
+            "set-namespace" | "set-namespaces" => {
                 self.watches.stop_all();
-                if let Some(ns) = v.get("namespace").and_then(Value::as_str) {
-                    let _ = storage::set("namespace", ns);
-                    let _ = storage::set("allNamespaces", "false");
-                    let req_limit = v
-                        .get("limit")
-                        .and_then(Value::as_u64)
-                        .map(|n| (n as u32).clamp(10, 500))
-                        .unwrap_or(kubectl::DEFAULT_PAGE_LIMIT);
-                    if let Some(cat) = v.get("category").and_then(Value::as_str)
-                        && let Ok(project) = resolve_project(ctx)
-                    {
-                        let mut cfg = KubeConfigState::load();
-                        self.ensure_catalog_loaded(&project, &mut cfg);
-                        if let Some(ref mut snap) = self.snapshot {
-                            if snap.namespaces.len() <= 3 {
-                                fetch_namespaces_into_snapshot(&project, &cfg, snap);
-                            }
-                            snap.current_namespace = ns.to_owned();
-                            snap.all_namespaces = false;
-                            snap.helm_releases.clear();
-                            snap.events.clear();
-                            snap.page_info.clear();
-                            snap.overview_counts.retain(|k, _| k == "Namespace");
-                            snap.resources
-                                .retain(|r| r.kind == "CustomResourceDefinition");
-                            fetch_category_with_options(
-                                &project,
-                                &cfg,
-                                snap,
-                                cat,
-                                FetchOptions {
-                                    limit: req_limit,
-                                    ..FetchOptions::default()
-                                },
-                            );
-                        }
-                        self.sync_category_watch(&project, &cfg, cat);
-                        self.post_snapshot(false);
-                    } else {
-                        if let Ok(project) = resolve_project(ctx) {
-                            self.refresh_cluster(&project);
-                        }
-                        self.post_state(ctx);
-                    }
-                }
-            }
-            "set-all-namespaces" => {
-                self.watches.stop_all();
-                let all = v.get("all").and_then(Value::as_bool).unwrap_or(false);
-                let _ = storage::set("allNamespaces", if all { "true" } else { "false" });
+                let requested: Vec<String> = if op == "set-namespaces" {
+                    v.get("namespaces")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else if let Some(ns) = v.get("namespace").and_then(Value::as_str) {
+                    vec![ns.to_owned()]
+                } else {
+                    return Ok(());
+                };
+                let normalized = kubectl::normalize_namespace_list(&requested);
+                let mut cfg = KubeConfigState::load();
+                cfg.set_namespaces(&normalized);
+                cfg.persist_scope();
                 let req_limit = v
                     .get("limit")
                     .and_then(Value::as_u64)
@@ -1240,7 +1297,66 @@ impl KubernetesPlugin {
                 if let Some(cat) = v.get("category").and_then(Value::as_str)
                     && let Ok(project) = resolve_project(ctx)
                 {
-                    let mut cfg = KubeConfigState::load();
+                    let _bg_task = (cfg.active_namespaces().len() > 3)
+                        .then(|| host::begin_task("Kubernetes: Loading namespaces", false));
+                    self.ensure_catalog_loaded(&project, &mut cfg);
+                    if let Some(ref mut snap) = self.snapshot {
+                        if snap.namespaces.len() <= 3 {
+                            fetch_namespaces_into_snapshot(&project, &cfg, snap);
+                        }
+                        if cfg.all_namespaces
+                            && matches!(cat, "ClusterOverview" | "WorkloadsOverview")
+                            && enforce_large_cluster_scope(&mut cfg, snap)
+                        {
+                            snap.error = Some(format!(
+                                "Cluster has {} namespaces; Overview is scoped to '{}' for responsiveness (select an individual resource tab to query All Namespaces).",
+                                snap.namespaces.len(),
+                                cfg.namespace
+                            ));
+                        }
+                        snap.current_namespace = cfg.namespace.clone();
+                        snap.all_namespaces = cfg.all_namespaces;
+                        snap.selected_namespaces = cfg.active_namespaces();
+                        snap.helm_releases.clear();
+                        snap.events.clear();
+                        snap.page_info.clear();
+                        snap.overview_counts.retain(|k, _| k == "Namespace");
+                        snap.resources
+                            .retain(|r| r.kind == "CustomResourceDefinition");
+                        fetch_category_with_options(
+                            &project,
+                            &cfg,
+                            snap,
+                            cat,
+                            FetchOptions {
+                                limit: req_limit,
+                                ..FetchOptions::default()
+                            },
+                        );
+                    }
+                    self.sync_category_watch(&project, &cfg, cat);
+                    self.post_snapshot(false);
+                } else {
+                    if let Ok(project) = resolve_project(ctx) {
+                        self.refresh_cluster(&project);
+                    }
+                    self.post_state(ctx);
+                }
+            }
+            "set-all-namespaces" => {
+                self.watches.stop_all();
+                let all = v.get("all").and_then(Value::as_bool).unwrap_or(false);
+                let mut cfg = KubeConfigState::load();
+                cfg.all_namespaces = all;
+                cfg.persist_scope();
+                let req_limit = v
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|n| (n as u32).clamp(10, 500))
+                    .unwrap_or(kubectl::DEFAULT_PAGE_LIMIT);
+                if let Some(cat) = v.get("category").and_then(Value::as_str)
+                    && let Ok(project) = resolve_project(ctx)
+                {
                     self.ensure_catalog_loaded(&project, &mut cfg);
                     if let Some(ref mut snap) = self.snapshot {
                         if snap.namespaces.len() <= 3 {
@@ -1258,6 +1374,7 @@ impl KubernetesPlugin {
                         } else {
                             snap.all_namespaces = all;
                         }
+                        snap.selected_namespaces = cfg.active_namespaces();
                         snap.helm_releases.clear();
                         snap.events.clear();
                         snap.page_info.clear();
@@ -2173,11 +2290,9 @@ impl Plugin for KubernetesPlugin {
                         .cloned()
                         .unwrap_or_else(|| "default".into())
                 };
-                storage::set("namespace", &next)?;
-                storage::set("allNamespaces", "false")?;
                 let mut updated = KubeConfigState::load();
-                updated.namespace = next.clone();
-                updated.all_namespaces = false;
+                updated.set_namespaces([next.as_str()]);
+                updated.persist_scope();
                 self.update_status_bar(&updated);
                 self.refresh_cluster(&project);
                 self.post_state(ctx);
@@ -3544,7 +3659,7 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
             } else if joined.contains("get crd --no-headers") {
                 "workloads.kueue.x-k8s.io 2025-07-29T21:30:07Z\n".to_owned()
             } else if joined.contains("--raw /apis/kueue.x-k8s.io/v1beta1/namespaces/production/workloads?limit=50") {
-                r#"{"kind":"WorkloadList","metadata":{"continue":"cr-tok-2","remainingItemCount":450},"items":[{"metadata":{"name":"job-wl-1","namespace":"production","creationTimestamp":"2026-11-11T10:00:00Z"},"status":{"phase":"Admitted"}}]}"#.to_owned()
+                r#"{"kind":"WorkloadList","metadata":{"continue":"cr-tok-2","remainingItemCount":850},"items":[{"metadata":{"name":"job-wl-1","namespace":"production","creationTimestamp":"2026-11-11T10:00:00Z"},"status":{"phase":"Admitted"}}]}"#.to_owned()
             } else if joined.contains("--raw /apis/kueue.x-k8s.io/v1beta1") {
                 r#"{"kind":"APIResourceList","resources":[{"name":"workloads","namespaced":true,"kind":"Workload"}]}"#.to_owned()
             } else if joined.contains("--raw /apis/kueue.x-k8s.io") {
@@ -3799,7 +3914,7 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
             )
             .unwrap();
         assert!(plugin.snapshot.as_ref().unwrap().page_info["Pod"].watch_supported);
-        assert!(plugin.watches.category_stream.is_some());
+        assert!(!plugin.watches.category_streams.is_empty());
 
         // Switching to All Namespaces (52,001 pods > 1,000): stops category watch & uses paged LIST
         plugin
@@ -3812,7 +3927,7 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
             )
             .unwrap();
         assert!(!plugin.snapshot.as_ref().unwrap().page_info["Pod"].watch_supported);
-        assert!(plugin.watches.category_stream.is_none());
+        assert!(plugin.watches.category_streams.is_empty());
 
         // Inspecting one Pod in the Drawer starts a single-object fieldSelector watch even on the 52k cluster
         plugin
@@ -3852,5 +3967,184 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
         assert!(host.view_messages().iter().any(|(v, m)| v == VIEW_ID
             && m.contains(r#""op":"watch-delta""#)
             && m.contains(r#""drawerWatching":true"#)));
+    }
+
+    #[test]
+    fn multi_namespace_selection_paginates_and_watches_across_namespaces() {
+        let host = install_mock_with_kubectl();
+        host.on_process("kubectl", move |args, _stdin| {
+            let joined = args.join(" ");
+            let stdout = if joined.contains("config view") {
+                KUBECONFIG_JSON.to_owned()
+            } else if joined.contains("get namespaces --no-headers") {
+                "dayan Active 30d\ndengliu Active 30d\nteam-large Active 30d\n".to_owned()
+            } else if joined.contains("/api/v1/namespaces/dayan/pods?limit=50") {
+                r#"{"kind":"PodList","metadata":{"resourceVersion":"4101"},"items":[{"metadata":{"name":"brix-git","namespace":"dayan","resourceVersion":"4100","creationTimestamp":"2026-11-11T10:00:00Z"},"spec":{"containers":[{"name":"git"}]},"status":{"phase":"Running"}}]}"#.to_owned()
+            } else if joined.contains("/api/v1/namespaces/dengliu/pods?limit=50") {
+                r#"{"kind":"PodList","metadata":{"resourceVersion":"5202"},"items":[{"metadata":{"name":"dev-pod-0","namespace":"dengliu","resourceVersion":"5201","creationTimestamp":"2026-11-11T10:05:00Z"},"spec":{"containers":[{"name":"dev"}]},"status":{"phase":"Running"}}]}"#.to_owned()
+            } else if joined.contains("/api/v1/namespaces/team-large/pods?limit=10&continue=tl-2") {
+                r#"{"kind":"PodList","metadata":{"resourceVersion":"6309"},"items":[{"metadata":{"name":"train-1","namespace":"team-large","creationTimestamp":"2026-11-11T10:10:00Z"},"status":{"phase":"Running"}}]}"#.to_owned()
+            } else if joined.contains("/api/v1/namespaces/team-large/pods?limit=") {
+                r#"{"kind":"PodList","metadata":{"resourceVersion":"6305","continue":"tl-2","remainingItemCount":600},"items":[{"metadata":{"name":"train-0","namespace":"team-large","creationTimestamp":"2026-11-11T10:09:00Z"},"status":{"phase":"Running"}}]}"#.to_owned()
+            } else if joined.contains("/api/v1/namespaces/dayan/pods?limit=10")
+                || joined.contains("/api/v1/namespaces/dayan/pods?limit=")
+            {
+                r#"{"kind":"PodList","metadata":{"resourceVersion":"4101"},"items":[{"metadata":{"name":"brix-git","namespace":"dayan","creationTimestamp":"2026-11-11T10:00:00Z"},"status":{"phase":"Running"}}]}"#.to_owned()
+            } else {
+                String::new()
+            };
+            Ok(ProcessOutput {
+                status: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        });
+        host.add_file("k8s/app.yaml", SAMPLE_MANIFEST);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        // 1. Selecting 2 small namespaces (`dayan` + `dengliu`) merges pods & opens 2 live watch streams
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"set-namespaces","namespaces":["dayan","dengliu"],"category":"Pod","limit":50}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+
+        let snap = plugin.snapshot.as_ref().unwrap();
+        assert!(!snap.all_namespaces);
+        assert_eq!(snap.selected_namespaces, vec!["dayan", "dengliu"]);
+        assert_eq!(snap.current_namespace, "dayan");
+        let pod_names: Vec<(&str, &str)> = snap
+            .resources
+            .iter()
+            .filter(|r| r.kind == "Pod")
+            .map(|r| (r.namespace.as_str(), r.name.as_str()))
+            .collect();
+        assert_eq!(
+            pod_names,
+            vec![("dayan", "brix-git"), ("dengliu", "dev-pod-0")]
+        );
+        assert!(snap.page_info["Pod"].watch_supported);
+        assert_eq!(plugin.watches.category_streams.len(), 2);
+
+        // 2. Paginating across `["team-large", "dayan"]` when `team-large` emits a `continue` cursor (`mns:0:tl-2`)
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"set-namespaces","namespaces":["team-large","dayan"],"category":"Pod","limit":10}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        let snap_p1 = plugin.snapshot.as_ref().unwrap();
+        assert_eq!(snap_p1.page_info["Pod"].continue_token, "mns:0:tl-2");
+        assert!(!snap_p1.page_info["Pod"].watch_supported);
+
+        // Advancing with `continueToken: "mns:0:tl-2"` finishes `team-large` (`train-1`) and continues into `dayan` (`brix-git`)!
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"load-category","category":"Pod","limit":10,"continueToken":"mns:0:tl-2","pageMode":"replace","pageIndex":2}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        let snap_p2 = plugin.snapshot.as_ref().unwrap();
+        assert_eq!(snap_p2.page_info["Pod"].continue_token, "");
+        let p2_names: Vec<(&str, &str)> = snap_p2
+            .resources
+            .iter()
+            .filter(|r| r.kind == "Pod")
+            .map(|r| (r.namespace.as_str(), r.name.as_str()))
+            .collect();
+        assert_eq!(
+            p2_names,
+            vec![("team-large", "train-1"), ("dayan", "brix-git")]
+        );
+    }
+
+    #[test]
+    fn scopes_up_to_500_items_auto_drain_completely_and_enable_live_watch() {
+        let host = install_mock_with_kubectl();
+        host.on_process("kubectl", move |args, _stdin| {
+            let joined = args.join(" ");
+            let stdout = if joined.contains("config view") {
+                KUBECONFIG_JSON.to_owned()
+            } else if joined.contains("get namespaces --no-headers") {
+                "default Active 30d\nmedium-ns Active 30d\nlarge-ns Active 30d\n".to_owned()
+            } else if joined.contains("/api/v1/namespaces/medium-ns/services?limit=250&continue=svc-p2") {
+                r#"{"kind":"ServiceList","metadata":{"resourceVersion":"9105"},"items":[{"metadata":{"name":"svc-b","namespace":"medium-ns","creationTimestamp":"2026-11-12T10:00:00Z"},"spec":{"type":"ClusterIP"}}]}"#.to_owned()
+            } else if joined.contains("/api/v1/namespaces/medium-ns/services?limit=200") {
+                // 1 + 319 remaining = 320 <= 500 -> should auto-drain `svc-p2` right away!
+                r#"{"kind":"ServiceList","metadata":{"resourceVersion":"9100","continue":"svc-p2","remainingItemCount":319},"items":[{"metadata":{"name":"svc-a","namespace":"medium-ns","creationTimestamp":"2026-11-12T09:59:00Z"},"spec":{"type":"ClusterIP"}}]}"#.to_owned()
+            } else if joined.contains("/api/v1/namespaces/large-ns/services?limit=200") {
+                // 1 + 520 remaining = 521 > 500 -> stays paged with `continue_token = "svc-big-2"` and `watch_supported = false`
+                r#"{"kind":"ServiceList","metadata":{"resourceVersion":"9200","continue":"svc-big-2","remainingItemCount":520},"items":[{"metadata":{"name":"svc-0","namespace":"large-ns","creationTimestamp":"2026-11-12T09:59:00Z"},"spec":{"type":"ClusterIP"}}]}"#.to_owned()
+            } else {
+                String::new()
+            };
+            Ok(ProcessOutput {
+                status: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        });
+        host.add_file("k8s/app.yaml", SAMPLE_MANIFEST);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        // 1. `medium-ns` (<= 500 items): drains continuation automatically, loads all items, starts live watch
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"set-namespace","namespace":"medium-ns","category":"Service","limit":200}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        let snap_med = plugin.snapshot.as_ref().unwrap();
+        let svc_names: Vec<&str> = snap_med
+            .resources
+            .iter()
+            .filter(|r| r.kind == "Service")
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(svc_names, vec!["svc-a", "svc-b"]);
+        assert_eq!(snap_med.page_info["Service"].continue_token, "");
+        assert!(snap_med.page_info["Service"].watch_supported);
+        assert_eq!(plugin.watches.category_streams.len(), 1);
+
+        // 2. `large-ns` (521 > 500 items): keeps `continue_token` for virtualized auto-scroll and stops watch
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"set-namespace","namespace":"large-ns","category":"Service","limit":200}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        let snap_lg = plugin.snapshot.as_ref().unwrap();
+        assert_eq!(snap_lg.page_info["Service"].continue_token, "svc-big-2");
+        assert!(!snap_lg.page_info["Service"].watch_supported);
+        assert!(plugin.watches.category_streams.is_empty());
     }
 }

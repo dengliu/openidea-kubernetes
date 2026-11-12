@@ -586,7 +586,40 @@ export const VIRTUAL_OVERSCAN = 20;
 export const VIRTUAL_THRESHOLD = 100;
 export const NS_OPTION_ROW_HEIGHT = 30;
 export const NS_VIEWPORT_HEIGHT = 288;
-export const PAGE_SIZE_OPTIONS = [50, 100, 250, 500] as const;
+export const DEFAULT_BATCH_SIZE = 200;
+export const SOFT_AUTO_LOAD_CAP = 3000;
+export const AUTO_LOAD_PREFETCH_PX = 560;
+
+export function shouldTriggerAutoLoadMore(params: {
+  hasMore: boolean;
+  isLoading: boolean;
+  hasSearch: boolean;
+  rawLoadedCount: number;
+  softCap?: number;
+  scrollTop: number;
+  viewportHeight: number;
+  scrollHeight: number;
+  prefetchPx?: number;
+}): boolean {
+  const {
+    hasMore,
+    isLoading,
+    hasSearch,
+    rawLoadedCount,
+    softCap = SOFT_AUTO_LOAD_CAP,
+    scrollTop,
+    viewportHeight,
+    scrollHeight,
+    prefetchPx = AUTO_LOAD_PREFETCH_PX,
+  } = params;
+  if (!hasMore || isLoading || rawLoadedCount <= 0 || rawLoadedCount >= softCap) {
+    return false;
+  }
+  if (hasSearch && scrollHeight <= viewportHeight + 40) {
+    return false;
+  }
+  return scrollTop + viewportHeight >= scrollHeight - prefetchPx;
+}
 
 export function computeVirtualWindow(
   totalRows: number,
@@ -701,6 +734,67 @@ export function formatPaginationStatus(
     hasMore,
     pageIndex,
     isAppend: false,
+  };
+}
+
+export function resolveSelectedNamespaces(
+  snapshot: Pick<ClusterSnapshot, "all_namespaces" | "selected_namespaces" | "current_namespace">,
+): string[] {
+  if (snapshot.all_namespaces) return [];
+  const list = Array.from(
+    new Set((snapshot.selected_namespaces || []).map((s) => s.trim()).filter(Boolean)),
+  );
+  if (list.length > 0) return list;
+  const fallback = (snapshot.current_namespace || "").trim() || "default";
+  return [fallback];
+}
+
+export function toggleNamespaceInSelection(
+  currentSelected: string[],
+  allNamespaces: boolean,
+  clickedNs: string,
+): { allNamespaces: boolean; selectedNamespaces: string[] } {
+  const target = clickedNs.trim();
+  if (!target) {
+    return { allNamespaces, selectedNamespaces: currentSelected };
+  }
+  if (allNamespaces) {
+    return { allNamespaces: false, selectedNamespaces: [target] };
+  }
+  const normalized = Array.from(new Set(currentSelected.map((s) => s.trim()).filter(Boolean)));
+  if (normalized.includes(target)) {
+    const remaining = normalized.filter((n) => n !== target);
+    if (remaining.length === 0) {
+      return { allNamespaces: true, selectedNamespaces: [] };
+    }
+    return { allNamespaces: false, selectedNamespaces: remaining };
+  }
+  const added = [...normalized, target].sort();
+  return { allNamespaces: false, selectedNamespaces: added };
+}
+
+export function formatNamespaceButtonLabel(
+  allNamespaces: boolean,
+  selectedNamespaces: string[],
+): { label: string; tooltip: string } {
+  if (allNamespaces || selectedNamespaces.length === 0) {
+    return { label: "Namespace: All Namespaces", tooltip: "Namespace: All Namespaces" };
+  }
+  if (selectedNamespaces.length === 1) {
+    return {
+      label: `Namespace: ${selectedNamespaces[0]}`,
+      tooltip: `Namespace: ${selectedNamespaces[0]}`,
+    };
+  }
+  if (selectedNamespaces.length === 2) {
+    return {
+      label: `Namespaces: ${selectedNamespaces[0]}, ${selectedNamespaces[1]}`,
+      tooltip: `Namespaces: ${selectedNamespaces.join(", ")}`,
+    };
+  }
+  return {
+    label: `Namespaces: ${selectedNamespaces[0]}, ${selectedNamespaces[1]} +${selectedNamespaces.length - 2}`,
+    tooltip: `Namespaces (${selectedNamespaces.length}): ${selectedNamespaces.join(", ")}`,
   };
 }
 
@@ -1071,6 +1165,7 @@ export function App() {
     cluster_catalog: [],
     current_namespace: "default",
     all_namespaces: false,
+    selected_namespaces: ["default"],
     namespaces: ["default"],
     resources: [],
     events: [],
@@ -1141,20 +1236,33 @@ export function App() {
   const [nsSearch, setNsSearch] = useState<string>("");
   const [nsScrollTop, setNsScrollTop] = useState<number>(0);
   const nsListRef = useRef<HTMLDivElement>(null);
+  const nsApplyTimerRef = useRef<number | null>(null);
+  const pendingNsScopeRef = useRef<{ allNamespaces: boolean; selectedNamespaces: string[] } | null>(null);
 
-  // Server-side limit + continue pagination state
-  const [pageSize, setPageSize] = useState<number>(() => {
-    try {
-      const saved = Number(window.localStorage.getItem("k8s.pageSize") || "100");
-      return PAGE_SIZE_OPTIONS.includes(saved as any) ? saved : 100;
-    } catch {
-      return 100;
-    }
-  });
+  const selectedNamespaces = useMemo(() => resolveSelectedNamespaces(snapshot), [
+    snapshot.all_namespaces,
+    snapshot.selected_namespaces,
+    snapshot.current_namespace,
+  ]);
+  const selectedNamespaceSet = useMemo(() => new Set(selectedNamespaces), [selectedNamespaces]);
+  const selectedNsSignature = useMemo(
+    () => (snapshot.all_namespaces ? "*" : selectedNamespaces.join(",")),
+    [snapshot.all_namespaces, selectedNamespaces],
+  );
+  const nsButtonDisplay = useMemo(
+    () => formatNamespaceButtonLabel(snapshot.all_namespaces, selectedNamespaces),
+    [snapshot.all_namespaces, selectedNamespaces],
+  );
+
+  // Progressive limit + continue streaming state (Freelens zero-button scroll UX)
+  const pageSize = DEFAULT_BATCH_SIZE;
   const pageSizeRef = useRef<number>(pageSize);
   pageSizeRef.current = pageSize;
-  const [prevTokensByKind, setPrevTokensByKind] = useState<Record<string, string[]>>({});
+  const activeKindRef = useRef<string>(activeKind);
+  activeKindRef.current = activeKind;
   const [pageLoading, setPageLoading] = useState<boolean>(false);
+  const [loadingMore, setLoadingMore] = useState<boolean>(false);
+  const autoLoadTokenInFlightRef = useRef<string>("");
 
   const [debuggerImage, setDebuggerImage] = useState<string>("dengliu/k8sdebugger:3cfd912");
   const [customHotbar, setCustomHotbar] = useState<string[] | null>(null);
@@ -1216,7 +1324,7 @@ export function App() {
     if (tableContainerRef.current) {
       tableContainerRef.current.scrollTop = 0;
     }
-  }, [activeKind, snapshot.current_context, snapshot.current_namespace, snapshot.all_namespaces, searchQuery]);
+  }, [activeKind, snapshot.current_context, selectedNsSignature, searchQuery]);
 
   // Support Cmd/Ctrl + =/-/0 font size zoom inside the Kubernetes plugin window
   useEffect(() => {
@@ -1302,8 +1410,7 @@ export function App() {
   }, [
     snapshot.connected,
     snapshot.current_context,
-    snapshot.current_namespace,
-    snapshot.all_namespaces,
+    selectedNsSignature,
     activeKind,
     activeCategoryWatchEligible,
     drawerOpen,
@@ -1363,8 +1470,7 @@ export function App() {
   }, [
     snapshot.connected,
     snapshot.current_context,
-    snapshot.current_namespace,
-    snapshot.all_namespaces,
+    selectedNsSignature,
     snapshot.resources.length,
     activeKind,
     activeCategoryWatchEligible,
@@ -1434,6 +1540,8 @@ export function App() {
           pollInFlightSinceRef.current = 0;
           watchInFlightSinceRef.current = 0;
           setPageLoading(false);
+          setLoadingMore(false);
+          autoLoadTokenInFlightRef.current = "";
           if (typeof m.pollDurationMs === "number" && Number.isFinite(m.pollDurationMs)) {
             lastPollDurationMsRef.current = m.pollDurationMs;
           }
@@ -1445,20 +1553,6 @@ export function App() {
           }
           if (Array.isArray(m.hotbarItems)) {
             setCustomHotbar((prev) => (prev === null ? m.hotbarItems : prev));
-          }
-          if (m.snapshot?.page_info) {
-            const pmap = m.snapshot.page_info as Record<string, CategoryPageInfo>;
-            setPrevTokensByKind((prev) => {
-              let changed = false;
-              const next = { ...prev };
-              for (const [k, info] of Object.entries(pmap)) {
-                if ((info.page_index || 1) <= 1 && next[k] && next[k].length > 0) {
-                  delete next[k];
-                  changed = true;
-                }
-              }
-              return changed ? next : prev;
-            });
           }
           setSnapshot((prev) => {
             const next: ClusterSnapshot = m.snapshot || prev;
@@ -1474,6 +1568,11 @@ export function App() {
               prev.namespaces.length > 3
             ) {
               next.namespaces = prev.namespaces;
+            }
+            if (pendingNsScopeRef.current !== null && next.current_context === prev.current_context) {
+              next.all_namespaces = prev.all_namespaces;
+              next.selected_namespaces = prev.selected_namespaces;
+              next.current_namespace = prev.current_namespace;
             }
             return { ...next };
           });
@@ -1657,7 +1756,8 @@ export function App() {
     const defaultNs = (entry && entry.namespace) || "default";
     const nextKind = targetKind || (activeKind === "ClusterCatalog" ? "Pod" : activeKind);
     loadedLazyRef.current = {};
-    setPrevTokensByKind({});
+    autoLoadTokenInFlightRef.current = "";
+    setLoadingMore(false);
     setPageLoading(true);
     setClusterMenuOpen(false);
     setSelectedRowKey(null);
@@ -1671,6 +1771,7 @@ export function App() {
       current_context: chosen,
       current_namespace: defaultNs,
       all_namespaces: false,
+      selected_namespaces: [defaultNs],
       error: null,
       resources: [],
       events: [],
@@ -1692,7 +1793,8 @@ export function App() {
     setBulkDeleteConfirmOpen(false);
     setDrawerOpen(false);
     setColMenuOpen(false);
-    setPrevTokensByKind((prev) => ({ ...prev, [nextKind]: [] }));
+    autoLoadTokenInFlightRef.current = "";
+    setLoadingMore(false);
     // Ensure parent group is expanded
     const parentGroup = SIDEBAR_TREE.find((g) => g.items?.some((i) => i.kind === nextKind));
     if (parentGroup) {
@@ -1712,23 +1814,112 @@ export function App() {
     }
   }
 
-  function handleSelectNamespace(val: string) {
+  function sendNamespaceScopeToBackend(scope: { allNamespaces: boolean; selectedNamespaces: string[] }) {
+    const cat = activeKindRef.current;
+    const lim = pageSizeRef.current;
+    if (scope.allNamespaces || scope.selectedNamespaces.length === 0) {
+      setBanner({ text: "Querying all namespaces…", isError: false });
+      sendToBackend({ op: "set-all-namespaces", all: true, category: cat, limit: lim });
+    } else if (scope.selectedNamespaces.length === 1) {
+      const single = scope.selectedNamespaces[0];
+      setBanner({ text: `Switching namespace to ${single}…`, isError: false });
+      sendToBackend({ op: "set-namespace", namespace: single, category: cat, limit: lim });
+    } else {
+      setBanner({
+        text: `Querying ${scope.selectedNamespaces.length} namespaces (${scope.selectedNamespaces.slice(0, 3).join(", ")}${scope.selectedNamespaces.length > 3 ? ", …" : ""})…`,
+        isError: false,
+      });
+      sendToBackend({
+        op: "set-namespaces",
+        namespaces: scope.selectedNamespaces,
+        category: cat,
+        limit: lim,
+      });
+    }
+  }
+
+  function flushPendingNamespaceScope() {
+    if (nsApplyTimerRef.current !== null) {
+      window.clearTimeout(nsApplyTimerRef.current);
+      nsApplyTimerRef.current = null;
+    }
+    const pending = pendingNsScopeRef.current;
+    if (pending) {
+      pendingNsScopeRef.current = null;
+      sendNamespaceScopeToBackend(pending);
+    }
+  }
+
+  useEffect(() => {
+    if (!nsMenuOpen) {
+      flushPendingNamespaceScope();
+    }
+  }, [nsMenuOpen]);
+
+  useEffect(() => {
+    return () => {
+      if (nsApplyTimerRef.current !== null) {
+        window.clearTimeout(nsApplyTimerRef.current);
+      }
+    };
+  }, []);
+
+  function applyNamespaceScopeOptimistically(
+    nextScope: { allNamespaces: boolean; selectedNamespaces: string[] },
+    immediate: boolean,
+  ) {
     loadedLazyRef.current = {};
-    setPrevTokensByKind({});
+    autoLoadTokenInFlightRef.current = "";
+    setLoadingMore(false);
     setPageLoading(true);
     setSelectedRowKey(null);
     setCheckedRows({});
     setBulkDeleteConfirmOpen(false);
     setDrawerOpen(false);
-    if (val === "__ALL__") {
-      setSnapshot((prev) => ({ ...prev, all_namespaces: true, page_info: {} }));
-      setBanner({ text: "Querying all namespaces…", isError: false });
-      sendToBackend({ op: "set-all-namespaces", all: true, category: activeKind, limit: pageSize });
-    } else {
-      setSnapshot((prev) => ({ ...prev, current_namespace: val, all_namespaces: false, page_info: {} }));
-      setBanner({ text: `Switching namespace to ${val}…`, isError: false });
-      sendToBackend({ op: "set-namespace", namespace: val, category: activeKind, limit: pageSize });
+    setSnapshot((prev) => ({
+      ...prev,
+      all_namespaces: nextScope.allNamespaces,
+      selected_namespaces: nextScope.allNamespaces
+        ? prev.selected_namespaces && prev.selected_namespaces.length > 0
+          ? prev.selected_namespaces
+          : [prev.current_namespace || "default"]
+        : nextScope.selectedNamespaces,
+      current_namespace: nextScope.allNamespaces
+        ? prev.current_namespace || "default"
+        : nextScope.selectedNamespaces[0] || prev.current_namespace || "default",
+      page_info: {},
+    }));
+    if (nsApplyTimerRef.current !== null) {
+      window.clearTimeout(nsApplyTimerRef.current);
+      nsApplyTimerRef.current = null;
     }
+    if (immediate) {
+      pendingNsScopeRef.current = null;
+      sendNamespaceScopeToBackend(nextScope);
+    } else {
+      pendingNsScopeRef.current = nextScope;
+      nsApplyTimerRef.current = window.setTimeout(() => {
+        nsApplyTimerRef.current = null;
+        const pending = pendingNsScopeRef.current;
+        if (pending) {
+          pendingNsScopeRef.current = null;
+          sendNamespaceScopeToBackend(pending);
+        }
+      }, 180);
+    }
+  }
+
+  function handleSelectNamespace(val: string) {
+    if (val === "__ALL__") {
+      applyNamespaceScopeOptimistically({ allNamespaces: true, selectedNamespaces: [] }, true);
+    } else {
+      applyNamespaceScopeOptimistically({ allNamespaces: false, selectedNamespaces: [val] }, true);
+    }
+  }
+
+  function handleToggleNamespace(ns: string) {
+    const nextScope = toggleNamespaceInSelection(selectedNamespaces, snapshot.all_namespaces, ns);
+    applyNamespaceScopeOptimistically(nextScope, false);
   }
 
   function resetScrollToTop() {
@@ -1738,93 +1929,24 @@ export function App() {
     }
   }
 
-  function handlePageFirst() {
-    setPrevTokensByKind((prev) => ({ ...prev, [activeKind]: [] }));
-    setPageLoading(true);
-    resetScrollToTop();
-    sendToBackend({
-      op: "load-category",
-      category: activeKind,
-      limit: pageSize,
-      continueToken: "",
-      pageMode: "replace",
-      pageIndex: 1,
-    });
-  }
-
-  function handlePageNext() {
+  function requestNextStreamBatch(mode: "append" | "replace" = "append") {
     const pi = snapshot.page_info?.[activeKind];
     if (!pi || !pi.continue_token) return;
-    const curReqTok = pi.request_token || "";
-    const curPageIdx = Math.max(1, pi.page_index || 1);
-    setPrevTokensByKind((prev) => ({
-      ...prev,
-      [activeKind]: [...(prev[activeKind] || []), curReqTok],
-    }));
-    setPageLoading(true);
-    resetScrollToTop();
-    sendToBackend({
-      op: "load-category",
-      category: activeKind,
-      limit: pageSize,
-      continueToken: pi.continue_token,
-      pageMode: "replace",
-      pageIndex: curPageIdx + 1,
-    });
-  }
-
-  function handlePagePrev() {
-    const stack = prevTokensByKind[activeKind] || [];
-    if (stack.length === 0) {
-      handlePageFirst();
-      return;
+    if (autoLoadTokenInFlightRef.current === pi.continue_token) return;
+    autoLoadTokenInFlightRef.current = pi.continue_token;
+    if (mode === "replace") {
+      setPageLoading(true);
+      resetScrollToTop();
+    } else {
+      setLoadingMore(true);
     }
-    const prevTok = stack[stack.length - 1] || "";
-    const nextStack = stack.slice(0, -1);
-    setPrevTokensByKind((prev) => ({ ...prev, [activeKind]: nextStack }));
-    setPageLoading(true);
-    resetScrollToTop();
-    sendToBackend({
-      op: "load-category",
-      category: activeKind,
-      limit: pageSize,
-      continueToken: prevTok,
-      pageMode: "replace",
-      pageIndex: nextStack.length + 1,
-    });
-  }
-
-  function handleLoadMore() {
-    const pi = snapshot.page_info?.[activeKind];
-    if (!pi || !pi.continue_token) return;
-    setPageLoading(true);
     sendToBackend({
       op: "load-category",
       category: activeKind,
       limit: pageSize,
       continueToken: pi.continue_token,
-      pageMode: "append",
+      pageMode: mode,
       pageIndex: Math.max(1, pi.page_index || 1) + 1,
-    });
-  }
-
-  function handleChangePageSize(nextLimit: number) {
-    setPageSize(nextLimit);
-    try {
-      window.localStorage.setItem("k8s.pageSize", String(nextLimit));
-    } catch {
-      // ignore storage errors
-    }
-    setPrevTokensByKind((prev) => ({ ...prev, [activeKind]: [] }));
-    setPageLoading(true);
-    resetScrollToTop();
-    sendToBackend({
-      op: "load-category",
-      category: activeKind,
-      limit: nextLimit,
-      continueToken: "",
-      pageMode: "replace",
-      pageIndex: 1,
     });
   }
 
@@ -2076,12 +2198,15 @@ export function App() {
   const allAvailableNamespaces = useMemo(() => {
     const set = new Set<string>(snapshot.namespaces || []);
     if (snapshot.current_namespace) set.add(snapshot.current_namespace);
+    for (const ns of snapshot.selected_namespaces || []) {
+      if (ns) set.add(ns);
+    }
     for (const r of snapshot.resources || []) {
       if (r.kind === "Namespace" && r.name) set.add(r.name);
       else if (r.namespace) set.add(r.namespace);
     }
     return Array.from(set).filter(Boolean).sort();
-  }, [snapshot.namespaces, snapshot.current_namespace, snapshot.resources]);
+  }, [snapshot.namespaces, snapshot.current_namespace, snapshot.selected_namespaces, snapshot.resources]);
 
   const matchingNamespaces = useMemo(() => {
     const q = nsSearch.trim().toLowerCase();
@@ -2091,8 +2216,9 @@ export function App() {
   useEffect(() => {
     if (!nsMenuOpen) return;
     let nextScroll = 0;
-    if (!snapshot.all_namespaces && snapshot.current_namespace && !nsSearch.trim()) {
-      const idx = matchingNamespaces.indexOf(snapshot.current_namespace);
+    const anchorNs = selectedNamespaces[0] || snapshot.current_namespace;
+    if (!snapshot.all_namespaces && anchorNs && !nsSearch.trim()) {
+      const idx = matchingNamespaces.indexOf(anchorNs);
       if (idx > 4) {
         nextScroll = Math.max(0, (idx - 3) * NS_OPTION_ROW_HEIGHT);
       }
@@ -2211,16 +2337,168 @@ export function App() {
   }, [snapshot.events, snapshot.helm_releases, snapshot.resources, activeKind]);
 
   const activePageInfo: CategoryPageInfo | undefined = snapshot.page_info?.[activeKind];
+  const hasSearchQuery = Boolean(searchQuery.trim());
   const paginationStatus = useMemo(
     () =>
       formatPaginationStatus(
         activePageInfo,
         activeKind === "Event" ? filteredEvents.length : filteredResources.length,
         rawActiveCategoryCount,
-        Boolean(searchQuery.trim()),
+        hasSearchQuery,
       ),
-    [activePageInfo, activeKind, filteredEvents.length, filteredResources.length, rawActiveCategoryCount, searchQuery],
+    [activePageInfo, activeKind, filteredEvents.length, filteredResources.length, rawActiveCategoryCount, hasSearchQuery],
   );
+
+  function maybeAutoLoadMore(el: HTMLDivElement | null) {
+    if (!el) return;
+    if (
+      activeKind === "ClusterCatalog" ||
+      activeKind === "Workspace" ||
+      activeKind === "ClusterOverview" ||
+      activeKind === "WorkloadsOverview" ||
+      activeKind === "HelmRelease" ||
+      activeKind === "CustomResourceDefinition"
+    ) {
+      return;
+    }
+    if (
+      shouldTriggerAutoLoadMore({
+        hasMore: paginationStatus.hasMore,
+        isLoading: pageLoading || loadingMore,
+        hasSearch: hasSearchQuery,
+        rawLoadedCount: rawActiveCategoryCount,
+        scrollTop: el.scrollTop,
+        viewportHeight: el.clientHeight || tableViewportHeight,
+        scrollHeight: el.scrollHeight,
+      })
+    ) {
+      requestNextStreamBatch("append");
+    }
+  }
+
+  useEffect(() => {
+    maybeAutoLoadMore(tableContainerRef.current);
+  }, [
+    activeKind,
+    rawActiveCategoryCount,
+    paginationStatus.hasMore,
+    pageLoading,
+    loadingMore,
+    hasSearchQuery,
+    tableViewportHeight,
+  ]);
+
+  function renderTableSentinelRow(
+    colSpan: number,
+    labelPlural: string,
+    rawCount: number,
+    filteredCount: number,
+    supportsCursorStream: boolean,
+  ): React.ReactNode {
+    const labelLower = labelPlural.toLowerCase();
+    const hasMore = supportsCursorStream && paginationStatus.hasMore;
+    const estTotal = Math.max(rawCount, paginationStatus.estTotal || rawCount);
+
+    if (hasMore && (loadingMore || pageLoading)) {
+      return (
+        <tr className="fl-table-sentinel-row">
+          <td colSpan={colSpan}>
+            <div className="fl-table-sentinel">
+              <span className="fl-sentinel-spinner" aria-hidden="true" />
+              <span>
+                Loading more {labelLower}… ({rawCount.toLocaleString()} of {estTotal.toLocaleString()} loaded)
+              </span>
+            </div>
+          </td>
+        </tr>
+      );
+    }
+
+    if (hasMore && rawCount >= SOFT_AUTO_LOAD_CAP) {
+      return (
+        <tr className="fl-table-sentinel-row">
+          <td colSpan={colSpan}>
+            <div className="fl-table-sentinel">
+              <span>
+                Loaded {rawCount.toLocaleString()} of {estTotal.toLocaleString()} {labelLower} · Narrow by Namespace or
+                Search, or
+              </span>
+              <button
+                type="button"
+                className="fl-sentinel-btn"
+                disabled={pageLoading || loadingMore}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  requestNextStreamBatch("replace");
+                }}
+              >
+                Load next {pageSize} window →
+              </button>
+            </div>
+          </td>
+        </tr>
+      );
+    }
+
+    if (hasMore && hasSearchQuery) {
+      return (
+        <tr className="fl-table-sentinel-row">
+          <td colSpan={colSpan}>
+            <div className="fl-table-sentinel">
+              <span>
+                {filteredCount.toLocaleString()} matching in {rawCount.toLocaleString()} loaded of{" "}
+                {estTotal.toLocaleString()} {labelLower}
+              </span>
+              <button
+                type="button"
+                className="fl-sentinel-btn"
+                disabled={pageLoading || loadingMore}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  requestNextStreamBatch("append");
+                }}
+              >
+                Scan next {pageSize}
+              </button>
+            </div>
+          </td>
+        </tr>
+      );
+    }
+
+    if (hasMore) {
+      return (
+        <tr className="fl-table-sentinel-row">
+          <td colSpan={colSpan}>
+            <div className="fl-table-sentinel">
+              <span>
+                {rawCount.toLocaleString()} of {estTotal.toLocaleString()} {labelLower} loaded · Scroll down to load
+                more
+              </span>
+            </div>
+          </td>
+        </tr>
+      );
+    }
+
+    if (rawCount <= 0) {
+      return null;
+    }
+
+    return (
+      <tr className="fl-table-sentinel-row">
+        <td colSpan={colSpan}>
+          <div className="fl-table-sentinel fl-table-sentinel-end">
+            <span>
+              {hasSearchQuery
+                ? `End of list · Showing ${filteredCount.toLocaleString()} matching of ${rawCount.toLocaleString()} ${labelLower}`
+                : `End of list · All ${rawCount.toLocaleString()} ${labelLower} loaded`}
+            </span>
+          </div>
+        </td>
+      </tr>
+    );
+  }
 
   function getPodContainerItems(
     res: ClusterResource,
@@ -3144,6 +3422,7 @@ export function App() {
                 <div className="fl-ns-picker-wrap" onClick={(e) => e.stopPropagation()}>
                   <button
                     className="fl-ns-picker-btn"
+                    title={nsButtonDisplay.tooltip}
                     onClick={() => {
                       if (!nsMenuOpen && allAvailableNamespaces.length <= 3) {
                         sendToBackend({ op: "sync-cluster", context: snapshot.current_context });
@@ -3152,7 +3431,7 @@ export function App() {
                     }}
                   >
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      Namespace: {snapshot.all_namespaces ? "All Namespaces" : snapshot.current_namespace || "default"}
+                      {nsButtonDisplay.label}
                     </span>
                     <span style={{ fontSize: 11, opacity: 0.7 }}>▾</span>
                   </button>
@@ -3168,6 +3447,12 @@ export function App() {
                           setNsScrollTop(0);
                           if (nsListRef.current) nsListRef.current.scrollTop = 0;
                         }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape" || e.key === "Enter") {
+                            e.stopPropagation();
+                            setNsMenuOpen(false);
+                          }
+                        }}
                         autoFocus
                       />
                       <div className="fl-ns-pinned">
@@ -3179,9 +3464,43 @@ export function App() {
                             handleSelectNamespace("__ALL__");
                           }}
                         >
-                          <span>All Namespaces</span>
-                          {snapshot.all_namespaces && <span>✓</span>}
+                          <span className="fl-ns-opt-main">
+                            <span className={`fl-ns-check ${snapshot.all_namespaces ? "checked" : ""}`}>
+                              {snapshot.all_namespaces ? "✓" : ""}
+                            </span>
+                            <span className="fl-ns-opt-label">All Namespaces</span>
+                          </span>
                         </div>
+                        {!snapshot.all_namespaces && selectedNamespaces.length > 1 && (
+                          <div className="fl-ns-chips-bar">
+                            <div className="fl-ns-chips-scroll">
+                              {selectedNamespaces.map((ns) => (
+                                <button
+                                  key={ns}
+                                  type="button"
+                                  className="fl-ns-chip"
+                                  title={`Remove ${ns}`}
+                                  onClick={() => handleToggleNamespace(ns)}
+                                >
+                                  <span className="fl-ns-chip-text">{ns}</span>
+                                  <span aria-hidden="true">×</span>
+                                </button>
+                              ))}
+                            </div>
+                            <button
+                              type="button"
+                              className="fl-ns-clear-btn"
+                              title="Reset to All Namespaces"
+                              onClick={() => {
+                                setNsMenuOpen(false);
+                                setNsSearch("");
+                                handleSelectNamespace("__ALL__");
+                              }}
+                            >
+                              All
+                            </button>
+                          </div>
+                        )}
                       </div>
                       <div
                         ref={nsListRef}
@@ -3192,20 +3511,41 @@ export function App() {
                           <div style={{ height: nsVirtualWin.topPadPx }} aria-hidden="true" />
                         )}
                         {visibleNamespaces.map((ns) => {
-                          const isSelected = !snapshot.all_namespaces && ns === snapshot.current_namespace;
+                          const isSelected = !snapshot.all_namespaces && selectedNamespaceSet.has(ns);
                           return (
                             <div
                               key={ns}
                               className={`fl-ns-opt ${isSelected ? "active" : ""}`}
                               title={ns}
-                              onClick={() => {
-                                setNsMenuOpen(false);
-                                setNsSearch("");
-                                handleSelectNamespace(ns);
+                              onClick={(e) => {
+                                if (e.metaKey || e.ctrlKey) {
+                                  setNsMenuOpen(false);
+                                  setNsSearch("");
+                                  handleSelectNamespace(ns);
+                                  return;
+                                }
+                                handleToggleNamespace(ns);
                               }}
                             >
-                              <span>{ns}</span>
-                              {isSelected && <span>✓</span>}
+                              <span className="fl-ns-opt-main">
+                                <span className={`fl-ns-check ${isSelected ? "checked" : ""}`}>
+                                  {isSelected ? "✓" : ""}
+                                </span>
+                                <span className="fl-ns-opt-label">{ns}</span>
+                              </span>
+                              <button
+                                type="button"
+                                className="fl-ns-only-btn"
+                                title={`Select only ${ns}`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setNsMenuOpen(false);
+                                  setNsSearch("");
+                                  handleSelectNamespace(ns);
+                                }}
+                              >
+                                only
+                              </button>
                             </div>
                           );
                         })}
@@ -3215,8 +3555,12 @@ export function App() {
                       </div>
                       <div className="fl-ns-footer">
                         {nsSearch.trim()
-                          ? `${matchingNamespaces.length.toLocaleString()} of ${allAvailableNamespaces.length.toLocaleString()} namespaces`
-                          : `${allAvailableNamespaces.length.toLocaleString()} namespaces — scroll or type to filter`}
+                          ? `${matchingNamespaces.length.toLocaleString()} of ${allAvailableNamespaces.length.toLocaleString()} (${
+                              snapshot.all_namespaces ? "all" : `${selectedNamespaces.length} selected`
+                            })`
+                          : `${allAvailableNamespaces.length.toLocaleString()} namespaces · ${
+                              snapshot.all_namespaces ? "all selected" : `${selectedNamespaces.length} selected`
+                            } (click to toggle)`}
                       </div>
                     </div>
                   )}
@@ -3241,8 +3585,10 @@ export function App() {
               title="Refresh"
               onClick={() => {
                 setBanner({ text: `Refreshing ${currentViewLabel}…`, isError: false });
+                autoLoadTokenInFlightRef.current = "";
+                setLoadingMore(false);
                 setPageLoading(true);
-                setPrevTokensByKind((prev) => ({ ...prev, [activeKind]: [] }));
+                resetScrollToTop();
                 sendToBackend({ op: "load-category", category: activeKind, limit: pageSize, pageIndex: 1 });
                 sendToBackend({ op: "sync-cluster", context: snapshot.current_context });
               }}
@@ -3258,7 +3604,11 @@ export function App() {
         <div
           ref={tableContainerRef}
           className="fl-table-container"
-          onScroll={(e) => setTableScrollTop(e.currentTarget.scrollTop)}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            setTableScrollTop(el.scrollTop);
+            maybeAutoLoadMore(el);
+          }}
         >
           {activeKind === "WorkloadsOverview" || activeKind === "ClusterOverview" ? (
             <div className="fl-overview-cards">
@@ -3437,6 +3787,22 @@ export function App() {
                       </tr>
                     );
                   })}
+                {renderTableSentinelRow(
+                  visibleCols.length + 1,
+                  "Clusters",
+                  catalogList.length,
+                  catalogList.filter((c) => {
+                    const q = searchQuery.trim().toLowerCase();
+                    if (!q) return true;
+                    return (
+                      c.name.toLowerCase().includes(q) ||
+                      (c.cluster || "").toLowerCase().includes(q) ||
+                      (c.server || "").toLowerCase().includes(q) ||
+                      (c.distro || "").toLowerCase().includes(q)
+                    );
+                  }).length,
+                  false,
+                )}
               </tbody>
             </table>
           ) : activeKind === "Event" ? (
@@ -3473,11 +3839,15 @@ export function App() {
               </thead>
               <tbody>
                 {filteredEvents.length === 0 ? (
-                  <tr>
-                    <td colSpan={6} style={{ textAlign: "center", padding: "32px 16px", color: "var(--fl-fg-muted)" }}>
-                      {banner && !banner.isError ? banner.text : "No events found."}
-                    </td>
-                  </tr>
+                  hasSearchQuery && paginationStatus.hasMore ? (
+                    renderTableSentinelRow(6, "Events", rawActiveCategoryCount, 0, true)
+                  ) : (
+                    <tr>
+                      <td colSpan={6} style={{ textAlign: "center", padding: "32px 16px", color: "var(--fl-fg-muted)" }}>
+                        {banner && !banner.isError ? banner.text : "No events found."}
+                      </td>
+                    </tr>
+                  )
                 ) : (
                   <>
                     {virtualWin.topPadPx > 0 && (
@@ -3506,6 +3876,7 @@ export function App() {
                         <td colSpan={6} style={{ padding: 0, border: "none" }} />
                       </tr>
                     )}
+                    {renderTableSentinelRow(6, "Events", rawActiveCategoryCount, filteredEvents.length, true)}
                   </>
                 )}
               </tbody>
@@ -3541,28 +3912,39 @@ export function App() {
                 </tr>
               </thead>
               <tbody>
-                {virtualWin.topPadPx > 0 && (
-                  <tr aria-hidden="true" style={{ height: virtualWin.topPadPx, border: "none" }}>
-                    <td colSpan={4} style={{ padding: 0, border: "none" }} />
-                  </tr>
-                )}
-                {visibleWorkspace.map((w, i) => (
-                  <tr
-                    key={`${w.fullPath}:${w.line}:${virtualWin.start + i}`}
-                    onClick={() => sendToBackend({ op: "open-location", path: w.fullPath, line: w.line })}
-                  >
-                    <td>{w.kind}</td>
-                    <td>{w.name}</td>
-                    <td>{w.namespace}</td>
-                    <td className="fl-link-teal">
-                      {w.path}:{w.line + 1}
+                {filteredWorkspace.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} style={{ textAlign: "center", padding: "32px 16px", color: "var(--fl-fg-muted)" }}>
+                      No workspace manifests found.
                     </td>
                   </tr>
-                ))}
-                {virtualWin.bottomPadPx > 0 && (
-                  <tr aria-hidden="true" style={{ height: virtualWin.bottomPadPx, border: "none" }}>
-                    <td colSpan={4} style={{ padding: 0, border: "none" }} />
-                  </tr>
+                ) : (
+                  <>
+                    {virtualWin.topPadPx > 0 && (
+                      <tr aria-hidden="true" style={{ height: virtualWin.topPadPx, border: "none" }}>
+                        <td colSpan={4} style={{ padding: 0, border: "none" }} />
+                      </tr>
+                    )}
+                    {visibleWorkspace.map((w, i) => (
+                      <tr
+                        key={`${w.fullPath}:${w.line}:${virtualWin.start + i}`}
+                        onClick={() => sendToBackend({ op: "open-location", path: w.fullPath, line: w.line })}
+                      >
+                        <td>{w.kind}</td>
+                        <td>{w.name}</td>
+                        <td>{w.namespace}</td>
+                        <td className="fl-link-teal">
+                          {w.path}:{w.line + 1}
+                        </td>
+                      </tr>
+                    ))}
+                    {virtualWin.bottomPadPx > 0 && (
+                      <tr aria-hidden="true" style={{ height: virtualWin.bottomPadPx, border: "none" }}>
+                        <td colSpan={4} style={{ padding: 0, border: "none" }} />
+                      </tr>
+                    )}
+                    {renderTableSentinelRow(4, "Manifests", workspace.length, filteredWorkspace.length, false)}
+                  </>
                 )}
               </tbody>
             </table>
@@ -3633,18 +4015,32 @@ export function App() {
               </thead>
               <tbody>
                 {filteredResources.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={visibleCols.length + (activeKind === "Node" ? 1 : 2)}
-                      style={{ textAlign: "center", padding: "32px 16px", color: "var(--fl-fg-muted)" }}
-                    >
-                      {banner && !banner.isError
-                        ? banner.text
-                        : `No ${currentViewLabel} found in ${
-                            snapshot.all_namespaces ? "any namespace" : `namespace "${snapshot.current_namespace}"`
-                          }.`}
-                    </td>
-                  </tr>
+                  hasSearchQuery && paginationStatus.hasMore ? (
+                    renderTableSentinelRow(
+                      visibleCols.length + (activeKind === "Node" ? 1 : 2),
+                      currentViewLabel,
+                      rawActiveCategoryCount,
+                      0,
+                      true,
+                    )
+                  ) : (
+                    <tr>
+                      <td
+                        colSpan={visibleCols.length + (activeKind === "Node" ? 1 : 2)}
+                        style={{ textAlign: "center", padding: "32px 16px", color: "var(--fl-fg-muted)" }}
+                      >
+                        {banner && !banner.isError
+                          ? banner.text
+                          : `No ${currentViewLabel} found in ${
+                              snapshot.all_namespaces
+                                ? "any namespace"
+                                : selectedNamespaces.length > 1
+                                  ? `namespaces "${selectedNamespaces.join('", "')}"`
+                                  : `namespace "${selectedNamespaces[0] || snapshot.current_namespace}"`
+                            }.`}
+                      </td>
+                    </tr>
+                  )
                 ) : (
                   <>
                     {virtualWin.topPadPx > 0 && (
@@ -3749,6 +4145,13 @@ export function App() {
                         />
                       </tr>
                     )}
+                    {renderTableSentinelRow(
+                      visibleCols.length + (activeKind === "Node" ? 1 : 2),
+                      currentViewLabel,
+                      rawActiveCategoryCount,
+                      filteredResources.length,
+                      activeKind !== "HelmRelease" && activeKind !== "CustomResourceDefinition",
+                    )}
                   </>
                 )}
               </tbody>
@@ -3756,85 +4159,26 @@ export function App() {
           )}
         </div>
 
-        {/* Sticky Server-Side Pagination Footer Bar */}
-        {activeKind !== "ClusterCatalog" &&
-          activeKind !== "Workspace" &&
+        {/* Floating Scroll-to-Top pill after scrolling deep into virtualized lists */}
+        {tableScrollTop > 600 &&
           activeKind !== "ClusterOverview" &&
-          activeKind !== "WorkloadsOverview" &&
-          activeKind !== "HelmRelease" &&
-          activeKind !== "CustomResourceDefinition" &&
-          (paginationStatus.hasMore ||
-            paginationStatus.pageIndex > 1 ||
-            paginationStatus.isAppend ||
-            rawActiveCategoryCount >= 50) && (
-            <div className="fl-pagination-bar" onClick={(e) => e.stopPropagation()}>
-              <div>
-                <span>{paginationStatus.rangeText}</span>
-                {pageLoading && <span style={{ marginLeft: 10, opacity: 0.75 }}>Loading…</span>}
-              </div>
-              <div className="fl-pagination-controls">
-                <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginRight: 6 }}>
-                  <span>Rows:</span>
-                  <select
-                    className="fl-page-select"
-                    aria-label="Rows per page"
-                    value={pageSize}
-                    onChange={(e) => handleChangePageSize(Number(e.target.value))}
-                  >
-                    {PAGE_SIZE_OPTIONS.map((opt) => (
-                      <option key={opt} value={opt}>
-                        {opt}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                {paginationStatus.hasMore && rawActiveCategoryCount < 2000 && (
-                  <button
-                    type="button"
-                    className="fl-page-btn"
-                    disabled={pageLoading}
-                    title={`Append next ${pageSize} items into the current view`}
-                    onClick={handleLoadMore}
-                  >
-                    + Load {pageSize} more
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className="fl-page-btn"
-                  disabled={pageLoading || (paginationStatus.pageIndex <= 1 && !paginationStatus.isAppend)}
-                  title="First page"
-                  onClick={handlePageFirst}
-                >
-                  ⟪ First
-                </button>
-                <button
-                  type="button"
-                  className="fl-page-btn"
-                  disabled={pageLoading || paginationStatus.pageIndex <= 1 || paginationStatus.isAppend}
-                  title="Previous page"
-                  onClick={handlePagePrev}
-                >
-                  ‹ Prev
-                </button>
-                <span style={{ padding: "0 6px" }}>
-                  {paginationStatus.isAppend
-                    ? `${rawActiveCategoryCount.toLocaleString()} loaded`
-                    : paginationStatus.totalPages
-                      ? `Page ${paginationStatus.pageIndex.toLocaleString()} of ${paginationStatus.totalPages.toLocaleString()}`
-                      : `Page ${paginationStatus.pageIndex.toLocaleString()}`}
-                </span>
-                <button
-                  type="button"
-                  className="fl-page-btn"
-                  disabled={pageLoading || !paginationStatus.hasMore}
-                  title="Next page"
-                  onClick={handlePageNext}
-                >
-                  Next ›
-                </button>
-              </div>
-            </div>
+          activeKind !== "WorkloadsOverview" && (
+            <button
+              type="button"
+              className="fl-scroll-top-fab"
+              style={{
+                right:
+                  (drawerOpen && selectedResource ? drawerWidth + 28 : 28) +
+                  (selectedCheckedResources.length > 0 ? 54 : 0),
+              }}
+              title="Scroll back to top"
+              onClick={(e) => {
+                e.stopPropagation();
+                resetScrollToTop();
+              }}
+            >
+              ↑ Top
+            </button>
           )}
 
         {/* Floating Bulk Remove Button ("Remove selected items (N)") */}

@@ -4,9 +4,14 @@ import {
   computePollDelayMs,
   computeVirtualWindow,
   formatCompactAge,
+  formatNamespaceButtonLabel,
   formatPaginationStatus,
   NS_OPTION_ROW_HEIGHT,
   NS_VIEWPORT_HEIGHT,
+  resolveSelectedNamespaces,
+  shouldTriggerAutoLoadMore,
+  SOFT_AUTO_LOAD_CAP,
+  toggleNamespaceInSelection,
   VIRTUAL_ROW_HEIGHT,
 } from "./App";
 import { bytesToUnits, cpuUnitsToNumber, formatKubeMemory, toYamlLines, unitsToBytes } from "./ResourceDetails";
@@ -195,6 +200,102 @@ describe("ResourceDetails helpers", () => {
     expect(formatCompactAge("6d22h")).toBe("6d22h");
     expect(formatCompactAge("3d5h10m")).toBe("3d5h10m");
     expect(formatCompactAge("45s")).toBe("45s");
+  });
+
+  it("toggles multiple namespaces cleanly and formats button labels", () => {
+    expect(
+      resolveSelectedNamespaces({
+        all_namespaces: false,
+        selected_namespaces: ["dayan", "dengliu"],
+        current_namespace: "dayan",
+      }),
+    ).toEqual(["dayan", "dengliu"]);
+
+    // Starting from All Namespaces, clicking `dayan` selects `["dayan"]`
+    const s1 = toggleNamespaceInSelection([], true, "dayan");
+    expect(s1).toEqual({ allNamespaces: false, selectedNamespaces: ["dayan"] });
+
+    // Clicking `dengliu` and `default` builds a sorted multi-namespace selection
+    const s2 = toggleNamespaceInSelection(s1.selectedNamespaces, s1.allNamespaces, "dengliu");
+    expect(s2).toEqual({ allNamespaces: false, selectedNamespaces: ["dayan", "dengliu"] });
+    expect(formatNamespaceButtonLabel(false, s2.selectedNamespaces).label).toBe("Namespaces: dayan, dengliu");
+
+    const s3 = toggleNamespaceInSelection(s2.selectedNamespaces, s2.allNamespaces, "default");
+    expect(s3).toEqual({ allNamespaces: false, selectedNamespaces: ["dayan", "default", "dengliu"] });
+    expect(formatNamespaceButtonLabel(false, s3.selectedNamespaces)).toEqual({
+      label: "Namespaces: dayan, default +1",
+      tooltip: "Namespaces (3): dayan, default, dengliu",
+    });
+
+    // Unchecking all remaining namespaces smoothly falls back to All Namespaces
+    const s4 = toggleNamespaceInSelection(["dayan"], false, "dayan");
+    expect(s4).toEqual({ allNamespaces: true, selectedNamespaces: [] });
+    expect(formatNamespaceButtonLabel(true, []).label).toBe("Namespace: All Namespaces");
+  });
+
+  it("triggers predictive auto-load near scroll bottom while guarding in-flight, soft cap, and short search viewports", () => {
+    // Far from bottom -> false
+    expect(
+      shouldTriggerAutoLoadMore({
+        hasMore: true,
+        isLoading: false,
+        hasSearch: false,
+        rawLoadedCount: 200,
+        scrollTop: 800,
+        viewportHeight: 700,
+        scrollHeight: 7400,
+      }),
+    ).toBe(false);
+
+    // Within predictive prefetch zone (~15 rows from bottom) -> true
+    expect(
+      shouldTriggerAutoLoadMore({
+        hasMore: true,
+        isLoading: false,
+        hasSearch: false,
+        rawLoadedCount: 200,
+        scrollTop: 6300,
+        viewportHeight: 700,
+        scrollHeight: 7400,
+      }),
+    ).toBe(true);
+
+    // Already loading or hit soft memory cap (3,000 rows) -> false
+    expect(
+      shouldTriggerAutoLoadMore({
+        hasMore: true,
+        isLoading: true,
+        hasSearch: false,
+        rawLoadedCount: 200,
+        scrollTop: 6300,
+        viewportHeight: 700,
+        scrollHeight: 7400,
+      }),
+    ).toBe(false);
+    expect(
+      shouldTriggerAutoLoadMore({
+        hasMore: true,
+        isLoading: false,
+        hasSearch: false,
+        rawLoadedCount: SOFT_AUTO_LOAD_CAP,
+        scrollTop: 99000,
+        viewportHeight: 700,
+        scrollHeight: 100000,
+      }),
+    ).toBe(false);
+
+    // Active search query that shrank filtered rows below viewport height -> false (prevents runaway auto-scan loop)
+    expect(
+      shouldTriggerAutoLoadMore({
+        hasMore: true,
+        isLoading: false,
+        hasSearch: true,
+        rawLoadedCount: 200,
+        scrollTop: 0,
+        viewportHeight: 700,
+        scrollHeight: 120,
+      }),
+    ).toBe(false);
   });
 
   it("adapts background poll interval to cluster latency and resource count", () => {

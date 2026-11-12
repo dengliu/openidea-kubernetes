@@ -83,6 +83,7 @@ export interface CategoryPageInfo {
   page_index: number;
   mode: "replace" | "append" | string;
   resource_version?: string;
+  namespace_versions?: Record<string, string>;
   watch_supported?: boolean;
 }
 
@@ -94,6 +95,7 @@ export interface ClusterSnapshot {
   cluster_catalog: ClusterContextInfo[];
   current_namespace: string;
   all_namespaces: boolean;
+  selected_namespaces?: string[];
   namespaces: string[];
   resources: ClusterResource[];
   events: ClusterEvent[];

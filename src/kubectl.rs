@@ -16,9 +16,26 @@ pub struct KubeConfigState {
     pub context: String,
     pub namespace: String,
     pub all_namespaces: bool,
+    #[serde(default)]
+    pub selected_namespaces: Vec<String>,
     pub tail_lines: u32,
     pub shell: String,
     pub debugger_image: String,
+}
+
+pub fn normalize_namespace_list<I, S>(items: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for raw in items {
+        let trimmed = raw.as_ref().trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_owned());
+        }
+    }
+    out
 }
 
 impl KubeConfigState {
@@ -30,11 +47,26 @@ impl KubeConfigState {
             .filter(|s| !s.is_empty())
             .or_else(|| host::setting_string("context").filter(|s| !s.is_empty()))
             .unwrap_or_default();
-        let namespace = storage::get("namespace")
+        let fallback_ns = storage::get("namespace")
             .ok()
             .flatten()
             .filter(|s| !s.is_empty())
             .or_else(|| host::setting_string("namespace").filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "default".into());
+        let stored_multi = storage::get("selectedNamespaces")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .map(normalize_namespace_list)
+            .unwrap_or_default();
+        let selected_namespaces = if stored_multi.is_empty() {
+            normalize_namespace_list([fallback_ns.as_str()])
+        } else {
+            stored_multi
+        };
+        let namespace = selected_namespaces
+            .first()
+            .cloned()
             .unwrap_or_else(|| "default".into());
         let all_namespaces = storage::get("allNamespaces")
             .ok()
@@ -57,9 +89,87 @@ impl KubeConfigState {
             context,
             namespace,
             all_namespaces,
+            selected_namespaces,
             tail_lines,
             shell,
             debugger_image,
+        }
+    }
+
+    /// Non-empty list of selected namespaces when `!self.all_namespaces`, or empty when `all_namespaces` is active.
+    pub fn active_namespaces(&self) -> Vec<String> {
+        if self.all_namespaces {
+            return Vec::new();
+        }
+        let normalized = normalize_namespace_list(&self.selected_namespaces);
+        if !normalized.is_empty() {
+            normalized
+        } else if !self.namespace.trim().is_empty() {
+            vec![self.namespace.trim().to_owned()]
+        } else {
+            vec!["default".into()]
+        }
+    }
+
+    pub fn is_multi_namespace(&self) -> bool {
+        !self.all_namespaces && self.active_namespaces().len() > 1
+    }
+
+    pub fn with_single_namespace(&self, ns: &str) -> Self {
+        let clean = ns.trim();
+        let target = if clean.is_empty() { "default" } else { clean };
+        let mut copy = self.clone();
+        copy.all_namespaces = false;
+        copy.namespace = target.to_owned();
+        copy.selected_namespaces = vec![target.to_owned()];
+        copy
+    }
+
+    pub fn set_namespaces<I, S>(&mut self, items: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let normalized = normalize_namespace_list(items);
+        if normalized.is_empty() {
+            self.all_namespaces = true;
+            if self.selected_namespaces.is_empty() {
+                let primary = if self.namespace.trim().is_empty() {
+                    "default".to_owned()
+                } else {
+                    self.namespace.trim().to_owned()
+                };
+                self.selected_namespaces = vec![primary.clone()];
+                self.namespace = primary;
+            }
+        } else {
+            self.all_namespaces = false;
+            self.namespace = normalized[0].clone();
+            self.selected_namespaces = normalized;
+        }
+    }
+
+    pub fn persist_scope(&self) {
+        let primary = if self.namespace.trim().is_empty() {
+            "default"
+        } else {
+            self.namespace.trim()
+        };
+        let list = {
+            let norm = normalize_namespace_list(&self.selected_namespaces);
+            if norm.is_empty() {
+                vec![primary.to_owned()]
+            } else {
+                norm
+            }
+        };
+        let _ = storage::set("namespace", primary);
+        let _ = storage::set(
+            "allNamespaces",
+            if self.all_namespaces { "true" } else { "false" },
+        );
+        if let Ok(json) = serde_json::to_string(&list) {
+            let _ = storage::set("selectedNamespaces", &json);
         }
     }
 
@@ -207,11 +317,15 @@ pub struct HelmRelease {
     pub updated: String,
 }
 
-pub const DEFAULT_PAGE_LIMIT: u32 = 100;
-pub const MAX_APPENDED_ITEMS: usize = 2_000;
-/// Maximum total items in a category scope where live `watch=true` delta streaming is enabled.
-/// Scopes larger than this (e.g. 53k Pods or 115k Events across All Namespaces) keep using bounded `limit` + `continue` pagination.
-pub const WATCH_ELIGIBLE_MAX_ITEMS: u64 = 1_000;
+pub const DEFAULT_PAGE_LIMIT: u32 = 200;
+pub const MAX_APPENDED_ITEMS: usize = 3_000;
+/// Maximum total items in a category scope where 100% of items are loaded up front and live `watch=true`
+/// delta streaming is enabled (matching Freelens's full-store + live watch experience for scopes <= 500 items).
+/// Scopes larger than this keep using bounded `limit` + `continue` auto-scroll streaming.
+pub const WATCH_ELIGIBLE_MAX_ITEMS: u64 = 500;
+/// Maximum number of concurrent per-namespace `watch=true` streams opened when multiple namespaces
+/// are selected (keeps total `Child` handles <= 6 alongside an optional Drawer watch, within OpenIDEA's 8-child cap).
+pub const MAX_MULTI_NAMESPACE_WATCHES: usize = 5;
 
 /// Pagination & watch metadata for a single resource category returned by Kubernetes API `limit` + `continue`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +342,8 @@ pub struct CategoryPageInfo {
     #[serde(default)]
     pub resource_version: String,
     #[serde(default)]
+    pub namespace_versions: BTreeMap<String, String>,
+    #[serde(default)]
     pub watch_supported: bool,
 }
 
@@ -241,6 +357,8 @@ pub struct ClusterSnapshot {
     pub cluster_catalog: Vec<ClusterContextInfo>,
     pub current_namespace: String,
     pub all_namespaces: bool,
+    #[serde(default)]
+    pub selected_namespaces: Vec<String>,
     pub namespaces: Vec<String>,
     pub resources: Vec<ClusterResource>,
     pub events: Vec<ClusterEvent>,
@@ -2651,6 +2769,7 @@ fn fetch_namespaces_table_fallback(
                 page_index: 1,
                 mode: "replace".into(),
                 resource_version: String::new(),
+                namespace_versions: BTreeMap::new(),
                 watch_supported: false,
             },
         );
@@ -3055,6 +3174,17 @@ pub fn fetch_secrets_into_snapshot(
     cfg: &KubeConfigState,
     snap: &mut ClusterSnapshot,
 ) {
+    if cfg.is_multi_namespace() {
+        let active = cfg.active_namespaces();
+        snap.resources.retain(|r| r.kind != "Secret");
+        for ns in active.iter().take(12) {
+            let sub_cfg = cfg.with_single_namespace(ns);
+            let mut sub_snap = ClusterSnapshot::default();
+            fetch_secrets_into_snapshot(project, &sub_cfg, &mut sub_snap);
+            snap.resources.extend(sub_snap.resources);
+        }
+        return;
+    }
     let mut sec_args = cfg.base_args(true);
     sec_args.extend(["get".into(), "secrets".into()]);
     cfg.push_scope_flags(&mut sec_args);
@@ -3124,6 +3254,21 @@ pub fn fetch_events_into_snapshot(
     cfg: &KubeConfigState,
     snap: &mut ClusterSnapshot,
 ) {
+    if cfg.is_multi_namespace() {
+        let mut combined = Vec::new();
+        for ns in cfg.active_namespaces().iter().take(12) {
+            let sub_cfg = cfg.with_single_namespace(ns);
+            let mut ev_args = sub_cfg.base_args(true);
+            ev_args.extend(["get".into(), "events".into(), "-o".into(), "json".into()]);
+            if let Ok(out) = run_kubectl(project, &ev_args, None)
+                && out.status == Some(0)
+            {
+                combined.extend(parse_events_json(&out.stdout));
+            }
+        }
+        snap.events = combined;
+        return;
+    }
     let mut ev_args = cfg.base_args(true);
     ev_args.extend(["get".into(), "events".into()]);
     cfg.push_scope_flags(&mut ev_args);
@@ -3141,6 +3286,61 @@ pub fn fetch_helm_into_snapshot(
     cfg: &KubeConfigState,
     snap: &mut ClusterSnapshot,
 ) {
+    if cfg.is_multi_namespace() {
+        let active = cfg.active_namespaces();
+        if active.len() <= 8 {
+            let mut combined = Vec::new();
+            let mut any_ok = false;
+            for ns in &active {
+                let mut helm_args = Vec::new();
+                if !cfg.kubeconfig.trim().is_empty() {
+                    helm_args.push(format!("--kubeconfig={}", cfg.kubeconfig.trim()));
+                }
+                if !cfg.context.trim().is_empty() {
+                    helm_args.push(format!("--kube-context={}", cfg.context.trim()));
+                }
+                helm_args.extend([
+                    "list".into(),
+                    "-n".into(),
+                    ns.clone(),
+                    "-o".into(),
+                    "json".into(),
+                ]);
+                if let Ok(out) = project.run_process("helm", &helm_args, None)
+                    && out.status == Some(0)
+                {
+                    any_ok = true;
+                    combined.extend(parse_helm_releases_json(&out.stdout));
+                }
+            }
+            if any_ok {
+                snap.connected = true;
+                snap.error = None;
+                snap.helm_releases = combined;
+            }
+            return;
+        }
+        let mut helm_args = Vec::new();
+        if !cfg.kubeconfig.trim().is_empty() {
+            helm_args.push(format!("--kubeconfig={}", cfg.kubeconfig.trim()));
+        }
+        if !cfg.context.trim().is_empty() {
+            helm_args.push(format!("--kube-context={}", cfg.context.trim()));
+        }
+        helm_args.extend(["list".into(), "-A".into(), "-o".into(), "json".into()]);
+        if let Ok(out) = project.run_process("helm", &helm_args, None)
+            && out.status == Some(0)
+        {
+            let allowed: std::collections::BTreeSet<String> = active.into_iter().collect();
+            snap.connected = true;
+            snap.error = None;
+            snap.helm_releases = parse_helm_releases_json(&out.stdout)
+                .into_iter()
+                .filter(|r| allowed.contains(&r.namespace))
+                .collect();
+        }
+        return;
+    }
     let mut helm_args = Vec::new();
     if !cfg.kubeconfig.trim().is_empty() {
         helm_args.push(format!("--kubeconfig={}", cfg.kubeconfig.trim()));
@@ -3192,6 +3392,56 @@ fn format_pod_memory_aligned(raw: &str) -> String {
 pub fn enrich_pod_metrics(project: &Project, cfg: &KubeConfigState, snap: &mut ClusterSnapshot) {
     let pod_cnt = snap.resources.iter().filter(|r| r.kind == "Pod").count();
     if pod_cnt == 0 || pod_cnt >= 2_500 {
+        return;
+    }
+    if cfg.is_multi_namespace() {
+        let mut present_ns: Vec<String> = Vec::new();
+        for r in snap.resources.iter().filter(|r| r.kind == "Pod") {
+            if !r.namespace.is_empty() && !present_ns.contains(&r.namespace) {
+                present_ns.push(r.namespace.clone());
+            }
+        }
+        if present_ns.len() > MAX_MULTI_NAMESPACE_WATCHES {
+            return;
+        }
+        let mut ns_metrics: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+        for ns in &present_ns {
+            let sub_cfg = cfg.with_single_namespace(ns);
+            let mut args = sub_cfg.base_args(true);
+            args.extend(["top".into(), "pods".into(), "--no-headers".into()]);
+            let Ok(out) = run_kubectl_timed(project, &args, None, Some(3)) else {
+                continue;
+            };
+            if out.status != Some(0) {
+                continue;
+            }
+            for line in out.stdout.lines() {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() >= 3 {
+                    let (name, raw_cpu, raw_mem) = if cols.len() >= 4 {
+                        (cols[1], cols[2], cols[3])
+                    } else {
+                        (cols[0], cols[1], cols[2])
+                    };
+                    let cpu = if let Some(m) = raw_cpu
+                        .strip_suffix('m')
+                        .and_then(|v| v.parse::<f64>().ok())
+                    {
+                        format!("{:.3}", m / 1000.0)
+                    } else {
+                        raw_cpu.to_owned()
+                    };
+                    let mem = format_pod_memory_aligned(raw_mem);
+                    ns_metrics.insert((ns.clone(), name.to_owned()), (cpu, mem));
+                }
+            }
+        }
+        for r in snap.resources.iter_mut().filter(|r| r.kind == "Pod") {
+            if let Some((cpu, mem)) = ns_metrics.get(&(r.namespace.clone(), r.name.clone())) {
+                r.cpu = cpu.clone();
+                r.memory = mem.clone();
+            }
+        }
         return;
     }
     let mut args = cfg.base_args(true);
@@ -3269,6 +3519,53 @@ pub fn fetch_workloads_into_snapshot(
     cfg: &KubeConfigState,
     snap: &mut ClusterSnapshot,
 ) {
+    if cfg.is_multi_namespace() {
+        let active = cfg.active_namespaces();
+        snap.resources.retain(|r| {
+            matches!(
+                r.kind.as_str(),
+                "Namespace" | "Node" | "CustomResourceDefinition" | "Secret"
+            )
+        });
+        let mut any_ok = false;
+        let mut last_err: Option<String> = None;
+        for ns in active.iter().take(8) {
+            let sub_cfg = cfg.with_single_namespace(ns);
+            let mut res_args = sub_cfg.base_args(true);
+            res_args.extend([
+                "get".into(),
+                "pods,deployments,statefulsets,daemonsets,replicasets,jobs,cronjobs,services,ingresses,configmaps,pvc".into(),
+                "-o".into(),
+                "json".into(),
+                "--chunk-size=500".into(),
+            ]);
+            match run_kubectl(project, &res_args, None) {
+                Ok(out) if out.status == Some(0) => {
+                    any_ok = true;
+                    if out.stdout.trim_start().starts_with('{') {
+                        snap.resources.extend(parse_resource_list_json(&out.stdout));
+                    } else {
+                        snap.resources
+                            .extend(parse_custom_columns_resources(&out.stdout));
+                    }
+                }
+                Ok(out) => {
+                    last_err = Some(first_line_or(&out.stderr, "kubectl get resources failed"));
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+        if any_ok {
+            snap.connected = true;
+            snap.error = None;
+            enrich_pod_metrics(project, cfg, snap);
+        } else if let Some(err) = last_err {
+            snap.error = Some(err);
+        }
+        return;
+    }
     let mut eff_cfg = cfg.clone();
     if eff_cfg.all_namespaces && snap.namespaces.len() > LARGE_CLUSTER_NAMESPACE_THRESHOLD {
         eff_cfg.all_namespaces = false;
@@ -3569,6 +3866,7 @@ struct FetchedPage<T> {
     continue_token: String,
     remaining_count: Option<u64>,
     resource_version: String,
+    namespace_versions: BTreeMap<String, String>,
     page_index: u32,
     append: bool,
     used_limit: u32,
@@ -3578,6 +3876,374 @@ enum RawPageOutcome<T> {
     Page(Box<FetchedPage<T>>),
     Unsupported,
     Failed(String),
+}
+
+fn parse_multi_ns_cursor(token: &str, ns_len: usize) -> Option<(usize, String)> {
+    let rest = token.trim().strip_prefix("mns:")?;
+    let (idx_str, inner) = rest.split_once(':')?;
+    let idx = idx_str.parse::<usize>().ok()?;
+    if idx < ns_len {
+        Some((idx, inner.to_owned()))
+    } else {
+        None
+    }
+}
+
+/// Executes a small batch (`<= 4`) of single-namespace `kubectl get --raw` calls concurrently via
+/// `host::start` when `limit <= 100` (falling back seamlessly to `run_kubectl_timed` whenever `limit > 100`,
+/// `host::start` is unavailable, or stdout approaches `Child`'s 1 MiB stream buffer).
+fn run_raw_uri_batch(
+    project: &Project,
+    cfg: &KubeConfigState,
+    uris: &[String],
+    allow_parallel_children: bool,
+    req_timeout: Option<u32>,
+) -> Vec<Result<ProcessOutput, Error>> {
+    let timeout_secs = req_timeout.unwrap_or(15);
+    if !allow_parallel_children || uris.len() <= 1 {
+        return uris
+            .iter()
+            .map(|uri| {
+                let mut args = cfg.base_args(false);
+                args.extend(["get".into(), "--raw".into(), uri.clone()]);
+                run_kubectl_timed(project, &args, None, Some(timeout_secs))
+            })
+            .collect();
+    }
+
+    let mut spawned: Vec<Option<host::Child>> = Vec::with_capacity(uris.len());
+    for uri in uris {
+        let mut args = cfg.base_args(false);
+        args.extend([
+            "get".into(),
+            "--raw".into(),
+            uri.clone(),
+            format!("--request-timeout={timeout_secs}s"),
+        ]);
+        let cmd = host::Command::new("kubectl").args(args);
+        spawned.push(host::start(&cmd, Some(project)).ok());
+    }
+
+    let wait_ms = timeout_secs.saturating_mul(1_000).max(1_000);
+    spawned
+        .into_iter()
+        .zip(uris.iter())
+        .map(|(maybe_child, uri)| {
+            if let Some(child) = maybe_child {
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                let mut status: Option<i32> = None;
+                let mut overflowed_ring = false;
+                for _ in 0..8 {
+                    match child.wait(wait_ms) {
+                        Ok(chunk) => {
+                            if chunk.stdout.len() >= 900 * 1024 {
+                                overflowed_ring = true;
+                                break;
+                            }
+                            stdout.push_str(&chunk.stdout);
+                            stderr.push_str(&chunk.stderr);
+                            if chunk.status.is_some() {
+                                status = chunk.status;
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            overflowed_ring = true;
+                            break;
+                        }
+                    }
+                }
+                let _ = child.kill();
+                if !overflowed_ring
+                    && status.is_some()
+                    && (status != Some(0) || stdout.trim_start().starts_with('{'))
+                {
+                    return Ok(ProcessOutput {
+                        status,
+                        stdout,
+                        stderr,
+                    });
+                }
+            }
+            let mut args = cfg.base_args(false);
+            args.extend(["get".into(), "--raw".into(), uri.clone()]);
+            run_kubectl_timed(project, &args, None, Some(timeout_secs))
+        })
+        .collect()
+}
+
+fn fetch_raw_paged_multi_ns<T, F>(
+    project: &Project,
+    cfg: &KubeConfigState,
+    endpoint: (&str, &str),
+    opts: &FetchOptions,
+    req_timeout: Option<u32>,
+    mut parse_fn: F,
+) -> RawPageOutcome<T>
+where
+    F: FnMut(&str) -> Option<(Vec<T>, String, Option<u64>, String)>,
+{
+    let (api_prefix, plural) = endpoint;
+    let namespaces = cfg.active_namespaces();
+    let ns_len = namespaces.len();
+    if ns_len == 0 {
+        return RawPageOutcome::Unsupported;
+    }
+
+    let limit = opts.limit.clamp(10, 500);
+    let raw_req_tok = opts.continue_token.trim().to_owned();
+    let (mut idx, mut inner_tok, req_tok, page_idx, append) = if raw_req_tok.is_empty() {
+        (
+            0usize,
+            String::new(),
+            String::new(),
+            opts.page_index.max(1),
+            opts.append,
+        )
+    } else if let Some((parsed_idx, parsed_inner)) = parse_multi_ns_cursor(&raw_req_tok, ns_len) {
+        (
+            parsed_idx,
+            parsed_inner,
+            raw_req_tok,
+            opts.page_index.max(1),
+            opts.append,
+        )
+    } else {
+        (0usize, String::new(), String::new(), 1, false)
+    };
+
+    let mut collected: Vec<T> = Vec::new();
+    let mut namespace_versions: BTreeMap<String, String> = BTreeMap::new();
+    let mut next_continue = String::new();
+    let mut rem_total: u64 = 0;
+    let mut any_rem = false;
+    let mut any_ok = false;
+    let mut last_err: Option<String> = None;
+    let eager_watch_drain = req_tok.is_empty() && !append && ns_len <= MAX_MULTI_NAMESPACE_WATCHES;
+    let max_collect_cap = if eager_watch_drain {
+        (WATCH_ELIGIBLE_MAX_ITEMS as usize).max(limit as usize)
+    } else {
+        limit as usize
+    };
+
+    // 1. If resuming mid-namespace via `mns:{idx}:{inner_tok}` with non-empty `inner_tok`, fetch that page first.
+    if !inner_tok.is_empty() && idx < ns_len {
+        let ns = &namespaces[idx];
+        let sub_cfg = cfg.with_single_namespace(ns);
+        let mut sub_opts = opts.clone();
+        sub_opts.limit = limit;
+        sub_opts.continue_token = inner_tok.clone();
+        match fetch_raw_paged_json(
+            project,
+            &sub_cfg,
+            (api_prefix, plural, false),
+            &sub_opts,
+            req_timeout,
+        ) {
+            Ok((stdout, used_tok, _, _, _)) => {
+                if let Some((items, cont, rem, rv)) = parse_fn(&stdout) {
+                    any_ok = true;
+                    if !rv.is_empty() {
+                        namespace_versions.insert(ns.clone(), rv);
+                    }
+                    // If `inner_tok` expired and `fetch_raw_paged_json` reset `used_tok` to empty, keep going cleanly.
+                    let _ = used_tok;
+                    collected.extend(items);
+                    if !cont.is_empty() {
+                        next_continue = format!("mns:{idx}:{cont}");
+                        if let Some(r) = rem {
+                            rem_total += r;
+                            any_rem = true;
+                        }
+                        idx = ns_len;
+                    } else {
+                        idx += 1;
+                    }
+                }
+            }
+            Err(RawPageOutcome::Failed(err)) => {
+                last_err = Some(err);
+                idx += 1;
+            }
+            Err(_) => {
+                return RawPageOutcome::Unsupported;
+            }
+        }
+        inner_tok.clear();
+    }
+
+    // 2. Walk remaining selected namespaces in bounded batches of up to 4.
+    while idx < ns_len && next_continue.is_empty() {
+        let room = max_collect_cap.saturating_sub(collected.len()) as u32;
+        if room == 0 {
+            next_continue = format!("mns:{idx}:");
+            any_rem = true;
+            break;
+        }
+        let batch_end = (idx + 4).min(ns_len);
+        let batch_slice = &namespaces[idx..batch_end];
+        let req_per_ns = if eager_watch_drain {
+            room.clamp(10, 500)
+        } else if collected.is_empty() {
+            limit
+        } else {
+            room.max(10).min(limit)
+        };
+        let uris: Vec<String> = batch_slice
+            .iter()
+            .map(|ns| {
+                let sub_cfg = cfg.with_single_namespace(ns);
+                build_paged_raw_uri(api_prefix, plural, false, &sub_cfg, req_per_ns, "")
+            })
+            .collect();
+        let allow_parallel = req_per_ns <= 100 && batch_slice.len() > 1;
+        let outputs = run_raw_uri_batch(project, cfg, &uris, allow_parallel, req_timeout);
+
+        let mut stopped_in_batch = false;
+        for (offset, (ns, out_res)) in batch_slice.iter().zip(outputs).enumerate() {
+            let ns_idx = idx + offset;
+            match out_res {
+                Ok(out) if out.status == Some(0) => {
+                    if !out.stdout.trim_start().starts_with('{') {
+                        return RawPageOutcome::Unsupported;
+                    }
+                    let Some((mut items, mut cont, mut rem, mut rv)) = parse_fn(&out.stdout) else {
+                        return RawPageOutcome::Unsupported;
+                    };
+                    any_ok = true;
+                    if !rv.is_empty() {
+                        namespace_versions.insert(ns.clone(), rv.clone());
+                    }
+                    if stopped_in_batch {
+                        rem_total += items.len() as u64 + rem.unwrap_or(0);
+                        any_rem = true;
+                        continue;
+                    }
+                    // When <= 5 namespaces are selected and combined total stays <= 500, drain any
+                    // continuation inside `ns` so all <= 500 items load up front with live watch.
+                    if eager_watch_drain
+                        && !cont.is_empty()
+                        && (collected.len() as u64 + items.len() as u64 + rem.unwrap_or(0))
+                            <= WATCH_ELIGIBLE_MAX_ITEMS
+                    {
+                        let sub_cfg = cfg.with_single_namespace(ns);
+                        for _ in 0..4 {
+                            if cont.is_empty() {
+                                break;
+                            }
+                            let drain_opts = FetchOptions {
+                                limit: 250,
+                                continue_token: cont.clone(),
+                                ..opts.clone()
+                            };
+                            let Ok((d_out, _, _, _, _)) = fetch_raw_paged_json(
+                                project,
+                                &sub_cfg,
+                                (api_prefix, plural, false),
+                                &drain_opts,
+                                req_timeout,
+                            ) else {
+                                break;
+                            };
+                            let Some((d_items, d_cont, d_rem, d_rv)) = parse_fn(&d_out) else {
+                                break;
+                            };
+                            if (collected.len() + items.len() + d_items.len()) as u64
+                                + d_rem.unwrap_or(0)
+                                > WATCH_ELIGIBLE_MAX_ITEMS
+                            {
+                                break;
+                            }
+                            items.extend(d_items);
+                            cont = d_cont;
+                            rem = d_rem;
+                            if !d_rv.is_empty() {
+                                rv = d_rv;
+                                namespace_versions.insert(ns.clone(), rv.clone());
+                            }
+                        }
+                    }
+
+                    let est_after = collected.len() as u64 + items.len() as u64 + rem.unwrap_or(0);
+                    let active_cap = if eager_watch_drain && est_after <= WATCH_ELIGIBLE_MAX_ITEMS {
+                        WATCH_ELIGIBLE_MAX_ITEMS as usize
+                    } else {
+                        limit as usize
+                    };
+                    if !collected.is_empty() && collected.len() + items.len() > active_cap {
+                        next_continue = format!("mns:{ns_idx}:");
+                        rem_total += items.len() as u64 + rem.unwrap_or(0);
+                        any_rem = true;
+                        stopped_in_batch = true;
+                        continue;
+                    }
+                    collected.extend(items);
+                    if !cont.is_empty() {
+                        next_continue = format!("mns:{ns_idx}:{cont}");
+                        rem_total += rem.unwrap_or(0);
+                        any_rem = true;
+                        stopped_in_batch = true;
+                    }
+                }
+                Ok(out) => {
+                    if out.stderr.trim().is_empty() && out.stdout.trim().is_empty() {
+                        return RawPageOutcome::Unsupported;
+                    }
+                    last_err = Some(first_line_or(
+                        &out.stderr,
+                        "kubectl raw list request failed",
+                    ));
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+        idx = batch_end;
+        let stop_cap = if eager_watch_drain && collected.len() <= WATCH_ELIGIBLE_MAX_ITEMS as usize
+        {
+            WATCH_ELIGIBLE_MAX_ITEMS as usize
+        } else {
+            limit as usize
+        };
+        if !stopped_in_batch && collected.len() >= stop_cap && idx < ns_len {
+            next_continue = format!("mns:{idx}:");
+            any_rem = true;
+            break;
+        }
+    }
+
+    if !any_ok {
+        return match last_err {
+            Some(err) => RawPageOutcome::Failed(err),
+            None => RawPageOutcome::Unsupported,
+        };
+    }
+
+    let summary_rv = if namespace_versions.len() == ns_len
+        && namespace_versions.values().all(|rv| !rv.is_empty())
+    {
+        "multi".to_owned()
+    } else {
+        String::new()
+    };
+
+    RawPageOutcome::Page(Box::new(FetchedPage {
+        items: collected,
+        request_token: req_tok,
+        continue_token: next_continue.clone(),
+        remaining_count: if !next_continue.is_empty() || any_rem {
+            Some(rem_total)
+        } else {
+            None
+        },
+        resource_version: summary_rv,
+        namespace_versions,
+        page_index: page_idx,
+        append,
+        used_limit: limit,
+    }))
 }
 
 fn fetch_raw_paged_json(
@@ -3640,6 +4306,80 @@ fn fetch_raw_paged_json(
     Err(RawPageOutcome::Unsupported)
 }
 
+fn fetch_raw_paged_single_or_cluster<T, F>(
+    project: &Project,
+    cfg: &KubeConfigState,
+    endpoint: (&str, &str, bool),
+    opts: &FetchOptions,
+    req_timeout: Option<u32>,
+    mut parse_fn: F,
+) -> RawPageOutcome<T>
+where
+    F: FnMut(&str) -> Option<(Vec<T>, String, Option<u64>, String)>,
+{
+    match fetch_raw_paged_json(project, cfg, endpoint, opts, req_timeout) {
+        Ok((stdout, req_tok, page_idx, append, used_limit)) => {
+            let Some((mut items, mut cont, mut rem, mut rv)) = parse_fn(&stdout) else {
+                return RawPageOutcome::Unsupported;
+            };
+            // If the entire scope has <= WATCH_ELIGIBLE_MAX_ITEMS (500) items, drain remaining pages
+            // immediately so 100% of items are in memory and live `watch=true` streaming activates.
+            if req_tok.is_empty()
+                && !append
+                && !cont.is_empty()
+                && (items.len() as u64 + rem.unwrap_or(0)) <= WATCH_ELIGIBLE_MAX_ITEMS
+            {
+                for _ in 0..5 {
+                    if cont.is_empty() {
+                        break;
+                    }
+                    let drain_opts = FetchOptions {
+                        limit: 250,
+                        continue_token: cont.clone(),
+                        ..opts.clone()
+                    };
+                    let Ok((d_out, _, _, _, _)) =
+                        fetch_raw_paged_json(project, cfg, endpoint, &drain_opts, req_timeout)
+                    else {
+                        break;
+                    };
+                    let Some((d_items, d_cont, d_rem, d_rv)) = parse_fn(&d_out) else {
+                        break;
+                    };
+                    if (items.len() + d_items.len()) as u64 + d_rem.unwrap_or(0)
+                        > WATCH_ELIGIBLE_MAX_ITEMS
+                    {
+                        break;
+                    }
+                    items.extend(d_items);
+                    cont = d_cont;
+                    rem = d_rem;
+                    if !d_rv.is_empty() {
+                        rv = d_rv;
+                    }
+                }
+                if cont.is_empty() {
+                    rem = None;
+                }
+            }
+            RawPageOutcome::Page(Box::new(FetchedPage {
+                items,
+                request_token: req_tok,
+                continue_token: cont,
+                remaining_count: rem,
+                resource_version: rv,
+                namespace_versions: BTreeMap::new(),
+                page_index: page_idx,
+                append,
+                used_limit,
+            }))
+        }
+        Err(RawPageOutcome::Unsupported) => RawPageOutcome::Unsupported,
+        Err(RawPageOutcome::Failed(msg)) => RawPageOutcome::Failed(msg),
+        Err(RawPageOutcome::Page(_)) => RawPageOutcome::Unsupported,
+    }
+}
+
 fn fetch_raw_paged_resources(
     project: &Project,
     cfg: &KubeConfigState,
@@ -3648,27 +4388,19 @@ fn fetch_raw_paged_resources(
     opts: &FetchOptions,
     req_timeout: Option<u32>,
 ) -> RawPageOutcome<ClusterResource> {
-    match fetch_raw_paged_json(project, cfg, endpoint, opts, req_timeout) {
-        Ok((stdout, req_tok, page_idx, append, used_limit)) => {
-            if let Some((items, cont, rem, rv)) =
-                parse_paged_resource_list_json_with_rv(&stdout, Some(category))
-            {
-                RawPageOutcome::Page(Box::new(FetchedPage {
-                    items,
-                    request_token: req_tok,
-                    continue_token: cont,
-                    remaining_count: rem,
-                    resource_version: rv,
-                    page_index: page_idx,
-                    append,
-                    used_limit,
-                }))
-            } else {
-                RawPageOutcome::Unsupported
-            }
-        }
-        Err(outcome) => outcome,
+    if !endpoint.2 && cfg.is_multi_namespace() {
+        return fetch_raw_paged_multi_ns(
+            project,
+            cfg,
+            (endpoint.0, endpoint.1),
+            opts,
+            req_timeout,
+            |stdout| parse_paged_resource_list_json_with_rv(stdout, Some(category)),
+        );
     }
+    fetch_raw_paged_single_or_cluster(project, cfg, endpoint, opts, req_timeout, |stdout| {
+        parse_paged_resource_list_json_with_rv(stdout, Some(category))
+    })
 }
 
 fn fetch_raw_paged_events(
@@ -3677,34 +4409,46 @@ fn fetch_raw_paged_events(
     opts: &FetchOptions,
     req_timeout: Option<u32>,
 ) -> RawPageOutcome<ClusterEvent> {
-    match fetch_raw_paged_json(
+    if cfg.is_multi_namespace() {
+        return fetch_raw_paged_multi_ns(
+            project,
+            cfg,
+            ("/api/v1", "events"),
+            opts,
+            req_timeout,
+            |stdout| parse_paged_events_json_with_rv(stdout, None),
+        );
+    }
+    fetch_raw_paged_single_or_cluster(
         project,
         cfg,
         ("/api/v1", "events", false),
         opts,
         req_timeout,
-    ) {
-        Ok((stdout, req_tok, page_idx, append, used_limit)) => {
-            if let Some((items, cont, rem, rv)) = parse_paged_events_json_with_rv(&stdout, None) {
-                RawPageOutcome::Page(Box::new(FetchedPage {
-                    items,
-                    request_token: req_tok,
-                    continue_token: cont,
-                    remaining_count: rem,
-                    resource_version: rv,
-                    page_index: page_idx,
-                    append,
-                    used_limit,
-                }))
-            } else {
-                RawPageOutcome::Unsupported
-            }
-        }
-        Err(outcome) => match outcome {
-            RawPageOutcome::Unsupported => RawPageOutcome::Unsupported,
-            RawPageOutcome::Failed(msg) => RawPageOutcome::Failed(msg),
-            RawPageOutcome::Page(_) => RawPageOutcome::Unsupported,
-        },
+        |stdout| parse_paged_events_json_with_rv(stdout, None),
+    )
+}
+
+fn compute_page_watch_supported(
+    resource_version: &str,
+    namespace_versions: &BTreeMap<String, String>,
+    page_index: u32,
+    continue_token: &str,
+    est_total: u64,
+    append: bool,
+) -> bool {
+    if !continue_token.is_empty() || est_total > WATCH_ELIGIBLE_MAX_ITEMS {
+        return false;
+    }
+    if !append && page_index > 1 {
+        return false;
+    }
+    if namespace_versions.is_empty() {
+        !resource_version.is_empty()
+    } else {
+        !resource_version.is_empty()
+            && namespace_versions.len() <= MAX_MULTI_NAMESPACE_WATCHES
+            && namespace_versions.values().all(|rv| !rv.is_empty())
     }
 }
 
@@ -3719,6 +4463,7 @@ fn apply_resource_page_to_snapshot(
         continue_token,
         remaining_count,
         resource_version,
+        namespace_versions,
         page_index,
         append,
         used_limit,
@@ -3751,9 +4496,14 @@ fn apply_resource_page_to_snapshot(
                 current_cat_cnt += 1;
             }
         }
-        let watch_supported = !resource_version.is_empty()
-            && continue_token.is_empty()
-            && est_total <= WATCH_ELIGIBLE_MAX_ITEMS;
+        let watch_supported = compute_page_watch_supported(
+            &resource_version,
+            &namespace_versions,
+            page_index,
+            &continue_token,
+            est_total,
+            true,
+        );
         snap.page_info.insert(
             category.to_owned(),
             CategoryPageInfo {
@@ -3766,6 +4516,7 @@ fn apply_resource_page_to_snapshot(
                 page_index,
                 mode: "append".into(),
                 resource_version,
+                namespace_versions,
                 watch_supported,
             },
         );
@@ -3775,10 +4526,14 @@ fn apply_resource_page_to_snapshot(
         });
         snap.resources.extend(items);
         let loaded = snap.resources.iter().filter(|r| r.kind == category).count() as u64;
-        let watch_supported = !resource_version.is_empty()
-            && page_index <= 1
-            && continue_token.is_empty()
-            && est_total <= WATCH_ELIGIBLE_MAX_ITEMS;
+        let watch_supported = compute_page_watch_supported(
+            &resource_version,
+            &namespace_versions,
+            page_index,
+            &continue_token,
+            est_total,
+            false,
+        );
         snap.page_info.insert(
             category.to_owned(),
             CategoryPageInfo {
@@ -3791,6 +4546,7 @@ fn apply_resource_page_to_snapshot(
                 page_index,
                 mode: "replace".into(),
                 resource_version,
+                namespace_versions,
                 watch_supported,
             },
         );
@@ -3842,6 +4598,7 @@ pub fn fetch_category_with_options(
                     page_index: 1,
                     mode: "replace".into(),
                     resource_version: String::new(),
+                    namespace_versions: BTreeMap::new(),
                     watch_supported: false,
                 },
             );
@@ -3868,10 +4625,14 @@ pub fn fetch_category_with_options(
                     snap.events = page.items;
                 }
                 let loaded = snap.events.len() as u64;
-                let watch_supported = !page.resource_version.is_empty()
-                    && page.page_index <= 1
-                    && page.continue_token.is_empty()
-                    && est_total <= WATCH_ELIGIBLE_MAX_ITEMS;
+                let watch_supported = compute_page_watch_supported(
+                    &page.resource_version,
+                    &page.namespace_versions,
+                    page.page_index,
+                    &page.continue_token,
+                    est_total,
+                    page.append,
+                );
                 snap.page_info.insert(
                     "Event".into(),
                     CategoryPageInfo {
@@ -3888,6 +4649,7 @@ pub fn fetch_category_with_options(
                             "replace".into()
                         },
                         resource_version: page.resource_version,
+                        namespace_versions: page.namespace_versions,
                         watch_supported,
                     },
                 );
@@ -4245,6 +5007,7 @@ pub fn fetch_cluster_snapshot(project: &Project, cfg: &mut KubeConfigState) -> C
         cluster_catalog: Vec::new(),
         current_namespace: cfg.namespace.clone(),
         all_namespaces: cfg.all_namespaces,
+        selected_namespaces: cfg.active_namespaces(),
         namespaces: vec!["default".into(), "kube-system".into()],
         resources: Vec::new(),
         events: Vec::new(),
@@ -4258,11 +5021,12 @@ pub fn fetch_cluster_snapshot(project: &Project, cfg: &mut KubeConfigState) -> C
                 cfg.context = current_ctx.clone();
             }
             if cfg.namespace == "default"
+                && cfg.selected_namespaces.len() <= 1
                 && let Some(ns) = ctx_ns
                 && !ns.is_empty()
             {
-                cfg.namespace = ns.clone();
-                let _ = storage::set("namespace", &ns);
+                cfg.set_namespaces([ns.as_str()]);
+                cfg.persist_scope();
             }
             snap.current_context = if cfg.context.is_empty() {
                 current_ctx
@@ -4272,6 +5036,7 @@ pub fn fetch_cluster_snapshot(project: &Project, cfg: &mut KubeConfigState) -> C
             snap.contexts = contexts;
             snap.cluster_catalog = catalog;
             snap.current_namespace = cfg.namespace.clone();
+            snap.selected_namespaces = cfg.active_namespaces();
         }
         Err(e) => {
             snap.error = Some(e.to_string());
@@ -6221,27 +6986,23 @@ impl ActiveWatchStream {
     }
 }
 
-/// Manages at most 2 concurrent `kubectl --raw ?watch=true` child processes
-/// (1 for the active table category when `total <= 1,000` and 1 for the open Drawer resource),
-/// staying well within OpenIDEA's 8-child-per-plugin cap.
+/// Manages concurrent `kubectl --raw ?watch=true` child processes
+/// (up to `MAX_MULTI_NAMESPACE_WATCHES` for the active table category when `total <= 1,000`
+/// plus 1 for the open Drawer resource), staying safely within OpenIDEA's 8-child-per-plugin cap.
 #[derive(Default)]
 pub struct WatchManager {
-    pub category_stream: Option<ActiveWatchStream>,
+    pub category_streams: Vec<ActiveWatchStream>,
     pub drawer_stream: Option<ActiveWatchStream>,
 }
 
 impl WatchManager {
     pub fn stop_all(&mut self) {
-        if let Some(s) = self.category_stream.take() {
-            s.stop();
-        }
-        if let Some(s) = self.drawer_stream.take() {
-            s.stop();
-        }
+        self.stop_category();
+        self.stop_drawer();
     }
 
     pub fn stop_category(&mut self) {
-        if let Some(s) = self.category_stream.take() {
+        for s in self.category_streams.drain(..) {
             s.stop();
         }
     }
