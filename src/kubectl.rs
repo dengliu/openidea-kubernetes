@@ -6580,20 +6580,34 @@ pub fn fetch_helm_release_detail(
     Ok(out.stdout)
 }
 
-/// Summarizes workspace Kubernetes manifests for the tool window's "Workspace Manifests" section.
-pub fn workspace_manifests_json(
-    files: &BTreeMap<String, crate::manifest::ParsedFile>,
-    root: &str,
-) -> Value {
+/// Summarizes workspace Kubernetes, Helm, and Kustomize files for the tool window's "Workspace Manifests" section.
+pub fn workspace_manifests_json(index: &crate::intelligence::ProjectIndex, root: &str) -> Value {
+    use crate::intelligence::KubeFileIcon;
     let norm_root = root.replace('\\', "/");
+    let icon_map: BTreeMap<String, KubeFileIcon> = index
+        .compute_workspace_icons(if norm_root.is_empty() {
+            None
+        } else {
+            Some(&norm_root)
+        })
+        .into_iter()
+        .collect();
     let mut items = Vec::new();
-    for (path, parsed) in files {
+    for (path, parsed) in &index.files {
+        if parsed.marked_non_k8s {
+            continue;
+        }
         let rel = path
             .strip_prefix(&norm_root)
             .map(|r| r.trim_start_matches('/'))
             .unwrap_or(path);
+        let icon = icon_map.get(path).copied();
+        let source = icon.map_or("kubernetes", |i| i.source_kind());
+        let icon_id = icon.map_or("kubernetes", |i| i.as_str());
+        let mut emitted = false;
         for doc in &parsed.docs {
             if let Some(ref kind) = doc.kind {
+                emitted = true;
                 let name = doc.name.as_ref().map_or("(unnamed)", |n| n.value.as_str());
                 let ns = doc
                     .namespace
@@ -6608,8 +6622,43 @@ pub fn workspace_manifests_json(
                     "name": name,
                     "namespace": ns,
                     "apiVersion": api,
+                    "source": source,
+                    "icon": icon_id,
                 }));
             }
+        }
+        if !emitted && let Some(ic) = icon {
+            let fname = path.rsplit('/').next().unwrap_or(path);
+            let synthetic_kind = match ic {
+                KubeFileIcon::HelmChart => "HelmChart",
+                KubeFileIcon::HelmValues => "HelmValues",
+                KubeFileIcon::HelmTemplate => "HelmTemplate",
+                KubeFileIcon::Kustomize => "Kustomization",
+                KubeFileIcon::KustomizePatch => "KustomizePatch",
+                KubeFileIcon::Kubernetes => "Manifest",
+                KubeFileIcon::HelmChartDir | KubeFileIcon::KustomizeDir => continue,
+            };
+            let display_name = if ic == KubeFileIcon::HelmChart {
+                parsed
+                    .helm_values
+                    .get("name")
+                    .map(|s| s.value.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(fname)
+            } else {
+                fname
+            };
+            items.push(json!({
+                "path": rel,
+                "fullPath": path,
+                "line": 0,
+                "kind": synthetic_kind,
+                "name": display_name,
+                "namespace": "-",
+                "apiVersion": "",
+                "source": ic.source_kind(),
+                "icon": ic.as_str(),
+            }));
         }
     }
     Value::Array(items)

@@ -16,7 +16,11 @@ pub struct Spanned {
 impl Spanned {
     pub fn new(value: impl Into<String>, range: Range) -> Self {
         let line = range.start.line;
-        Self { value: value.into(), range, line }
+        Self {
+            value: value.into(),
+            range,
+            line,
+        }
     }
 }
 
@@ -104,8 +108,14 @@ pub struct KubeDoc {
     pub storage_class_refs: Vec<Spanned>,
     pub role_ref: Option<(String, Spanned)>,
     pub ingress_backends: Vec<IngressBackendRef>,
-    /// Kustomization file paths (`resources`, `patches`, `components`, `bases`).
+    /// Kustomization file paths (`resources`, `patches`, `components`, `bases`, etc.).
     pub kustomize_paths: Vec<Spanned>,
+    /// Kustomize patch / transformer / generator / configuration / replacement file paths.
+    pub kustomize_patch_paths: Vec<Spanned>,
+    /// Kustomize component / base directory references (`components`, `bases`).
+    pub kustomize_component_dirs: Vec<Spanned>,
+    /// Helm values files referenced by `helmCharts` inside a `kustomization.yaml`.
+    pub kustomize_helm_values: Vec<Spanned>,
     /// Duplicate sibling YAML keys within the same mapping (`(key_name, second_range, first_line)`).
     pub duplicate_keys: Vec<(String, Range, u32)>,
     /// Read-only / server-managed fields present in a local manifest (`metadata.uid`, `status`, etc.).
@@ -121,19 +131,36 @@ pub struct KubeDoc {
 impl KubeDoc {
     /// Whether this document looks like a Kubernetes or Kustomize resource.
     pub fn is_kube_resource(&self) -> bool {
-        self.api_version.is_some() || self.kind.is_some() || !self.kustomize_paths.is_empty()
+        self.api_version.is_some()
+            || self.kind.is_some()
+            || !self.kustomize_paths.is_empty()
+            || !self.kustomize_patch_paths.is_empty()
+            || !self.kustomize_component_dirs.is_empty()
+            || !self.kustomize_helm_values.is_empty()
     }
 
     /// Effective labels exposed to Service selectors (`pod_labels` for workloads, `labels` for Pods).
     pub fn target_labels(&self) -> &BTreeMap<String, Spanned> {
-        if !self.pod_labels.is_empty() { &self.pod_labels } else { &self.labels }
+        if !self.pod_labels.is_empty() {
+            &self.pod_labels
+        } else {
+            &self.labels
+        }
     }
 
     /// Whether this document is a workload that manages or is a Pod.
     pub fn is_workload(&self) -> bool {
         matches!(
             self.kind.as_ref().map(|k| k.value.as_str()),
-            Some("Pod" | "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet" | "Job" | "CronJob")
+            Some(
+                "Pod"
+                    | "Deployment"
+                    | "StatefulSet"
+                    | "DaemonSet"
+                    | "ReplicaSet"
+                    | "Job"
+                    | "CronJob"
+            )
         )
     }
 }
@@ -151,13 +178,21 @@ pub struct ParsedFile {
     pub helm_template_defs: BTreeMap<String, Spanned>,
     /// `{{ include "mychart.fullname" . }}` or `{{ template "mychart.fullname" . }}` references.
     pub helm_template_refs: Vec<Spanned>,
+    /// Whether Go/Helm template directives (`{{ ... }}`) appear in the file.
+    pub has_helm_directives: bool,
+    /// Whether top-level RFC 6902 JSON Patch operations (`- op: replace|add|remove|...`) appear in the file.
+    pub has_json6902_ops: bool,
     /// Whether `# nonk8s` or `# openidea:nonk8s` is set at the top of the file.
     pub marked_non_k8s: bool,
 }
 
 ///UTF-16 length of `s`.
 pub fn utf16_len(s: &str) -> u32 {
-    if s.is_ascii() { s.len() as u32 } else { s.encode_utf16().count() as u32 }
+    if s.is_ascii() {
+        s.len() as u32
+    } else {
+        s.encode_utf16().count() as u32
+    }
 }
 
 /// Converts a byte offset within `line_str` on `line_no` into a UTF-16 `Position`.
@@ -169,11 +204,19 @@ pub fn pos_in_line(line_no: u32, line_str: &str, byte_offset: usize) -> Position
 
 /// Builds a `Range` on a single line from byte offsets `start..end`.
 pub fn range_in_line(line_no: u32, line_str: &str, start: usize, end: usize) -> Range {
-    Range::new(pos_in_line(line_no, line_str, start), pos_in_line(line_no, line_str, end))
+    Range::new(
+        pos_in_line(line_no, line_str, start),
+        pos_in_line(line_no, line_str, end),
+    )
 }
 
 /// Strips inline YAML comments (`# ...` outside quotes) and trims surrounding quotes.
-fn parse_scalar_span(raw_after_colon: &str, base_byte: usize, line_no: u32, full_line: &str) -> Option<Spanned> {
+fn parse_scalar_span(
+    raw_after_colon: &str,
+    base_byte: usize,
+    line_no: u32,
+    full_line: &str,
+) -> Option<Spanned> {
     let trimmed_start = raw_after_colon.trim_start();
     if trimmed_start.is_empty() || trimmed_start.starts_with('#') {
         return None;
@@ -195,7 +238,10 @@ fn parse_scalar_span(raw_after_colon: &str, base_byte: usize, line_no: u32, full
                 let inner = &trimmed_start[1..i];
                 let start = base_byte + val_start_rel + 1;
                 let end = base_byte + val_start_rel + i;
-                return Some(Spanned::new(inner, range_in_line(line_no, full_line, start, end)));
+                return Some(Spanned::new(
+                    inner,
+                    range_in_line(line_no, full_line, start, end),
+                ));
             }
             i += 1;
         }
@@ -215,7 +261,10 @@ fn parse_scalar_span(raw_after_colon: &str, base_byte: usize, line_no: u32, full
     }
     let start = base_byte + val_start_rel;
     let end = start + clean.len();
-    Some(Spanned::new(clean, range_in_line(line_no, full_line, start, end)))
+    Some(Spanned::new(
+        clean,
+        range_in_line(line_no, full_line, start, end),
+    ))
 }
 
 /// Extracts `{{ .Values.xxx.yyy }}`, `{{ define "name" }}`, and `{{ include/template "name" }}` from a line.
@@ -230,24 +279,35 @@ fn extract_helm_constructs(
     while let Some(idx) = line[search_from..].find(".Values.") {
         let start_byte = search_from + idx + ".Values.".len();
         let rest = &line[start_byte..];
-        let path_len =
-            rest.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))).unwrap_or(rest.len());
+        let path_len = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+            .unwrap_or(rest.len());
         let path = rest[..path_len].trim_end_matches('.');
         if !path.is_empty() {
             let end_byte = start_byte + path.len();
-            value_refs.push(Spanned::new(path, range_in_line(line_no, line, start_byte, end_byte)));
+            value_refs.push(Spanned::new(
+                path,
+                range_in_line(line_no, line, start_byte, end_byte),
+            ));
         }
         search_from = start_byte + path_len.max(1);
     }
 
-    for (kw, is_def) in [("define \"", true), ("include \"", false), ("template \"", false)] {
+    for (kw, is_def) in [
+        ("define \"", true),
+        ("include \"", false),
+        ("template \"", false),
+    ] {
         let mut from = 0;
         while let Some(idx) = line[from..].find(kw) {
             let name_start = from + idx + kw.len();
             if let Some(end_rel) = line[name_start..].find('"') {
                 let name = &line[name_start..name_start + end_rel];
                 if !name.is_empty() {
-                    let sp = Spanned::new(name, range_in_line(line_no, line, name_start, name_start + end_rel));
+                    let sp = Spanned::new(
+                        name,
+                        range_in_line(line_no, line, name_start, name_start + end_rel),
+                    );
                     if is_def {
                         template_defs.insert(name.to_owned(), sp);
                     } else {
@@ -312,7 +372,11 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
         }
     }
 
-    let mut doc = KubeDoc { start_line: 0, end_line: 0, ..Default::default() };
+    let mut doc = KubeDoc {
+        start_line: 0,
+        end_line: 0,
+        ..Default::default()
+    };
     let mut path_stack: Vec<(usize, String)> = Vec::new();
     let mut sibling_keys: Vec<(usize, String, BTreeMap<String, u32>)> = Vec::new();
     let mut pending_ref: Option<PendingRef> = None;
@@ -328,7 +392,11 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
         if let Some(r) = pending_ref.take()
             && let Some(name) = r.name
         {
-            doc.data_refs.push(DataRef { target_kind: r.kind, name, key: r.key });
+            doc.data_refs.push(DataRef {
+                target_kind: r.kind,
+                name,
+                key: r.key,
+            });
         }
         if let Some(b) = pending_backend.take()
             && let Some(service_name) = b.service_name
@@ -362,6 +430,27 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
             &mut result.helm_template_defs,
             &mut result.helm_template_refs,
         );
+        if !result.has_helm_directives
+            && let Some(open) = line.find("{{")
+            && line[open + 2..].contains("}}")
+        {
+            let inner = &line[open + 2..];
+            if inner.starts_with('-')
+                || inner.contains(".Values")
+                || inner.contains(".Release")
+                || inner.contains(".Chart")
+                || inner.contains(".Capabilities")
+                || inner.contains(".Template")
+                || inner.contains(".Files")
+                || inner.contains("include ")
+                || inner.contains("template ")
+                || inner.contains("define ")
+                || inner.contains("toYaml")
+                || inner.contains("nindent")
+            {
+                result.has_helm_directives = true;
+            }
+        }
 
         let trimmed = line.trim();
         if trimmed == "---" || trimmed.starts_with("--- ") || trimmed == "..." {
@@ -376,7 +465,11 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
             if doc.is_kube_resource() {
                 result.docs.push(doc);
             }
-            doc = KubeDoc { start_line: line_no + 1, end_line: line_no + 1, ..Default::default() };
+            doc = KubeDoc {
+                start_line: line_no + 1,
+                end_line: line_no + 1,
+                ..Default::default()
+            };
             path_stack.clear();
             sibling_keys.clear();
             continue;
@@ -404,9 +497,15 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
             && let Some(r) = pending_ref.take()
             && let Some(name) = r.name
         {
-            doc.data_refs.push(DataRef { target_kind: r.kind, name, key: r.key });
+            doc.data_refs.push(DataRef {
+                target_kind: r.kind,
+                name,
+                key: r.key,
+            });
         }
-        if pending_backend.as_ref().is_some_and(|p| raw_indent <= p.indent)
+        if pending_backend
+            .as_ref()
+            .is_some_and(|p| raw_indent <= p.indent)
             && let Some(b) = pending_backend.take()
             && let Some(service_name) = b.service_name
         {
@@ -416,13 +515,17 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                 port_number: b.port_number,
             });
         }
-        if pending_role_ref.as_ref().is_some_and(|p| raw_indent <= p.indent)
+        if pending_role_ref
+            .as_ref()
+            .is_some_and(|p| raw_indent <= p.indent)
             && let Some(rr) = pending_role_ref.take()
             && let Some(name) = rr.name
         {
             doc.role_ref = Some((rr.kind.unwrap_or_else(|| "Role".into()), name));
         }
-        if pending_subject.as_ref().is_some_and(|p| raw_indent <= p.indent)
+        if pending_subject
+            .as_ref()
+            .is_some_and(|p| raw_indent <= p.indent)
             && let Some(sub) = pending_subject.take()
             && sub.kind.as_deref() == Some("ServiceAccount")
             && let Some(name) = sub.name
@@ -434,7 +537,12 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
         let (is_list_item, effective_indent, content, content_byte_offset) =
             if let Some(rest) = after_spaces.strip_prefix("- ") {
                 let extra_spaces = rest.len() - rest.trim_start_matches(' ').len();
-                (true, raw_indent + 2 + extra_spaces, &rest[extra_spaces..], raw_indent + 2 + extra_spaces)
+                (
+                    true,
+                    raw_indent + 2 + extra_spaces,
+                    &rest[extra_spaces..],
+                    raw_indent + 2 + extra_spaces,
+                )
             } else if after_spaces == "-" {
                 (true, raw_indent + 2, "", raw_indent + 1)
             } else {
@@ -448,10 +556,15 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
             while path_stack.last().is_some_and(|(ind, _)| *ind > raw_indent) {
                 path_stack.pop();
             }
-            while sibling_keys.last().is_some_and(|(ind, _, _)| *ind >= raw_indent) {
+            while sibling_keys
+                .last()
+                .is_some_and(|(ind, _, _)| *ind >= raw_indent)
+            {
                 sibling_keys.pop();
             }
-            if pending_subject.as_ref().is_some_and(|p| raw_indent <= p.indent + 2)
+            if pending_subject
+                .as_ref()
+                .is_some_and(|p| raw_indent <= p.indent + 2)
                 && let Some(sub) = pending_subject.take()
                 && sub.kind.as_deref() == Some("ServiceAccount")
                 && let Some(name) = sub.name
@@ -459,31 +572,80 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                 doc.service_account_refs.push(name);
             }
         } else {
-            while path_stack.last().is_some_and(|(ind, _)| *ind >= effective_indent) {
+            while path_stack
+                .last()
+                .is_some_and(|(ind, _)| *ind >= effective_indent)
+            {
                 path_stack.pop();
             }
-            while sibling_keys.last().is_some_and(|(ind, _, _)| *ind > effective_indent) {
+            while sibling_keys
+                .last()
+                .is_some_and(|(ind, _, _)| *ind > effective_indent)
+            {
                 sibling_keys.pop();
             }
         }
 
-        let joined_parent = path_stack.iter().map(|(_, k)| k.as_str()).collect::<Vec<_>>().join(".");
+        let joined_parent = path_stack
+            .iter()
+            .map(|(_, k)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
 
         // Pure scalar list item, e.g. under `resources:` or `patches:` in kustomization.yaml
-        if is_list_item && !content.contains(':') {
+        let is_url_or_scalar_item = is_list_item
+            && (!content.contains(':')
+                || content.starts_with("http://")
+                || content.starts_with("https://")
+                || content.starts_with("ssh://")
+                || content.starts_with("git::")
+                || content.starts_with("oci://"));
+        if is_url_or_scalar_item {
             if matches!(
                 joined_parent.as_str(),
-                "resources" | "bases" | "components" | "patches" | "patchesStrategicMerge" | "configurations"
+                "resources"
+                    | "bases"
+                    | "components"
+                    | "patches"
+                    | "patchesStrategicMerge"
+                    | "patchesJson6902"
+                    | "replacements"
+                    | "configurations"
+                    | "generators"
+                    | "transformers"
+                    | "validators"
+                    | "crds"
             ) && let Some(sp) = parse_scalar_span(content, content_byte_offset, line_no, line)
             {
+                if matches!(
+                    joined_parent.as_str(),
+                    "patches"
+                        | "patchesStrategicMerge"
+                        | "patchesJson6902"
+                        | "replacements"
+                        | "configurations"
+                        | "generators"
+                        | "transformers"
+                        | "validators"
+                ) {
+                    doc.kustomize_patch_paths.push(sp.clone());
+                } else if matches!(joined_parent.as_str(), "components" | "bases") {
+                    doc.kustomize_component_dirs.push(sp.clone());
+                }
                 doc.kustomize_paths.push(sp);
+            } else if joined_parent == "helmCharts.additionalValuesFiles"
+                && let Some(sp) = parse_scalar_span(content, content_byte_offset, line_no, line)
+            {
+                doc.kustomize_helm_values.push(sp);
             }
             continue;
         }
 
         // Start of a new list item under `containers` / `initContainers`, `ports`, or `subjects`.
         if is_list_item {
-            if joined_parent.ends_with("spec.containers") || joined_parent.ends_with("spec.initContainers") {
+            if joined_parent.ends_with("spec.containers")
+                || joined_parent.ends_with("spec.initContainers")
+            {
                 doc.containers.push(ContainerSpec {
                     name: None,
                     image: None,
@@ -500,26 +662,37 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                     end_line: line_no,
                 });
             } else if joined_parent == "spec.ports" {
-                doc.service_ports.push(ServicePort { name: None, port: None, target_port: None });
+                doc.service_ports.push(ServicePort {
+                    name: None,
+                    port: None,
+                    target_port: None,
+                });
             } else if joined_parent == "subjects" {
-                pending_subject = Some(PendingSubject { indent: raw_indent, kind: None, name: None });
+                pending_subject = Some(PendingSubject {
+                    indent: raw_indent,
+                    kind: None,
+                    name: None,
+                });
             }
         }
 
-        let Some(colon_idx) = content.find(':') else { continue };
+        let Some(colon_idx) = content.find(':') else {
+            continue;
+        };
         let key_raw = content[..colon_idx].trim();
         let key = key_raw.trim_matches(|c| c == '"' || c == '\'');
         if key.is_empty() || key.contains("{{") {
             continue;
         }
-        let key_start_byte =
-            content_byte_offset + (content[..colon_idx].len() - content[..colon_idx].trim_start().len());
+        let key_start_byte = content_byte_offset
+            + (content[..colon_idx].len() - content[..colon_idx].trim_start().len());
         let key_end_byte = key_start_byte + key_raw.len();
         let key_range = range_in_line(line_no, line, key_start_byte, key_end_byte);
 
         // Duplicate key check within the same mapping scope
-        let scope_entry = if let Some(last) =
-            sibling_keys.last_mut().filter(|(ind, parent, _)| *ind == effective_indent && *parent == joined_parent)
+        let scope_entry = if let Some(last) = sibling_keys
+            .last_mut()
+            .filter(|(ind, parent, _)| *ind == effective_indent && *parent == joined_parent)
         {
             last
         } else {
@@ -527,7 +700,8 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
             sibling_keys.last_mut().expect("just pushed")
         };
         if let Some(&first_line) = scope_entry.2.get(key) {
-            doc.duplicate_keys.push((key.to_owned(), key_range, first_line));
+            doc.duplicate_keys
+                .push((key.to_owned(), key_range, first_line));
         } else {
             scope_entry.2.insert(key.to_owned(), line_no);
         }
@@ -536,22 +710,32 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
         let after_colon_byte = content_byte_offset + colon_idx + 1;
         let scalar = parse_scalar_span(after_colon, after_colon_byte, line_no, line);
 
-        let full_path = if joined_parent.is_empty() { key.to_owned() } else { format!("{joined_parent}.{key}") };
+        let full_path = if joined_parent.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{joined_parent}.{key}")
+        };
 
         // Record Helm `values.yaml` flattened path (capped at 512 entries per file).
         if result.helm_values.len() < 512 {
             if let Some(ref val) = scalar {
-                result.helm_values.entry(full_path.clone()).or_insert_with(|| Spanned {
-                    value: val.value.clone(),
-                    range: key_range,
-                    line: line_no,
-                });
+                result
+                    .helm_values
+                    .entry(full_path.clone())
+                    .or_insert_with(|| Spanned {
+                        value: val.value.clone(),
+                        range: key_range,
+                        line: line_no,
+                    });
             } else {
-                result.helm_values.entry(full_path.clone()).or_insert_with(|| Spanned {
-                    value: String::new(),
-                    range: key_range,
-                    line: line_no,
-                });
+                result
+                    .helm_values
+                    .entry(full_path.clone())
+                    .or_insert_with(|| Spanned {
+                        value: String::new(),
+                        range: key_range,
+                        line: line_no,
+                    });
             }
         }
 
@@ -572,16 +756,23 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
         // Deprecated fields detection (Kustomize & Kubernetes)
         match full_path.as_str() {
             "bases" => {
-                doc.deprecated_fields.push(("bases".into(), "resources".into(), key_range));
+                doc.deprecated_fields
+                    .push(("bases".into(), "resources".into(), key_range));
             }
             "patchesStrategicMerge" | "patchesJson6902" => {
-                doc.deprecated_fields.push((full_path.clone(), "patches".into(), key_range));
+                doc.deprecated_fields
+                    .push((full_path.clone(), "patches".into(), key_range));
             }
             "commonLabels" => {
-                doc.deprecated_fields.push(("commonLabels".into(), "labels".into(), key_range));
+                doc.deprecated_fields
+                    .push(("commonLabels".into(), "labels".into(), key_range));
             }
             "spec.serviceAccount" => {
-                doc.deprecated_fields.push(("serviceAccount".into(), "serviceAccountName".into(), key_range));
+                doc.deprecated_fields.push((
+                    "serviceAccount".into(),
+                    "serviceAccountName".into(),
+                    key_range,
+                ));
             }
             _ => {}
         }
@@ -595,13 +786,33 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                 && doc.kind.as_ref().map(|k| k.value.as_str()) == Some("Service")
                 && !SERVICE_TYPES.contains(&val.value.as_str())
             {
-                doc.invalid_enums.push((full_path.clone(), val.value.clone(), SERVICE_TYPES, val.range));
+                doc.invalid_enums.push((
+                    full_path.clone(),
+                    val.value.clone(),
+                    SERVICE_TYPES,
+                    val.range,
+                ));
             } else if key == "imagePullPolicy" && !PULL_POLICIES.contains(&val.value.as_str()) {
-                doc.invalid_enums.push((full_path.clone(), val.value.clone(), PULL_POLICIES, val.range));
+                doc.invalid_enums.push((
+                    full_path.clone(),
+                    val.value.clone(),
+                    PULL_POLICIES,
+                    val.range,
+                ));
             } else if key == "restartPolicy" && !RESTART_POLICIES.contains(&val.value.as_str()) {
-                doc.invalid_enums.push((full_path.clone(), val.value.clone(), RESTART_POLICIES, val.range));
+                doc.invalid_enums.push((
+                    full_path.clone(),
+                    val.value.clone(),
+                    RESTART_POLICIES,
+                    val.range,
+                ));
             } else if key == "pathType" && !PATH_TYPES.contains(&val.value.as_str()) {
-                doc.invalid_enums.push((full_path.clone(), val.value.clone(), PATH_TYPES, val.range));
+                doc.invalid_enums.push((
+                    full_path.clone(),
+                    val.value.clone(),
+                    PATH_TYPES,
+                    val.range,
+                ));
             }
         }
 
@@ -617,15 +828,28 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                     key: None,
                 }) && let Some(name) = prev.name
                 {
-                    doc.data_refs.push(DataRef { target_kind: prev.kind, name, key: prev.key });
+                    doc.data_refs.push(DataRef {
+                        target_kind: prev.kind,
+                        name,
+                        key: prev.key,
+                    });
                 }
             }
-            "secretKeyRef" | "secretRef" | "secret" if full_path.contains("env") || full_path.contains("volumes") => {
-                if let Some(prev) =
-                    pending_ref.replace(PendingRef { kind: "Secret", indent: effective_indent, name: None, key: None })
-                    && let Some(name) = prev.name
+            "secretKeyRef" | "secretRef" | "secret"
+                if full_path.contains("env") || full_path.contains("volumes") =>
+            {
+                if let Some(prev) = pending_ref.replace(PendingRef {
+                    kind: "Secret",
+                    indent: effective_indent,
+                    name: None,
+                    key: None,
+                }) && let Some(name) = prev.name
                 {
-                    doc.data_refs.push(DataRef { target_kind: prev.kind, name, key: prev.key });
+                    doc.data_refs.push(DataRef {
+                        target_kind: prev.kind,
+                        name,
+                        key: prev.key,
+                    });
                 }
             }
             "service" if full_path.ends_with("backend.service") => {
@@ -644,7 +868,11 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                 }
             }
             "roleRef" if full_path == "roleRef" => {
-                pending_role_ref = Some(PendingRoleRef { indent: effective_indent, kind: None, name: None });
+                pending_role_ref = Some(PendingRoleRef {
+                    indent: effective_indent,
+                    kind: None,
+                    name: None,
+                });
             }
             _ => {}
         }
@@ -715,9 +943,9 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                     }
                 }
                 _ => {
-                    if let Some(prop) =
-                        full_path.strip_prefix("spec.versions.schema.openAPIV3Schema.properties.spec.properties.")
-                        && !prop.contains('.')
+                    if let Some(prop) = full_path.strip_prefix(
+                        "spec.versions.schema.openAPIV3Schema.properties.spec.properties.",
+                    ) && !prop.contains('.')
                         && !crd.spec_properties.iter().any(|p| p == prop)
                     {
                         crd.spec_properties.push(prop.to_owned());
@@ -761,7 +989,9 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                     }
                 } else if let Some(label_key) = full_path
                     .strip_prefix("spec.template.metadata.labels.")
-                    .or_else(|| full_path.strip_prefix("spec.jobTemplate.spec.template.metadata.labels."))
+                    .or_else(|| {
+                        full_path.strip_prefix("spec.jobTemplate.spec.template.metadata.labels.")
+                    })
                 {
                     if let Some(s) = scalar.clone() {
                         doc.pod_labels.insert(label_key.to_owned(), s);
@@ -780,14 +1010,20 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                     {
                         doc.selector_labels.insert(sel_key.to_owned(), s);
                     }
-                } else if let Some(data_key) =
-                    full_path.strip_prefix("data.").or_else(|| full_path.strip_prefix("stringData."))
+                } else if let Some(data_key) = full_path
+                    .strip_prefix("data.")
+                    .or_else(|| full_path.strip_prefix("stringData."))
                 {
                     if !data_key.contains('.') {
-                        let sp = Spanned::new(scalar.as_ref().map_or("", |s| s.value.as_str()), key_range);
+                        let sp = Spanned::new(
+                            scalar.as_ref().map_or("", |s| s.value.as_str()),
+                            key_range,
+                        );
                         doc.data_keys.insert(data_key.to_owned(), sp);
                     }
-                } else if full_path.ends_with("serviceAccountName") || full_path.ends_with("serviceAccount") {
+                } else if full_path.ends_with("serviceAccountName")
+                    || full_path.ends_with("serviceAccount")
+                {
                     if let Some(s) = scalar.clone() {
                         doc.service_account_refs.push(s);
                     }
@@ -795,10 +1031,15 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                     if let Some(s) = scalar.clone() {
                         doc.pvc_refs.push(s);
                     }
-                } else if (full_path.ends_with("tls.secretName") || full_path.ends_with("imagePullSecrets.name"))
+                } else if (full_path.ends_with("tls.secretName")
+                    || full_path.ends_with("imagePullSecrets.name"))
                     && let Some(s) = scalar.clone()
                 {
-                    doc.data_refs.push(DataRef { target_kind: "Secret", name: s, key: None });
+                    doc.data_refs.push(DataRef {
+                        target_kind: "Secret",
+                        name: s,
+                        key: None,
+                    });
                 } else if full_path.starts_with("spec.ports.") {
                     if let Some(port) = doc.service_ports.last_mut() {
                         match key {
@@ -808,7 +1049,8 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                             _ => {}
                         }
                     }
-                } else if (full_path.contains("spec.containers.") || full_path.contains("spec.initContainers."))
+                } else if (full_path.contains("spec.containers.")
+                    || full_path.contains("spec.initContainers."))
                     && let Some(container) = doc.containers.last_mut()
                 {
                     let suffix = full_path
@@ -836,14 +1078,41 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                         "livenessProbe" => container.has_liveness_probe = true,
                         "readinessProbe" => container.has_readiness_probe = true,
                         "securityContext.privileged" => container.privileged = scalar.clone(),
-                        "securityContext.runAsNonRoot" => container.run_as_non_root = scalar.clone(),
+                        "securityContext.runAsNonRoot" => {
+                            container.run_as_non_root = scalar.clone()
+                        }
                         _ => {}
                     }
                 } else if matches!(key, "path")
-                    && (full_path.starts_with("patches.") || full_path.starts_with("components."))
+                    && (full_path.starts_with("patches.")
+                        || full_path.starts_with("patchesJson6902.")
+                        || full_path.starts_with("replacements.")
+                        || full_path == "openapi.path"
+                        || full_path.starts_with("components."))
                     && let Some(s) = scalar.clone()
                 {
+                    if full_path.starts_with("components.") {
+                        doc.kustomize_component_dirs.push(s.clone());
+                    } else {
+                        doc.kustomize_patch_paths.push(s.clone());
+                    }
                     doc.kustomize_paths.push(s);
+                } else if matches!(key, "valuesFile")
+                    && full_path.starts_with("helmCharts.")
+                    && let Some(s) = scalar.clone()
+                {
+                    doc.kustomize_helm_values.push(s);
+                } else if is_list_item
+                    && joined_parent.is_empty()
+                    && key == "op"
+                    && scalar.as_ref().is_some_and(|s| {
+                        matches!(
+                            s.value.as_str(),
+                            "add" | "remove" | "replace" | "move" | "copy" | "test"
+                        )
+                    })
+                {
+                    result.has_json6902_ops = true;
                 }
             }
         }
@@ -854,7 +1123,13 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
         }
     }
 
-    flush_pending(&mut doc, &mut pending_ref, &mut pending_backend, &mut pending_role_ref, &mut pending_subject);
+    flush_pending(
+        &mut doc,
+        &mut pending_ref,
+        &mut pending_backend,
+        &mut pending_role_ref,
+        &mut pending_subject,
+    );
     if doc.is_kube_resource() {
         result.docs.push(doc);
     }
@@ -908,7 +1183,9 @@ pub fn yaml_context_at(text: &str, pos: Position) -> (String, String, Option<Str
             }
         }
         if let Some(colon) = content.find(':') {
-            let key = content[..colon].trim().trim_matches(|c| c == '"' || c == '\'');
+            let key = content[..colon]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'');
             let after = content[colon + 1..].trim();
             if raw_indent == 0 && key == "kind" && !after.is_empty() {
                 doc_kind = Some(after.trim_matches(|c| c == '"' || c == '\'').to_owned());
@@ -941,6 +1218,10 @@ pub fn yaml_context_at(text: &str, pos: Position) -> (String, String, Option<Str
         stack.pop();
     }
 
-    let parent_path = stack.into_iter().map(|(_, k)| k).collect::<Vec<_>>().join(".");
+    let parent_path = stack
+        .into_iter()
+        .map(|(_, k)| k)
+        .collect::<Vec<_>>()
+        .join(".");
     (parent_path, current_line.to_owned(), doc_kind)
 }

@@ -249,12 +249,15 @@ impl KubernetesPlugin {
             .and_then(|p| p.root().ok())
             .unwrap_or_default();
         self.index.ensure(project.as_ref(), None);
+        if let Some(ref p) = project {
+            self.publish_project_icons(p);
+        }
         if self.snapshot.is_none()
             && let Some(ref p) = project
         {
             self.refresh_cluster(p);
         }
-        let ws = workspace_manifests_json(&self.index.files, &root);
+        let ws = workspace_manifests_json(&self.index, &root);
         let cfg = KubeConfigState::load();
         json!({
             "op": "state",
@@ -835,6 +838,7 @@ impl KubernetesPlugin {
             return Ok(0);
         };
         self.index.ensure(Some(&project), Some((path, &text)));
+        self.publish_project_icons(&project);
         let parsed = self
             .index
             .files
@@ -924,7 +928,7 @@ impl KubernetesPlugin {
                 }
                 self.update_status_bar(&cfg);
                 let snap = self.snapshot.clone().unwrap_or_default();
-                let ws = workspace_manifests_json(&self.index.files, &root);
+                let ws = workspace_manifests_json(&self.index, &root);
                 let cat = v.get("category").and_then(Value::as_str).unwrap_or("Pod");
                 let req_limit = v
                     .get("limit")
@@ -2294,10 +2298,66 @@ impl KubernetesPlugin {
     }
 }
 
+impl KubernetesPlugin {
+    fn icon_set_id(root: &str) -> String {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in root.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("k8s-icons:{h:016x}")
+    }
+
+    /// Publishes dynamic file & folder icons (`kubernetes`, `helm-*`, `kustomize-*`) for `project`.
+    pub fn publish_project_icons(&self, project: &Project) {
+        let Ok(raw_root) = project.root() else {
+            return;
+        };
+        let norm_root = normalize_slashes(&raw_root);
+        let items: Vec<(String, String)> = self
+            .index
+            .compute_workspace_icons(Some(&norm_root))
+            .into_iter()
+            .map(|(p, icon)| (p, icon.as_str().to_owned()))
+            .collect();
+        let _ = host::set_file_icons(&Self::icon_set_id(&norm_root), &items);
+    }
+
+    /// Scans all open projects and publishes their Kubernetes / Helm / Kustomize file & folder icons.
+    pub fn sync_all_project_icons(&mut self) {
+        let Ok(projects) = host::projects() else {
+            return;
+        };
+        for proj in projects {
+            self.index.invalidate();
+            self.index.ensure(Some(&proj), None);
+            self.publish_project_icons(&proj);
+        }
+    }
+}
+
 impl Plugin for KubernetesPlugin {
     fn activate(&mut self, _ctx: &Context) -> Result<(), Error> {
         let cfg = KubeConfigState::load();
         self.update_status_bar(&cfg);
+        let _ = host::subscribe_paths(
+            "files-changed",
+            &[
+                "**/*.yaml",
+                "**/*.yml",
+                "**/*.tpl",
+                "**/Kustomization",
+                "**/.helmignore",
+                "**/NOTES.txt",
+                "**/Chart.lock",
+                "**/requirements.lock",
+                "**/values.schema.json",
+                "**/*.kubeconfig",
+                "**/kubeconfig",
+                "**/*.json",
+            ],
+        );
+        self.sync_all_project_icons();
         Ok(())
     }
 
@@ -2453,15 +2513,31 @@ impl Plugin for KubernetesPlugin {
     fn handle_events(&mut self, events: &[Event], _ctx: &Invocation) {
         let _task = host::begin_task("Kubernetes: Inspecting manifest", false);
         let validate_on_save = host::setting_bool("validateOnSave").unwrap_or(true);
+        let mut needs_full_icon_resync = false;
         for event in events {
             match event {
-                Event::FileOpened(path) | Event::FileSaved(path)
-                    if validate_on_save && (path.ends_with(".yaml") || path.ends_with(".yml")) =>
-                {
-                    let _ = self.check_and_publish(path, false);
+                Event::FileOpened(path) | Event::FileSaved(path) => {
+                    if path.ends_with(".yaml") || path.ends_with(".yml") {
+                        if validate_on_save {
+                            let _ = self.check_and_publish(path, false);
+                        } else if let Some(project) = project_of(path)
+                            && let Ok(text) = project.read_file(path)
+                        {
+                            self.index.ensure(Some(&project), Some((path, &text)));
+                            self.publish_project_icons(&project);
+                        }
+                    } else {
+                        needs_full_icon_resync = true;
+                    }
+                }
+                Event::Other { kind, .. } if kind == "files-changed" => {
+                    needs_full_icon_resync = true;
                 }
                 _ => {}
             }
+        }
+        if needs_full_icon_resync {
+            self.sync_all_project_icons();
         }
     }
 }
@@ -2865,6 +2941,9 @@ impl Views for KubernetesPlugin {
             .and_then(|p| p.root().ok())
             .unwrap_or_default();
         self.index.ensure(project.as_ref(), None);
+        if let Some(ref p) = project {
+            self.publish_project_icons(p);
+        }
         let mut cfg = KubeConfigState::load();
         if let Some(ref p) = project {
             self.ensure_catalog_loaded(p, &mut cfg);
@@ -2875,7 +2954,7 @@ impl Views for KubernetesPlugin {
         if initial_snap.resources.len() > MAX_INITIAL_HTML_RESOURCES {
             initial_snap.resources.truncate(MAX_INITIAL_HTML_RESOURCES);
         }
-        let ws = workspace_manifests_json(&self.index.files, &root);
+        let ws = workspace_manifests_json(&self.index, &root);
         let initial = json!({
             "op": "state",
             "snapshot": initial_snap,
@@ -4781,6 +4860,260 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
             host.requests().len(),
             reqs_before,
             "stale queued search-category must be dropped without issuing HTTP calls"
+        );
+    }
+
+    #[test]
+    fn detects_helm_kustomize_and_kubernetes_files_and_folders_for_icons() {
+        let host = install_mock_with_kubectl();
+
+        // 1. Standalone Kubernetes & CNCF CRD manifests (open-source podinfo / Flux layout)
+        host.add_file(
+            "podinfo/deploy/webapp/frontend-deployment.yaml",
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: frontend\n",
+        );
+        host.add_file(
+            "podinfo/deploy/webapp/frontend-service.yaml",
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: frontend\n",
+        );
+        host.add_file(
+            "podinfo/flux/gitrepository.yaml",
+            "apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nmetadata:\n  name: podinfo\n",
+        );
+        host.add_file(
+            "podinfo/flux/helmrelease.yaml",
+            "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: podinfo\n",
+        );
+
+        // 2. Helm chart (`charts/podinfo`): chart dir, Chart.yaml, Chart.lock, values.yaml, values-prod.yaml, templates/deployment.yaml, _helpers.tpl, NOTES.txt, .helmignore, crds/, README.md
+        host.add_file(
+            "podinfo/charts/podinfo/Chart.yaml",
+            "apiVersion: v2\nname: podinfo\nversion: 6.7.0\n",
+        );
+        host.add_file(
+            "podinfo/charts/podinfo/Chart.lock",
+            "dependencies: []\ndigest: sha256:abc\n",
+        );
+        host.add_file(
+            "podinfo/charts/podinfo/values.yaml",
+            "replicaCount: 2\nimage:\n  tag: 6.7.0\n",
+        );
+        host.add_file(
+            "podinfo/charts/podinfo/values-prod.yaml",
+            "replicaCount: 5\n",
+        );
+        host.add_file(
+            "podinfo/charts/podinfo/templates/deployment.yaml",
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {{ include \"podinfo.fullname\" . }}\n",
+        );
+        host.add_file(
+            "podinfo/charts/podinfo/templates/_helpers.tpl",
+            "{{- define \"podinfo.fullname\" -}}podinfo{{- end -}}\n",
+        );
+        host.add_file(
+            "podinfo/charts/podinfo/templates/NOTES.txt",
+            "Installed {{ .Release.Name }}\n",
+        );
+        host.add_file("podinfo/charts/podinfo/.helmignore", ".DS_Store\n");
+        host.add_file(
+            "podinfo/charts/podinfo/crds/alertprovider-crd.yaml",
+            "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: providers.notification.toolkit.fluxcd.io\n",
+        );
+        host.add_file("podinfo/charts/podinfo/README.md", "# podinfo Helm chart\n");
+
+        // 3. Kustomize base & overlay (`overlays/prod`): dir, kustomization.yaml, strategic merge patch, JSON6902 patch, component dir, helmCharts valuesFile, and standard `resources:` manifest
+        host.add_file(
+            "podinfo/kustomize/base/kustomization.yaml",
+            "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - deployment.yaml\n",
+        );
+        host.add_file(
+            "podinfo/kustomize/base/deployment.yaml",
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: podinfo\n",
+        );
+        host.add_file(
+            "podinfo/kustomize/overlays/prod/kustomization.yaml",
+            "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - ../../base\ncomponents:\n  - ../../components/tls\npatches:\n  - path: patch-replicas.yaml\npatchesJson6902:\n  - path: patch-hpa.yaml\nhelmCharts:\n  - name: podinfo\n    valuesFile: helm-values-prod.yaml\n",
+        );
+        host.add_file(
+            "podinfo/kustomize/overlays/prod/patch-replicas.yaml",
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: podinfo\nspec:\n  replicas: 5\n",
+        );
+        host.add_file(
+            "podinfo/kustomize/overlays/prod/patch-hpa.yaml",
+            "- op: replace\n  path: /spec/maxReplicas\n  value: 10\n",
+        );
+        host.add_file(
+            "podinfo/kustomize/overlays/prod/helm-values-prod.yaml",
+            "replicaCount: 4\n",
+        );
+        host.add_file(
+            "podinfo/kustomize/overlays/prod/transformer.yaml",
+            "apiVersion: builtin\nkind: PrefixSuffixTransformer\nmetadata:\n  name: prod-prefix\n",
+        );
+
+        // 4. Non-Kubernetes YAML files that must NOT be given Kubernetes/Helm/Kustomize icons
+        host.add_file(
+            "docker-compose.yaml",
+            "services:\n  redis:\n    image: redis:7\n",
+        );
+        host.add_file(
+            ".github/workflows/ci.yaml",
+            "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n",
+        );
+        host.add_file(
+            "catalog-info.yaml",
+            "apiVersion: backstage.io/v1alpha1\nkind: Component\nmetadata:\n  name: podinfo\n",
+        );
+        host.add_file(
+            "misc/ignored.yaml",
+            "# nonk8s\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: local-only\n",
+        );
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        let icons: std::collections::BTreeMap<String, String> = host
+            .file_icons()
+            .into_iter()
+            .map(|((_, path), (icon, _))| (path, icon))
+            .collect();
+        let icon_of = |suffix: &str| -> Option<&str> {
+            icons
+                .iter()
+                .find_map(|(k, v)| k.ends_with(suffix).then_some(v.as_str()))
+        };
+
+        // Helm chart directory & files
+        assert_eq!(icon_of("/podinfo/charts/podinfo"), Some("helm-chart-dir"));
+        assert_eq!(
+            icon_of("/podinfo/charts/podinfo/Chart.yaml"),
+            Some("helm-chart")
+        );
+        assert_eq!(
+            icon_of("/podinfo/charts/podinfo/Chart.lock"),
+            Some("helm-chart")
+        );
+        assert_eq!(
+            icon_of("/podinfo/charts/podinfo/values.yaml"),
+            Some("helm-values")
+        );
+        assert_eq!(
+            icon_of("/podinfo/charts/podinfo/values-prod.yaml"),
+            Some("helm-values")
+        );
+        assert_eq!(
+            icon_of("/podinfo/charts/podinfo/templates/deployment.yaml"),
+            Some("helm-template"),
+            "Helm template with apiVersion/kind inside templates/ must get helm-template, not kubernetes"
+        );
+        assert_eq!(
+            icon_of("/podinfo/charts/podinfo/templates/_helpers.tpl"),
+            Some("helm-template")
+        );
+        assert_eq!(
+            icon_of("/podinfo/charts/podinfo/templates/NOTES.txt"),
+            Some("helm-template")
+        );
+        assert_eq!(
+            icon_of("/podinfo/charts/podinfo/.helmignore"),
+            Some("helm-template")
+        );
+        assert_eq!(
+            icon_of("/podinfo/charts/podinfo/crds/alertprovider-crd.yaml"),
+            Some("kubernetes"),
+            "Plain un-templated CRD under crds/ keeps kubernetes icon"
+        );
+        assert_eq!(icon_of("/podinfo/charts/podinfo/README.md"), None);
+
+        // Kustomize directories, root files, patches, plugins, and `resources:` manifests
+        assert_eq!(icon_of("/podinfo/kustomize/base"), Some("kustomize-dir"));
+        assert_eq!(
+            icon_of("/podinfo/kustomize/overlays/prod"),
+            Some("kustomize-dir")
+        );
+        assert_eq!(
+            icon_of("/podinfo/kustomize/components/tls"),
+            Some("kustomize-dir")
+        );
+        assert_eq!(
+            icon_of("/podinfo/kustomize/base/kustomization.yaml"),
+            Some("kustomize")
+        );
+        assert_eq!(
+            icon_of("/podinfo/kustomize/overlays/prod/kustomization.yaml"),
+            Some("kustomize")
+        );
+        assert_eq!(
+            icon_of("/podinfo/kustomize/overlays/prod/patch-replicas.yaml"),
+            Some("kustomize-patch"),
+            "Strategic merge patch referenced in patches: must get kustomize-patch, not kubernetes"
+        );
+        assert_eq!(
+            icon_of("/podinfo/kustomize/overlays/prod/patch-hpa.yaml"),
+            Some("kustomize-patch")
+        );
+        assert_eq!(
+            icon_of("/podinfo/kustomize/overlays/prod/transformer.yaml"),
+            Some("kustomize-patch")
+        );
+        assert_eq!(
+            icon_of("/podinfo/kustomize/overlays/prod/helm-values-prod.yaml"),
+            Some("helm-values")
+        );
+        assert_eq!(
+            icon_of("/podinfo/kustomize/base/deployment.yaml"),
+            Some("kubernetes"),
+            "Standard K8s manifest under resources: keeps kubernetes icon (IntelliJ default)"
+        );
+
+        // Standalone Kubernetes manifests
+        assert_eq!(
+            icon_of("/podinfo/deploy/webapp/frontend-deployment.yaml"),
+            Some("kubernetes")
+        );
+        assert_eq!(
+            icon_of("/podinfo/deploy/webapp/frontend-service.yaml"),
+            Some("kubernetes")
+        );
+        assert_eq!(
+            icon_of("/podinfo/flux/gitrepository.yaml"),
+            Some("kubernetes")
+        );
+        assert_eq!(
+            icon_of("/podinfo/flux/helmrelease.yaml"),
+            Some("kubernetes")
+        );
+
+        // Non-Kubernetes YAML files stay untouched
+        assert_eq!(icon_of("/docker-compose.yaml"), None);
+        assert_eq!(icon_of("/.github/workflows/ci.yaml"), None);
+        assert_eq!(icon_of("/catalog-info.yaml"), None);
+        assert_eq!(icon_of("/misc/ignored.yaml"), None);
+
+        // Live file-changed event updates icons when a new manifest is added
+        host.add_file(
+            "podinfo/flux/kustomization-sync.yaml",
+            "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: podinfo-sync\n",
+        );
+        plugin.handle_events(
+            &[Event::Other {
+                kind: "files-changed".into(),
+                data: r#"{"created":["podinfo/flux/kustomization-sync.yaml"],"modified":[],"removed":[]}"#.into(),
+            }],
+            &host.invocation(),
+        );
+        let updated_icons: std::collections::BTreeMap<String, String> = host
+            .file_icons()
+            .into_iter()
+            .map(|((_, path), (icon, _))| (path, icon))
+            .collect();
+        assert_eq!(
+            updated_icons.iter().find_map(|(k, v)| k
+                .ends_with("/podinfo/flux/kustomization-sync.yaml")
+                .then_some(v.as_str())),
+            Some("kubernetes")
         );
     }
 }

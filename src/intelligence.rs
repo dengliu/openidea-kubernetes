@@ -5,15 +5,69 @@
 //! - Static inspections & Quick Fixes (`CodeAction`)
 
 use crate::manifest::{KubeDoc, ParsedFile, Spanned, parse_yaml, utf16_len, yaml_context_at};
-use openidea_plugin::providers::{CodeAction, CompletionItem, CompletionKind, Document, LineMarker};
+use openidea_plugin::providers::{
+    CodeAction, CompletionItem, CompletionKind, Document, LineMarker,
+};
 use openidea_plugin::{Diagnostic, Location, Position, Project, Range, Severity, TextEdit, host};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 const INDEX_TTL: Duration = Duration::from_secs(300);
-const MAX_YAML_FILES: u32 = 80;
+const MAX_YAML_FILES: u32 = 500;
+const MAX_MARKER_FILES: u32 = 500;
 const MAX_INDEX_FILE_BYTES: usize = 256 << 10;
-const MAX_INDEX_SCAN_TIME: Duration = Duration::from_millis(150);
+const MAX_INDEX_SCAN_TIME: Duration = Duration::from_millis(600);
+
+/// Icon ids declared under `[[contributes.fileIcons]]` in `plugin.toml`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KubeFileIcon {
+    Kubernetes,
+    HelmChartDir,
+    HelmChart,
+    HelmValues,
+    HelmTemplate,
+    KustomizeDir,
+    Kustomize,
+    KustomizePatch,
+}
+
+impl KubeFileIcon {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Kubernetes => "kubernetes",
+            Self::HelmChartDir => "helm-chart-dir",
+            Self::HelmChart => "helm-chart",
+            Self::HelmValues => "helm-values",
+            Self::HelmTemplate => "helm-template",
+            Self::KustomizeDir => "kustomize-dir",
+            Self::Kustomize => "kustomize",
+            Self::KustomizePatch => "kustomize-patch",
+        }
+    }
+
+    pub const fn source_kind(self) -> &'static str {
+        match self {
+            Self::Kubernetes => "kubernetes",
+            Self::HelmChartDir | Self::HelmChart | Self::HelmValues | Self::HelmTemplate => "helm",
+            Self::KustomizeDir | Self::Kustomize | Self::KustomizePatch => "kustomize",
+        }
+    }
+}
+
+/// Returns true if `path` is inside an excluded build/dependency/CI directory.
+pub fn is_excluded_workspace_dir(path: &str) -> bool {
+    let norm = normalize_slashes(path);
+    norm.contains("/node_modules/")
+        || norm.contains("/.git/")
+        || norm.contains("/.github/workflows/")
+        || norm.contains("/.gitlab/")
+        || norm.contains("/.circleci/")
+        || norm.contains("/target/")
+        || norm.contains("/dist/")
+        || norm.contains("/vendor/")
+        || norm.contains("/.venv/")
+        || norm.contains("/venv/")
+}
 
 /// Returns true if `path` is a lockfile, dependency folder, or CI config that should not be indexed as a Kubernetes manifest.
 pub fn is_excluded_yaml_path(path: &str) -> bool {
@@ -25,6 +79,7 @@ pub fn is_excluded_yaml_path(path: &str) -> bool {
             | "yarn.lock"
             | "package-lock.json"
             | "Chart.lock"
+            | "requirements.lock"
             | "pubspec.lock"
             | "docker-compose.yml"
             | "docker-compose.yaml"
@@ -39,12 +94,23 @@ pub fn is_excluded_yaml_path(path: &str) -> bool {
     {
         return true;
     }
-    norm.contains("/node_modules/")
-        || norm.contains("/.git/")
-        || norm.contains("/.github/workflows/")
-        || norm.contains("/target/")
-        || norm.contains("/dist/")
-        || norm.contains("/vendor/")
+    is_excluded_workspace_dir(&norm)
+}
+
+pub fn is_yaml_filename(fname: &str) -> bool {
+    fname.ends_with(".yaml") || fname.ends_with(".yml")
+}
+
+pub fn is_helm_values_filename(fname: &str) -> bool {
+    fname == "values.yaml"
+        || fname == "values.yml"
+        || fname == "values.schema.json"
+        || ((fname.starts_with("values.")
+            || fname.starts_with("values-")
+            || fname.starts_with("values_"))
+            && is_yaml_filename(fname))
+        || fname.ends_with(".values.yaml")
+        || fname.ends_with(".values.yml")
 }
 
 /// Fast check before running the full line-by-line parser during background workspace scans.
@@ -54,12 +120,27 @@ fn is_likely_kube_or_helm_file(path: &str, text: &str) -> bool {
     }
     let norm = normalize_slashes(path);
     let fname = norm.rsplit('/').next().unwrap_or(&norm);
-    if fname == "values.yaml"
-        || fname == "values.yml"
-        || fname.starts_with("values.")
-        || fname == "Chart.yaml"
-        || fname == "kustomization.yaml"
-        || fname == "kustomization.yml"
+    if is_helm_values_filename(fname)
+        || matches!(
+            fname,
+            "Chart.yaml"
+                | "Chart.yml"
+                | "requirements.yaml"
+                | "requirements.yml"
+                | "helmfile.yaml"
+                | "helmfile.yml"
+                | "kustomization.yaml"
+                | "kustomization.yml"
+                | "Kustomization"
+        )
+        || fname.ends_with(".helmfile.yaml")
+        || fname.ends_with(".helmfile.yml")
+        || fname.ends_with(".kustomize.yaml")
+        || fname.ends_with(".kustomize.yml")
+        || fname.ends_with(".k8s.yaml")
+        || fname.ends_with(".k8s.yml")
+        || fname.ends_with(".helm.yaml")
+        || fname.ends_with(".helm.yml")
         || fname.ends_with(".tpl")
     {
         return true;
@@ -68,14 +149,27 @@ fn is_likely_kube_or_helm_file(path: &str, text: &str) -> bool {
         || text.contains("kind:")
         || text.contains(".Values.")
         || text.contains("define \"")
+        || text.contains("{{")
         || text.contains("resources:")
+        || text.contains("patches:")
+        || text.contains("patchesStrategicMerge:")
+        || text.contains("patchesJson6902:")
+        || text.contains("components:")
+        || text.contains("bases:")
+        || text.contains("- op:")
 }
 
-/// Project-wide index of parsed YAML manifests.
+/// Project-wide index of parsed YAML manifests, Helm charts, and Kustomize overlays.
 #[derive(Clone, Debug, Default)]
 pub struct ProjectIndex {
     pub built_at: Option<Instant>,
     pub files: BTreeMap<String, ParsedFile>,
+    /// Directories containing `Chart.yaml` or `Chart.yml`.
+    pub helm_chart_dirs: BTreeSet<String>,
+    /// Directories containing `kustomization.yaml`, `kustomization.yml`, or `Kustomization`.
+    pub kustomize_dirs: BTreeSet<String>,
+    /// Non-YAML or auxiliary Helm/Kustomize files (`NOTES.txt`, `.helmignore`, `Chart.lock`, `values.schema.json`, JSON patches).
+    pub extra_files: BTreeSet<String>,
 }
 
 /// One diagnosed issue and its optional quick fix.
@@ -96,30 +190,91 @@ pub const DEPRECATED_APIS: &[(&str, &str, &str)] = &[
     ("extensions/v1beta1", "ReplicaSet", "apps/v1"),
     ("apps/v1beta2", "ReplicaSet", "apps/v1"),
     ("extensions/v1beta1", "Ingress", "networking.k8s.io/v1"),
-    ("networking.k8s.io/v1beta1", "Ingress", "networking.k8s.io/v1"),
-    ("extensions/v1beta1", "NetworkPolicy", "networking.k8s.io/v1"),
+    (
+        "networking.k8s.io/v1beta1",
+        "Ingress",
+        "networking.k8s.io/v1",
+    ),
+    (
+        "extensions/v1beta1",
+        "NetworkPolicy",
+        "networking.k8s.io/v1",
+    ),
     ("batch/v1beta1", "CronJob", "batch/v1"),
     ("policy/v1beta1", "PodDisruptionBudget", "policy/v1"),
-    ("autoscaling/v2beta1", "HorizontalPodAutoscaler", "autoscaling/v2"),
-    ("autoscaling/v2beta2", "HorizontalPodAutoscaler", "autoscaling/v2"),
-    ("rbac.authorization.k8s.io/v1beta1", "Role", "rbac.authorization.k8s.io/v1"),
-    ("rbac.authorization.k8s.io/v1beta1", "ClusterRole", "rbac.authorization.k8s.io/v1"),
-    ("rbac.authorization.k8s.io/v1beta1", "RoleBinding", "rbac.authorization.k8s.io/v1"),
-    ("rbac.authorization.k8s.io/v1beta1", "ClusterRoleBinding", "rbac.authorization.k8s.io/v1"),
-    ("storage.k8s.io/v1beta1", "StorageClass", "storage.k8s.io/v1"),
-    ("apiextensions.k8s.io/v1beta1", "CustomResourceDefinition", "apiextensions.k8s.io/v1"),
+    (
+        "autoscaling/v2beta1",
+        "HorizontalPodAutoscaler",
+        "autoscaling/v2",
+    ),
+    (
+        "autoscaling/v2beta2",
+        "HorizontalPodAutoscaler",
+        "autoscaling/v2",
+    ),
+    (
+        "rbac.authorization.k8s.io/v1beta1",
+        "Role",
+        "rbac.authorization.k8s.io/v1",
+    ),
+    (
+        "rbac.authorization.k8s.io/v1beta1",
+        "ClusterRole",
+        "rbac.authorization.k8s.io/v1",
+    ),
+    (
+        "rbac.authorization.k8s.io/v1beta1",
+        "RoleBinding",
+        "rbac.authorization.k8s.io/v1",
+    ),
+    (
+        "rbac.authorization.k8s.io/v1beta1",
+        "ClusterRoleBinding",
+        "rbac.authorization.k8s.io/v1",
+    ),
+    (
+        "storage.k8s.io/v1beta1",
+        "StorageClass",
+        "storage.k8s.io/v1",
+    ),
+    (
+        "apiextensions.k8s.io/v1beta1",
+        "CustomResourceDefinition",
+        "apiextensions.k8s.io/v1",
+    ),
 ];
 
 pub const API_VERSIONS: &[(&str, &str)] = &[
-    ("v1", "Core Kubernetes API (Pod, Service, ConfigMap, Secret, Namespace, PVC)"),
-    ("apps/v1", "Workloads API (Deployment, StatefulSet, DaemonSet, ReplicaSet)"),
+    (
+        "v1",
+        "Core Kubernetes API (Pod, Service, ConfigMap, Secret, Namespace, PVC)",
+    ),
+    (
+        "apps/v1",
+        "Workloads API (Deployment, StatefulSet, DaemonSet, ReplicaSet)",
+    ),
     ("batch/v1", "Batch API (Job, CronJob)"),
-    ("networking.k8s.io/v1", "Networking API (Ingress, NetworkPolicy, IngressClass)"),
-    ("rbac.authorization.k8s.io/v1", "RBAC API (Role, ClusterRole, RoleBinding, ClusterRoleBinding)"),
-    ("autoscaling/v2", "Autoscaling API (HorizontalPodAutoscaler)"),
+    (
+        "networking.k8s.io/v1",
+        "Networking API (Ingress, NetworkPolicy, IngressClass)",
+    ),
+    (
+        "rbac.authorization.k8s.io/v1",
+        "RBAC API (Role, ClusterRole, RoleBinding, ClusterRoleBinding)",
+    ),
+    (
+        "autoscaling/v2",
+        "Autoscaling API (HorizontalPodAutoscaler)",
+    ),
     ("policy/v1", "Policy API (PodDisruptionBudget)"),
-    ("storage.k8s.io/v1", "Storage API (StorageClass, VolumeAttachment, CSIDriver)"),
-    ("apiextensions.k8s.io/v1", "CRD API (CustomResourceDefinition)"),
+    (
+        "storage.k8s.io/v1",
+        "Storage API (StorageClass, VolumeAttachment, CSIDriver)",
+    ),
+    (
+        "apiextensions.k8s.io/v1",
+        "CRD API (CustomResourceDefinition)",
+    ),
     ("kustomize.config.k8s.io/v1beta1", "Kustomize configuration"),
 ];
 
@@ -129,24 +284,63 @@ pub const KINDS: &[(&str, &str)] = &[
     ("ConfigMap", "v1 — Non-confidential configuration data"),
     ("Secret", "v1 — Sensitive configuration data"),
     ("Pod", "v1 — Smallest deployable compute unit"),
-    ("StatefulSet", "apps/v1 — Stateful workload with stable identity"),
+    (
+        "StatefulSet",
+        "apps/v1 — Stateful workload with stable identity",
+    ),
     ("DaemonSet", "apps/v1 — Node-local background workload"),
     ("Job", "batch/v1 — Run-to-completion task"),
     ("CronJob", "batch/v1 — Scheduled Job"),
-    ("Ingress", "networking.k8s.io/v1 — HTTP/HTTPS routing to Services"),
-    ("NetworkPolicy", "networking.k8s.io/v1 — Pod network isolation policy"),
-    ("PersistentVolumeClaim", "v1 — Storage request bound to a PV"),
+    (
+        "Ingress",
+        "networking.k8s.io/v1 — HTTP/HTTPS routing to Services",
+    ),
+    (
+        "NetworkPolicy",
+        "networking.k8s.io/v1 — Pod network isolation policy",
+    ),
+    (
+        "PersistentVolumeClaim",
+        "v1 — Storage request bound to a PV",
+    ),
     ("PersistentVolume", "v1 — Cluster storage volume"),
-    ("ServiceAccount", "v1 — Pod identity for cluster authentication"),
-    ("Role", "rbac.authorization.k8s.io/v1 — Namespaced RBAC permissions"),
-    ("ClusterRole", "rbac.authorization.k8s.io/v1 — Cluster-wide RBAC permissions"),
-    ("RoleBinding", "rbac.authorization.k8s.io/v1 — Binds a Role to subjects"),
-    ("ClusterRoleBinding", "rbac.authorization.k8s.io/v1 — Binds a ClusterRole cluster-wide"),
+    (
+        "ServiceAccount",
+        "v1 — Pod identity for cluster authentication",
+    ),
+    (
+        "Role",
+        "rbac.authorization.k8s.io/v1 — Namespaced RBAC permissions",
+    ),
+    (
+        "ClusterRole",
+        "rbac.authorization.k8s.io/v1 — Cluster-wide RBAC permissions",
+    ),
+    (
+        "RoleBinding",
+        "rbac.authorization.k8s.io/v1 — Binds a Role to subjects",
+    ),
+    (
+        "ClusterRoleBinding",
+        "rbac.authorization.k8s.io/v1 — Binds a ClusterRole cluster-wide",
+    ),
     ("Namespace", "v1 — Virtual cluster partition"),
-    ("HorizontalPodAutoscaler", "autoscaling/v2 — Automatic replica scaling"),
-    ("PodDisruptionBudget", "policy/v1 — Voluntary disruption budget"),
-    ("StorageClass", "storage.k8s.io/v1 — Dynamic volume provisioning profile"),
-    ("Kustomization", "kustomize.config.k8s.io/v1beta1 — Kustomize overlay manifest"),
+    (
+        "HorizontalPodAutoscaler",
+        "autoscaling/v2 — Automatic replica scaling",
+    ),
+    (
+        "PodDisruptionBudget",
+        "policy/v1 — Voluntary disruption budget",
+    ),
+    (
+        "StorageClass",
+        "storage.k8s.io/v1 — Dynamic volume provisioning profile",
+    ),
+    (
+        "Kustomization",
+        "kustomize.config.k8s.io/v1beta1 — Kustomize overlay manifest",
+    ),
 ];
 
 pub fn project_of(path: &str) -> Option<Project> {
@@ -154,7 +348,10 @@ pub fn project_of(path: &str) -> Option<Project> {
     host::projects()
         .ok()?
         .into_iter()
-        .filter(|p| p.root().is_ok_and(|r| norm.starts_with(&normalize_slashes(&r))))
+        .filter(|p| {
+            p.root()
+                .is_ok_and(|r| norm.starts_with(&normalize_slashes(&r)))
+        })
         .max_by_key(|p| p.root().map(|r| r.len()).unwrap_or(0))
 }
 
@@ -184,16 +381,102 @@ pub fn join_relative(base_dir: &str, rel: &str) -> String {
             s => parts.push(s),
         }
     }
-    if leading_slash { format!("/{}", parts.join("/")) } else { parts.join("/") }
+    if leading_slash {
+        format!("/{}", parts.join("/"))
+    } else {
+        parts.join("/")
+    }
 }
 
 impl ProjectIndex {
+    /// Clears TTL so the next `ensure` performs a fresh project scan.
+    pub fn invalidate(&mut self) {
+        self.built_at = None;
+    }
+
+    fn record_special_marker_path(&mut self, norm: &str) {
+        let fname = norm.rsplit('/').next().unwrap_or(norm);
+        if matches!(fname, "Chart.yaml" | "Chart.yml") {
+            let dir = parent_dir(norm);
+            if !dir.is_empty() {
+                self.helm_chart_dirs.insert(dir);
+            }
+        } else if matches!(
+            fname,
+            "kustomization.yaml" | "kustomization.yml" | "Kustomization"
+        ) {
+            let dir = parent_dir(norm);
+            if !dir.is_empty() {
+                self.kustomize_dirs.insert(dir);
+            }
+        }
+    }
+
     /// Builds or refreshes the YAML index for `project`, always overlaying `current_doc` if provided.
     pub fn ensure(&mut self, project: Option<&Project>, current_doc: Option<(&str, &str)>) {
         let fresh = self.built_at.is_some_and(|t| t.elapsed() < INDEX_TTL);
         if !fresh && let Some(proj) = project {
             let started = Instant::now();
+            let proj_root = proj
+                .root()
+                .ok()
+                .map(|r| normalize_slashes(&r).trim_end_matches('/').to_owned());
+            let belongs_to_proj = |p: &str| {
+                proj_root
+                    .as_ref()
+                    .is_some_and(|r| p == r || p.starts_with(&format!("{r}/")))
+            };
+
             let mut files = std::mem::take(&mut self.files);
+            files.retain(|k, _| !belongs_to_proj(k));
+            self.helm_chart_dirs.retain(|d| !belongs_to_proj(d));
+            self.kustomize_dirs.retain(|d| !belongs_to_proj(d));
+            self.extra_files.retain(|p| !belongs_to_proj(p));
+
+            // 1. Always discover Helm chart roots (`Chart.yaml`), Kustomize roots (`kustomization.yaml`),
+            // and auxiliary Helm files first so chart/overlay directory context is complete even in large repos.
+            for pat in [
+                "**/Chart.yaml",
+                "**/Chart.yml",
+                "**/kustomization.yaml",
+                "**/kustomization.yml",
+                "**/Kustomization",
+            ] {
+                if let Ok(paths) = proj.find_files(pat, MAX_MARKER_FILES) {
+                    for p in paths {
+                        if is_excluded_workspace_dir(&p) {
+                            continue;
+                        }
+                        let norm = normalize_slashes(&p);
+                        self.record_special_marker_path(&norm);
+                        if let Ok(text) = proj.read_file(&p)
+                            && text.len() <= MAX_INDEX_FILE_BYTES
+                        {
+                            files.insert(norm, parse_yaml(&text));
+                        }
+                    }
+                }
+            }
+
+            for pat in [
+                "**/Chart.lock",
+                "**/requirements.lock",
+                "**/.helmignore",
+                "**/NOTES.txt",
+                "**/values.schema.json",
+                "**/*.kubeconfig",
+                "**/kubeconfig",
+            ] {
+                if let Ok(paths) = proj.find_files(pat, MAX_MARKER_FILES) {
+                    for p in paths {
+                        if !is_excluded_workspace_dir(&p) {
+                            self.extra_files.insert(normalize_slashes(&p));
+                        }
+                    }
+                }
+            }
+
+            // 2. Index YAML and `.tpl` files across the workspace (including files inside Helm `templates/`).
             'outer: for pat in ["**/*.yaml", "**/*.yml", "**/*.tpl"] {
                 if started.elapsed() >= MAX_INDEX_SCAN_TIME {
                     break;
@@ -206,18 +489,44 @@ impl ProjectIndex {
                         if is_excluded_yaml_path(&p) {
                             continue;
                         }
+                        let norm = normalize_slashes(&p);
+                        if files.contains_key(&norm) {
+                            continue;
+                        }
+                        let dir = parent_dir(&norm);
+                        let in_helm_chart = self
+                            .helm_chart_dirs
+                            .iter()
+                            .any(|c| dir == *c || dir.starts_with(&format!("{c}/")));
+                        let in_kustomize_dir = self
+                            .kustomize_dirs
+                            .iter()
+                            .any(|k| dir == *k || dir.starts_with(&format!("{k}/")));
+                        if norm.ends_with(".tpl") {
+                            self.extra_files.insert(norm.clone());
+                        }
                         if let Ok(text) = proj.read_file(&p) {
-                            if !is_likely_kube_or_helm_file(&p, &text) {
+                            if !in_helm_chart
+                                && !in_kustomize_dir
+                                && !is_likely_kube_or_helm_file(&norm, &text)
+                            {
+                                continue;
+                            }
+                            if text.len() > MAX_INDEX_FILE_BYTES {
                                 continue;
                             }
                             let parsed = parse_yaml(&text);
-                            if !parsed.docs.is_empty()
+                            if in_helm_chart
+                                || in_kustomize_dir
+                                || !parsed.docs.is_empty()
                                 || !parsed.helm_values.is_empty()
                                 || !parsed.helm_value_refs.is_empty()
                                 || !parsed.helm_template_defs.is_empty()
                                 || !parsed.helm_template_refs.is_empty()
+                                || parsed.has_helm_directives
+                                || parsed.has_json6902_ops
                             {
-                                files.insert(normalize_slashes(&p), parsed);
+                                files.insert(norm, parsed);
                             }
                         }
                     }
@@ -231,11 +540,28 @@ impl ProjectIndex {
             && text.len() <= MAX_INDEX_FILE_BYTES
         {
             let norm = normalize_slashes(path);
+            self.record_special_marker_path(&norm);
             self.files.insert(norm.clone(), parse_yaml(text));
             // Also opportunistically index adjacent Helm chart files (`../values.yaml`, `_helpers.tpl`) by direct path
             if let Some(proj) = project {
                 let dir = parent_dir(&norm);
-                let chart_root = if dir.ends_with("/templates") { parent_dir(&dir) } else { dir.clone() };
+                let chart_root = if dir.ends_with("/templates") {
+                    parent_dir(&dir)
+                } else {
+                    dir.clone()
+                };
+                for chart_marker in [
+                    format!("{chart_root}/Chart.yaml"),
+                    format!("{chart_root}/Chart.yml"),
+                ] {
+                    if !self.files.contains_key(&chart_marker)
+                        && let Ok(ctext) = proj.read_file(&chart_marker)
+                        && ctext.len() <= MAX_INDEX_FILE_BYTES
+                    {
+                        self.record_special_marker_path(&chart_marker);
+                        self.files.insert(chart_marker, parse_yaml(&ctext));
+                    }
+                }
                 for candidate in [
                     format!("{chart_root}/values.yaml"),
                     format!("{chart_root}/values.yml"),
@@ -253,12 +579,304 @@ impl ProjectIndex {
     }
 
     pub fn update_file(&mut self, path: &str, text: &str) {
-        self.files.insert(normalize_slashes(path), parse_yaml(text));
+        let norm = normalize_slashes(path);
+        self.record_special_marker_path(&norm);
+        self.files.insert(norm, parse_yaml(text));
+    }
+
+    /// Deepest Helm chart root directory (`Chart.yaml` / `Chart.yml`) containing `path`, if any.
+    pub fn enclosing_helm_chart_dir<'a>(&'a self, path: &str) -> Option<&'a str> {
+        let dir = parent_dir(path);
+        self.helm_chart_dirs
+            .iter()
+            .filter(|c| dir == **c || dir.starts_with(&format!("{c}/")))
+            .max_by_key(|c| c.len())
+            .map(String::as_str)
+    }
+
+    fn is_kustomization_root_file(path: &str, parsed: Option<&ParsedFile>) -> bool {
+        let fname = path.rsplit('/').next().unwrap_or(path);
+        if matches!(
+            fname,
+            "kustomization.yaml" | "kustomization.yml" | "Kustomization"
+        ) {
+            return true;
+        }
+        parsed.is_some_and(|p| {
+            !p.marked_non_k8s
+                && p.docs.iter().any(|d| {
+                    d.api_version
+                        .as_ref()
+                        .is_some_and(|a| a.value.starts_with("kustomize.config.k8s.io/"))
+                        && d.kind.as_ref().is_some_and(|k| {
+                            matches!(k.value.as_str(), "Kustomization" | "Component")
+                        })
+                })
+        })
+    }
+
+    fn collect_kustomize_targets(&self) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+        let mut patch_files = BTreeSet::new();
+        let mut helm_value_files = BTreeSet::new();
+        let mut component_dirs = BTreeSet::new();
+        let is_remote = |v: &str| {
+            v.starts_with("http://")
+                || v.starts_with("https://")
+                || v.starts_with("ssh://")
+                || v.starts_with("git::")
+                || v.starts_with("oci://")
+        };
+        for (kpath, parsed) in &self.files {
+            if !Self::is_kustomization_root_file(kpath, Some(parsed)) {
+                continue;
+            }
+            let base = parent_dir(kpath);
+            for doc in &parsed.docs {
+                for sp in &doc.kustomize_patch_paths {
+                    if !is_remote(&sp.value) {
+                        patch_files.insert(join_relative(&base, &sp.value));
+                    }
+                }
+                for sp in &doc.kustomize_helm_values {
+                    if !is_remote(&sp.value) {
+                        helm_value_files.insert(join_relative(&base, &sp.value));
+                    }
+                }
+                for sp in &doc.kustomize_component_dirs {
+                    if !is_remote(&sp.value) {
+                        let resolved = join_relative(&base, &sp.value);
+                        if !self.files.contains_key(&resolved) {
+                            component_dirs.insert(resolved);
+                        }
+                    }
+                }
+            }
+        }
+        (patch_files, helm_value_files, component_dirs)
+    }
+
+    /// Classifies a single file path into its Kubernetes / Helm / Kustomize icon kind.
+    pub fn classify_file_icon(&self, path: &str) -> Option<KubeFileIcon> {
+        let (patch_files, helm_value_files, component_dirs) = self.collect_kustomize_targets();
+        let norm = normalize_slashes(path);
+        self.classify_file_icon_with(
+            &norm,
+            self.files.get(&norm),
+            &patch_files,
+            &helm_value_files,
+            &component_dirs,
+        )
+    }
+
+    fn classify_file_icon_with(
+        &self,
+        norm: &str,
+        parsed: Option<&ParsedFile>,
+        kustomize_patch_files: &BTreeSet<String>,
+        kustomize_helm_value_files: &BTreeSet<String>,
+        kustomize_component_dirs: &BTreeSet<String>,
+    ) -> Option<KubeFileIcon> {
+        if is_excluded_workspace_dir(norm) {
+            return None;
+        }
+        let fname = norm.rsplit('/').next().unwrap_or(norm);
+        if matches!(
+            fname,
+            "pnpm-lock.yaml"
+                | "yarn.lock"
+                | "package-lock.json"
+                | "pubspec.lock"
+                | "docker-compose.yml"
+                | "docker-compose.yaml"
+                | "compose.yml"
+                | "compose.yaml"
+        ) || fname.ends_with("-lock.yaml")
+            || fname.ends_with(".lock.yaml")
+        {
+            return None;
+        }
+
+        let dir = parent_dir(norm);
+
+        // 1. Inside a Helm chart directory (`Chart.yaml` / `Chart.yml`)
+        if let Some(chart_root) = self.enclosing_helm_chart_dir(norm) {
+            if dir == chart_root
+                && matches!(
+                    fname,
+                    "Chart.yaml"
+                        | "Chart.yml"
+                        | "Chart.lock"
+                        | "requirements.yaml"
+                        | "requirements.yml"
+                        | "requirements.lock"
+                )
+            {
+                return Some(KubeFileIcon::HelmChart);
+            }
+            if fname == ".helmignore" || fname.ends_with(".tpl") {
+                return Some(KubeFileIcon::HelmTemplate);
+            }
+            let templates_dir = format!("{chart_root}/templates");
+            if dir == templates_dir || dir.starts_with(&format!("{templates_dir}/")) {
+                if is_yaml_filename(fname)
+                    || fname.ends_with(".tpl")
+                    || fname.ends_with(".json")
+                    || fname == "NOTES.txt"
+                {
+                    return Some(KubeFileIcon::HelmTemplate);
+                }
+                return None;
+            }
+            if is_helm_values_filename(fname)
+                || (dir == format!("{chart_root}/ci") && is_yaml_filename(fname))
+                || kustomize_helm_value_files.contains(norm)
+            {
+                return Some(KubeFileIcon::HelmValues);
+            }
+            if parsed.is_some_and(|p| !p.marked_non_k8s && p.has_helm_directives) {
+                return Some(KubeFileIcon::HelmTemplate);
+            }
+        }
+
+        // 2. Standalone Helm files (outside a `Chart.yaml` directory, e.g. `helmfile.yaml`, `*.tpl`, `values.yaml`)
+        if matches!(
+            fname,
+            "Chart.yaml"
+                | "Chart.yml"
+                | "Chart.lock"
+                | "requirements.lock"
+                | "helmfile.yaml"
+                | "helmfile.yml"
+        ) || fname.ends_with(".helmfile.yaml")
+            || fname.ends_with(".helmfile.yml")
+            || (dir.ends_with("/helmfile.d") && is_yaml_filename(fname))
+        {
+            return Some(KubeFileIcon::HelmChart);
+        }
+        if fname == ".helmignore"
+            || fname.ends_with(".tpl")
+            || fname.ends_with(".helm.yaml")
+            || fname.ends_with(".helm.yml")
+        {
+            return Some(KubeFileIcon::HelmTemplate);
+        }
+        if is_helm_values_filename(fname) || kustomize_helm_value_files.contains(norm) {
+            return Some(KubeFileIcon::HelmValues);
+        }
+        if parsed.is_some_and(|p| !p.marked_non_k8s && p.has_helm_directives) {
+            return Some(KubeFileIcon::HelmTemplate);
+        }
+
+        // 3. Kustomize root, component, patch, generator, transformer, and replacement files
+        if Self::is_kustomization_root_file(norm, parsed) {
+            return Some(KubeFileIcon::Kustomize);
+        }
+        if kustomize_patch_files.contains(norm)
+            && (is_yaml_filename(fname) || fname.ends_with(".json"))
+        {
+            return Some(KubeFileIcon::KustomizePatch);
+        }
+        if fname.ends_with(".kustomize.yaml") || fname.ends_with(".kustomize.yml") {
+            return Some(KubeFileIcon::KustomizePatch);
+        }
+        if let Some(p) = parsed.filter(|p| !p.marked_non_k8s) {
+            if p.docs.iter().any(|d| {
+                d.api_version.as_ref().is_some_and(|a| {
+                    a.value == "builtin"
+                        || a.value.ends_with(".kustomize.config.k8s.io")
+                        || a.value.contains(".kustomize.config.k8s.io/")
+                })
+            }) {
+                return Some(KubeFileIcon::KustomizePatch);
+            }
+            let in_kustomize_tree = self
+                .kustomize_dirs
+                .iter()
+                .chain(kustomize_component_dirs.iter())
+                .any(|kd| dir == *kd || dir.starts_with(&format!("{kd}/")));
+            if in_kustomize_tree && p.has_json6902_ops {
+                return Some(KubeFileIcon::KustomizePatch);
+            }
+        }
+
+        // 4. Standard Kubernetes resource manifests (`apiVersion` + `kind`), `*.k8s.yaml`, and `kubeconfig`
+        if fname.ends_with(".k8s.yaml")
+            || fname.ends_with(".k8s.yml")
+            || fname == "kubeconfig"
+            || fname.ends_with(".kubeconfig")
+        {
+            return Some(KubeFileIcon::Kubernetes);
+        }
+        if let Some(p) = parsed.filter(|p| !p.marked_non_k8s)
+            && p.docs.iter().any(|d| {
+                d.api_version
+                    .as_ref()
+                    .is_some_and(|a| !a.value.is_empty() && !a.value.starts_with("backstage.io/"))
+                    && d.kind.as_ref().is_some_and(|k| !k.value.is_empty())
+            })
+        {
+            return Some(KubeFileIcon::Kubernetes);
+        }
+
+        None
+    }
+
+    /// Computes all `(path, KubeFileIcon)` folder and file entries for `project_root` (or all indexed paths when `None`).
+    pub fn compute_workspace_icons(
+        &self,
+        project_root: Option<&str>,
+    ) -> Vec<(String, KubeFileIcon)> {
+        let norm_root = project_root.map(|r| normalize_slashes(r).trim_end_matches('/').to_owned());
+        let in_scope = |p: &str| match norm_root.as_deref() {
+            Some(r) if !r.is_empty() => p == r || p.starts_with(&format!("{r}/")),
+            _ => true,
+        };
+
+        let (patch_files, helm_value_files, component_dirs) = self.collect_kustomize_targets();
+        let mut out: BTreeMap<String, KubeFileIcon> = BTreeMap::new();
+
+        for dir in &self.helm_chart_dirs {
+            if in_scope(dir) {
+                out.insert(dir.clone(), KubeFileIcon::HelmChartDir);
+            }
+        }
+        for dir in self.kustomize_dirs.iter().chain(component_dirs.iter()) {
+            if in_scope(dir) && !self.helm_chart_dirs.contains(dir) {
+                out.insert(dir.clone(), KubeFileIcon::KustomizeDir);
+            }
+        }
+
+        let mut all_paths: BTreeSet<&str> = self.files.keys().map(String::as_str).collect();
+        for extra in &self.extra_files {
+            all_paths.insert(extra.as_str());
+        }
+        for p in patch_files.iter().chain(helm_value_files.iter()) {
+            all_paths.insert(p.as_str());
+        }
+
+        for path in all_paths {
+            if !in_scope(path) {
+                continue;
+            }
+            if let Some(icon) = self.classify_file_icon_with(
+                path,
+                self.files.get(path),
+                &patch_files,
+                &helm_value_files,
+                &component_dirs,
+            ) {
+                out.insert(path.to_owned(), icon);
+            }
+        }
+
+        out.into_iter().collect()
     }
 
     /// Iterates over every `(file_path, &KubeDoc)` in the workspace.
     pub fn all_docs(&self) -> impl Iterator<Item = (&str, &KubeDoc)> {
-        self.files.iter().flat_map(|(path, parsed)| parsed.docs.iter().map(move |d| (path.as_str(), d)))
+        self.files
+            .iter()
+            .flat_map(|(path, parsed)| parsed.docs.iter().map(move |d| (path.as_str(), d)))
     }
 
     /// Finds resources of `kind` and `name`.
@@ -289,7 +907,10 @@ impl ProjectIndex {
                 continue;
             }
             let target = doc.target_labels();
-            if selector_labels.iter().all(|(k, v)| target.get(k).is_some_and(|tv| tv.value == v.value)) {
+            if selector_labels
+                .iter()
+                .all(|(k, v)| target.get(k).is_some_and(|tv| tv.value == v.value))
+            {
                 let range = doc
                     .name
                     .as_ref()
@@ -310,10 +931,16 @@ impl ProjectIndex {
         }
         let mut out = Vec::new();
         for (path, doc) in self.all_docs() {
-            if doc.kind.as_ref().map(|k| k.value.as_str()) != Some("Service") || doc.selector_labels.is_empty() {
+            if doc.kind.as_ref().map(|k| k.value.as_str()) != Some("Service")
+                || doc.selector_labels.is_empty()
+            {
                 continue;
             }
-            if doc.selector_labels.iter().all(|(k, v)| target.get(k).is_some_and(|tv| tv.value == v.value)) {
+            if doc
+                .selector_labels
+                .iter()
+                .all(|(k, v)| target.get(k).is_some_and(|tv| tv.value == v.value))
+            {
                 let range = doc
                     .name
                     .as_ref()
@@ -331,7 +958,9 @@ impl ProjectIndex {
         let mut out = Vec::new();
         for (path, parsed) in &self.files {
             let file_name = path.rsplit('/').next().unwrap_or(path);
-            if (file_name == "values.yaml" || file_name == "values.yml" || file_name.starts_with("values."))
+            if (file_name == "values.yaml"
+                || file_name == "values.yml"
+                || file_name.starts_with("values."))
                 && let Some(sp) = parsed.helm_values.get(key_path)
             {
                 out.push((path.clone(), sp.range, sp.value.clone()));
@@ -389,7 +1018,10 @@ pub fn document_links(
             };
             links.push((
                 href.range,
-                Location { path: vpath, range: vrange },
+                Location {
+                    path: vpath,
+                    range: vrange,
+                },
                 format!("Go to Helm value ({detail})"),
                 "navigate",
             ));
@@ -402,7 +1034,10 @@ pub fn document_links(
             let fname = tpath.rsplit('/').next().unwrap_or(&tpath);
             links.push((
                 tref.range,
-                Location { path: tpath.clone(), range: trange },
+                Location {
+                    path: tpath.clone(),
+                    range: trange,
+                },
                 format!("Go to Helm template '{}' in {fname}", tref.value),
                 "navigate",
             ));
@@ -419,7 +1054,10 @@ pub fn document_links(
             for (crd_path, _, crd_range) in index.find_crd(kind) {
                 links.push((
                     kind_sp.range,
-                    Location { path: crd_path, range: crd_range },
+                    Location {
+                        path: crd_path,
+                        range: crd_range,
+                    },
                     format!("Go to CustomResourceDefinition '{kind}'"),
                     "implemented",
                 ));
@@ -438,7 +1076,10 @@ pub fn document_links(
                     .unwrap_or_default();
                 links.push((
                     kpath.range,
-                    Location { path: resolved, range: target_range },
+                    Location {
+                        path: resolved,
+                        range: target_range,
+                    },
                     format!("Go to Kustomize resource {}", kpath.value),
                     "navigate",
                 ));
@@ -454,7 +1095,10 @@ pub fn document_links(
                     let wname = wdoc.name.as_ref().map_or("unnamed", |n| n.value.as_str());
                     links.push((
                         sel_sp.range,
-                        Location { path: wpath.clone(), range: *wrange },
+                        Location {
+                            path: wpath.clone(),
+                            range: *wrange,
+                        },
                         format!("Go to matching {wkind} '{wname}'"),
                         "implemented",
                     ));
@@ -466,10 +1110,14 @@ pub fn document_links(
                         for c in &wdoc.containers {
                             for cp in &c.ports {
                                 if cp.value == tp.value {
-                                    let wname = wdoc.name.as_ref().map_or("workload", |n| n.value.as_str());
+                                    let wname =
+                                        wdoc.name.as_ref().map_or("workload", |n| n.value.as_str());
                                     links.push((
                                         tp.range,
-                                        Location { path: wpath.clone(), range: cp.range },
+                                        Location {
+                                            path: wpath.clone(),
+                                            range: cp.range,
+                                        },
                                         format!("Go to containerPort '{}' in {wname}", cp.value),
                                         "navigate",
                                     ));
@@ -489,7 +1137,10 @@ pub fn document_links(
                     let sname = sdoc.name.as_ref().map_or("Service", |n| n.value.as_str());
                     links.push((
                         name_sp.range,
-                        Location { path: spath, range: srange },
+                        Location {
+                            path: spath,
+                            range: srange,
+                        },
                         format!("Exposed by Service '{sname}'"),
                         "implementing",
                     ));
@@ -499,10 +1150,15 @@ pub fn document_links(
 
         // 5. ConfigMap / Secret references (and specific key references)
         for dref in &kdoc.data_refs {
-            for (tpath, tdoc, trange) in index.find_by_kind_and_name(dref.target_kind, &dref.name.value) {
+            for (tpath, tdoc, trange) in
+                index.find_by_kind_and_name(dref.target_kind, &dref.name.value)
+            {
                 links.push((
                     dref.name.range,
-                    Location { path: tpath.clone(), range: trange },
+                    Location {
+                        path: tpath.clone(),
+                        range: trange,
+                    },
                     format!("Go to {} '{}'", dref.target_kind, dref.name.value),
                     "navigate",
                 ));
@@ -511,8 +1167,14 @@ pub fn document_links(
                 {
                     links.push((
                         key_sp.range,
-                        Location { path: tpath.clone(), range: target_key.range },
-                        format!("Go to key '{}' in {} '{}'", key_sp.value, dref.target_kind, dref.name.value),
+                        Location {
+                            path: tpath.clone(),
+                            range: target_key.range,
+                        },
+                        format!(
+                            "Go to key '{}' in {} '{}'",
+                            key_sp.value, dref.target_kind, dref.name.value
+                        ),
                         "navigate",
                     ));
                 }
@@ -524,7 +1186,10 @@ pub fn document_links(
             for (tpath, _, trange) in index.find_by_kind_and_name("ServiceAccount", &saref.value) {
                 links.push((
                     saref.range,
-                    Location { path: tpath, range: trange },
+                    Location {
+                        path: tpath,
+                        range: trange,
+                    },
                     format!("Go to ServiceAccount '{}'", saref.value),
                     "navigate",
                 ));
@@ -533,10 +1198,15 @@ pub fn document_links(
 
         // 7. PVC claimName references
         for pvcref in &kdoc.pvc_refs {
-            for (tpath, _, trange) in index.find_by_kind_and_name("PersistentVolumeClaim", &pvcref.value) {
+            for (tpath, _, trange) in
+                index.find_by_kind_and_name("PersistentVolumeClaim", &pvcref.value)
+            {
                 links.push((
                     pvcref.range,
-                    Location { path: tpath, range: trange },
+                    Location {
+                        path: tpath,
+                        range: trange,
+                    },
                     format!("Go to PersistentVolumeClaim '{}'", pvcref.value),
                     "navigate",
                 ));
@@ -548,7 +1218,10 @@ pub fn document_links(
             for (tpath, _, trange) in index.find_by_kind_and_name("StorageClass", &scref.value) {
                 links.push((
                     scref.range,
-                    Location { path: tpath, range: trange },
+                    Location {
+                        path: tpath,
+                        range: trange,
+                    },
                     format!("Go to StorageClass '{}'", scref.value),
                     "navigate",
                 ));
@@ -560,7 +1233,10 @@ pub fn document_links(
             for (tpath, _, trange) in index.find_by_kind_and_name(rkind, &rname.value) {
                 links.push((
                     rname.range,
-                    Location { path: tpath, range: trange },
+                    Location {
+                        path: tpath,
+                        range: trange,
+                    },
                     format!("Go to {rkind} '{}'", rname.value),
                     "navigate",
                 ));
@@ -569,10 +1245,15 @@ pub fn document_links(
 
         // 10. Ingress backend Service & Port references
         for backend in &kdoc.ingress_backends {
-            for (spath, sdoc, srange) in index.find_by_kind_and_name("Service", &backend.service_name.value) {
+            for (spath, sdoc, srange) in
+                index.find_by_kind_and_name("Service", &backend.service_name.value)
+            {
                 links.push((
                     backend.service_name.range,
-                    Location { path: spath.clone(), range: srange },
+                    Location {
+                        path: spath.clone(),
+                        range: srange,
+                    },
                     format!("Go to Service '{}'", backend.service_name.value),
                     "navigate",
                 ));
@@ -583,8 +1264,14 @@ pub fn document_links(
                         {
                             links.push((
                                 pname.range,
-                                Location { path: spath.clone(), range: sn.range },
-                                format!("Go to port '{}' on Service '{}'", pname.value, backend.service_name.value),
+                                Location {
+                                    path: spath.clone(),
+                                    range: sn.range,
+                                },
+                                format!(
+                                    "Go to port '{}' on Service '{}'",
+                                    pname.value, backend.service_name.value
+                                ),
                                 "navigate",
                             ));
                         }
@@ -597,8 +1284,14 @@ pub fn document_links(
                         {
                             links.push((
                                 pnum.range,
-                                Location { path: spath.clone(), range: sn.range },
-                                format!("Go to port {} on Service '{}'", pnum.value, backend.service_name.value),
+                                Location {
+                                    path: spath.clone(),
+                                    range: sn.range,
+                                },
+                                format!(
+                                    "Go to port {} on Service '{}'",
+                                    pnum.value, backend.service_name.value
+                                ),
                                 "navigate",
                             ));
                         }
@@ -612,11 +1305,22 @@ pub fn document_links(
 }
 
 /// Provides `definition` locations at `at`.
-pub fn definitions_at(index: &ProjectIndex, doc: &Document, at: Position, parsed: &ParsedFile) -> Vec<Location> {
+pub fn definitions_at(
+    index: &ProjectIndex,
+    doc: &Document,
+    at: Position,
+    parsed: &ParsedFile,
+) -> Vec<Location> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for (range, loc, _, _) in document_links(index, &doc.path, parsed) {
-        if contains(range, at) && seen.insert((loc.path.clone(), loc.range.start.line, loc.range.start.character)) {
+        if contains(range, at)
+            && seen.insert((
+                loc.path.clone(),
+                loc.range.start.line,
+                loc.range.start.character,
+            ))
+        {
             out.push(loc);
         }
     }
@@ -624,15 +1328,21 @@ pub fn definitions_at(index: &ProjectIndex, doc: &Document, at: Position, parsed
 }
 
 /// Provides gutter `LineMarker` items for `doc`.
-pub fn line_markers_for(index: &ProjectIndex, doc: &Document, parsed: &ParsedFile) -> Vec<LineMarker> {
+pub fn line_markers_for(
+    index: &ProjectIndex,
+    doc: &Document,
+    parsed: &ParsedFile,
+) -> Vec<LineMarker> {
     let mut by_line: BTreeMap<u32, LineMarker> = BTreeMap::new();
     for (range, loc, tooltip, icon) in document_links(index, &doc.path, parsed) {
-        by_line.entry(range.start.line).or_insert_with(|| LineMarker {
-            line: range.start.line,
-            icon: Some(icon.to_owned()),
-            tooltip,
-            target: Some(loc),
-        });
+        by_line
+            .entry(range.start.line)
+            .or_insert_with(|| LineMarker {
+                line: range.start.line,
+                icon: Some(icon.to_owned()),
+                tooltip,
+                target: Some(loc),
+            });
     }
     by_line.into_values().collect()
 }
@@ -654,10 +1364,21 @@ pub fn diag_with_source(
 }
 
 pub fn quickfix(title: impl Into<String>, edits: Vec<(String, Vec<TextEdit>)>) -> CodeAction {
-    CodeAction { title: title.into(), kind: Some("quickfix".into()), preferred: true, edits, data: None }
+    CodeAction {
+        title: title.into(),
+        kind: Some("quickfix".into()),
+        preferred: true,
+        edits,
+        data: None,
+    }
 }
 
-pub fn snippet_item(label: &str, insert_text: impl Into<String>, replace: Range, detail: &str) -> CompletionItem {
+pub fn snippet_item(
+    label: &str,
+    insert_text: impl Into<String>,
+    replace: Range,
+    detail: &str,
+) -> CompletionItem {
     CompletionItem {
         label: label.to_owned(),
         detail: Some(detail.to_owned()),
@@ -696,14 +1417,19 @@ pub fn inspect_document(
             continue;
         }
         let kind = kdoc.kind.as_ref().map(|k| k.value.as_str()).unwrap_or("");
-        let api = kdoc.api_version.as_ref().map(|a| a.value.as_str()).unwrap_or("");
+        let api = kdoc
+            .api_version
+            .as_ref()
+            .map(|a| a.value.as_str())
+            .unwrap_or("");
 
         // 1. Deprecated apiVersion check + Quick Fix
         if let Some(ref api_sp) = kdoc.api_version {
             for &(old_api, target_kind, replacement_api) in DEPRECATED_APIS {
                 if api == old_api && (kind == target_kind || kind.is_empty()) {
-                    let message =
-                        format!("Deprecated apiVersion '{old_api}' for {target_kind}; use '{replacement_api}' instead");
+                    let message = format!(
+                        "Deprecated apiVersion '{old_api}' for {target_kind}; use '{replacement_api}' instead"
+                    );
                     let diag = diag_with_source(
                         api_sp.range,
                         Severity::Warning,
@@ -717,10 +1443,16 @@ pub fn inspect_document(
                         format!("Kubernetes: Upgrade apiVersion to {replacement_api}"),
                         vec![(
                             doc_path.to_owned(),
-                            vec![TextEdit { range: api_sp.range, text: replacement_api.to_owned() }],
+                            vec![TextEdit {
+                                range: api_sp.range,
+                                text: replacement_api.to_owned(),
+                            }],
                         )],
                     );
-                    issues.push(InspectionIssue { diagnostic: diag, fix: Some(fix) });
+                    issues.push(InspectionIssue {
+                        diagnostic: diag,
+                        fix: Some(fix),
+                    });
                 }
             }
         }
@@ -751,16 +1483,31 @@ pub fn inspect_document(
             };
             let fix = quickfix(
                 "Kubernetes: Add metadata.name",
-                vec![(doc_path.to_owned(), vec![TextEdit { range: Range::new(edit_pos, edit_pos), text: snippet }])],
+                vec![(
+                    doc_path.to_owned(),
+                    vec![TextEdit {
+                        range: Range::new(edit_pos, edit_pos),
+                        text: snippet,
+                    }],
+                )],
             );
-            issues.push(InspectionIssue { diagnostic: diag, fix: Some(fix) });
+            issues.push(InspectionIssue {
+                diagnostic: diag,
+                fix: Some(fix),
+            });
         }
 
         // 3. Workload selector.matchLabels vs spec.template.metadata.labels mismatch
-        if matches!(kind, "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet") && !kdoc.selector_labels.is_empty()
+        if matches!(
+            kind,
+            "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet"
+        ) && !kdoc.selector_labels.is_empty()
         {
             for (sel_k, sel_v) in &kdoc.selector_labels {
-                let matches_pod = kdoc.pod_labels.get(sel_k).is_some_and(|pv| pv.value == sel_v.value);
+                let matches_pod = kdoc
+                    .pod_labels
+                    .get(sel_k)
+                    .is_some_and(|pv| pv.value == sel_v.value);
                 if !matches_pod {
                     let message = format!(
                         "Selector label '{sel_k}: {}' does not match 'spec.template.metadata.labels'",
@@ -778,10 +1525,16 @@ pub fn inspect_document(
 
                     let fix = if let Some(existing_pod_label) = kdoc.pod_labels.get(sel_k) {
                         Some(quickfix(
-                            format!("Kubernetes: Set template label '{sel_k}' to '{}'", sel_v.value),
+                            format!(
+                                "Kubernetes: Set template label '{sel_k}' to '{}'",
+                                sel_v.value
+                            ),
                             vec![(
                                 doc_path.to_owned(),
-                                vec![TextEdit { range: existing_pod_label.range, text: sel_v.value.clone() }],
+                                vec![TextEdit {
+                                    range: existing_pod_label.range,
+                                    text: sel_v.value.clone(),
+                                }],
                             )],
                         ))
                     } else if let (Some(labels_line), Some(labels_indent)) =
@@ -790,7 +1543,10 @@ pub fn inspect_document(
                         let pos = Position::new(labels_line + 1, 0);
                         let pad = " ".repeat(labels_indent + 2);
                         Some(quickfix(
-                            format!("Kubernetes: Add '{sel_k}: {}' to pod template labels", sel_v.value),
+                            format!(
+                                "Kubernetes: Add '{sel_k}: {}' to pod template labels",
+                                sel_v.value
+                            ),
                             vec![(
                                 doc_path.to_owned(),
                                 vec![TextEdit {
@@ -802,21 +1558,27 @@ pub fn inspect_document(
                     } else {
                         None
                     };
-                    issues.push(InspectionIssue { diagnostic: diag, fix });
+                    issues.push(InspectionIssue {
+                        diagnostic: diag,
+                        fix,
+                    });
                 }
             }
         }
 
         // 4. Container inspections: `:latest` / untagged image, missing resources, privileged container
         for container in &kdoc.containers {
-            let cname = container.name.as_ref().map_or("container", |n| n.value.as_str());
+            let cname = container
+                .name
+                .as_ref()
+                .map_or("container", |n| n.value.as_str());
             if warn_latest_tag
                 && let Some(ref img) = container.image
                 && !img.value.contains("{{")
             {
                 let last_segment = img.value.rsplit('/').next().unwrap_or(&img.value);
-                let is_latest_or_untagged =
-                    img.value.ends_with(":latest") || (!last_segment.contains(':') && !img.value.contains('@'));
+                let is_latest_or_untagged = img.value.ends_with(":latest")
+                    || (!last_segment.contains(':') && !img.value.contains('@'));
                 if is_latest_or_untagged {
                     let msg = format!(
                         "Container '{cname}' image '{}' uses ':latest' or omits an explicit version tag",
@@ -835,16 +1597,34 @@ pub fn inspect_document(
                     let pinned = format!("{base_img}:1.0.0");
                     let fix = quickfix(
                         format!("Kubernetes: Pin image version tag ({pinned})"),
-                        vec![(doc_path.to_owned(), vec![TextEdit { range: img.range, text: pinned }])],
+                        vec![(
+                            doc_path.to_owned(),
+                            vec![TextEdit {
+                                range: img.range,
+                                text: pinned,
+                            }],
+                        )],
                     );
-                    issues.push(InspectionIssue { diagnostic: diag, fix: Some(fix) });
+                    issues.push(InspectionIssue {
+                        diagnostic: diag,
+                        fix: Some(fix),
+                    });
                 }
             }
 
-            if warn_missing_resources && kdoc.is_workload() && (!container.has_limits || !container.has_requests) {
-                let anchor_range =
-                    container.name.as_ref().or(container.image.as_ref()).map(|s| s.range).unwrap_or_else(|| {
-                        let line_len = lines.get(container.header_line as usize).map_or(0, |l| utf16_len(l));
+            if warn_missing_resources
+                && kdoc.is_workload()
+                && (!container.has_limits || !container.has_requests)
+            {
+                let anchor_range = container
+                    .name
+                    .as_ref()
+                    .or(container.image.as_ref())
+                    .map(|s| s.range)
+                    .unwrap_or_else(|| {
+                        let line_len = lines
+                            .get(container.header_line as usize)
+                            .map_or(0, |l| utf16_len(l));
                         Range::new(
                             Position::new(container.header_line, 0),
                             Position::new(container.header_line, line_len),
@@ -853,7 +1633,9 @@ pub fn inspect_document(
                 let diag = diag_with_source(
                     anchor_range,
                     Severity::Warning,
-                    format!("Container '{cname}' is missing CPU/memory resource requests and limits"),
+                    format!(
+                        "Container '{cname}' is missing CPU/memory resource requests and limits"
+                    ),
                     "missing-resource-limits",
                     "kubernetes",
                     false,
@@ -871,17 +1653,30 @@ pub fn inspect_document(
                     } else {
                         Position::new(container.end_line, lines.last().map_or(0, |l| utf16_len(l)))
                     };
-                    let prefix = if (insert_line as usize) > lines.len() && !text.ends_with('\n') { "\n" } else { "" };
+                    let prefix = if (insert_line as usize) > lines.len() && !text.ends_with('\n') {
+                        "\n"
+                    } else {
+                        ""
+                    };
                     let fix = quickfix(
                         format!("Kubernetes: Add resource requests and limits to '{cname}'"),
                         vec![(
                             doc_path.to_owned(),
-                            vec![TextEdit { range: Range::new(pos, pos), text: format!("{prefix}{block}") }],
+                            vec![TextEdit {
+                                range: Range::new(pos, pos),
+                                text: format!("{prefix}{block}"),
+                            }],
                         )],
                     );
-                    issues.push(InspectionIssue { diagnostic: diag, fix: Some(fix) });
+                    issues.push(InspectionIssue {
+                        diagnostic: diag,
+                        fix: Some(fix),
+                    });
                 } else {
-                    issues.push(InspectionIssue { diagnostic: diag, fix: None });
+                    issues.push(InspectionIssue {
+                        diagnostic: diag,
+                        fix: None,
+                    });
                 }
             }
 
@@ -891,7 +1686,9 @@ pub fn inspect_document(
                 let diag = diag_with_source(
                     priv_sp.range,
                     Severity::Warning,
-                    format!("Container '{cname}' runs in privileged mode (securityContext.privileged: true)"),
+                    format!(
+                        "Container '{cname}' runs in privileged mode (securityContext.privileged: true)"
+                    ),
                     "privileged-container",
                     "kubernetes",
                     false,
@@ -899,9 +1696,18 @@ pub fn inspect_document(
                 );
                 let fix = quickfix(
                     "Kubernetes: Set privileged to false",
-                    vec![(doc_path.to_owned(), vec![TextEdit { range: priv_sp.range, text: "false".into() }])],
+                    vec![(
+                        doc_path.to_owned(),
+                        vec![TextEdit {
+                            range: priv_sp.range,
+                            text: "false".into(),
+                        }],
+                    )],
                 );
-                issues.push(InspectionIssue { diagnostic: diag, fix: Some(fix) });
+                issues.push(InspectionIssue {
+                    diagnostic: diag,
+                    fix: Some(fix),
+                });
             }
         }
 
@@ -929,7 +1735,9 @@ pub fn inspect_document(
                             false,
                         );
 
-                        let fix = if let (Some(data_indent), Some(data_end)) = (tdoc.data_indent, tdoc.data_end_line) {
+                        let fix = if let (Some(data_indent), Some(data_end)) =
+                            (tdoc.data_indent, tdoc.data_end_line)
+                        {
                             let pad = " ".repeat(data_indent + 2);
                             let pos = Position::new(data_end + 1, 0);
                             Some(quickfix(
@@ -948,7 +1756,10 @@ pub fn inspect_document(
                         } else {
                             None
                         };
-                        issues.push(InspectionIssue { diagnostic: diag, fix });
+                        issues.push(InspectionIssue {
+                            diagnostic: diag,
+                            fix,
+                        });
                     }
                 }
             } else if targets.is_empty() && (parsed.docs.len() > 1 || has_multiple_manifest_files) {
@@ -964,7 +1775,10 @@ pub fn inspect_document(
                     false,
                     false,
                 );
-                issues.push(InspectionIssue { diagnostic: diag, fix: None });
+                issues.push(InspectionIssue {
+                    diagnostic: diag,
+                    fix: None,
+                });
             }
         }
 
@@ -973,19 +1787,33 @@ pub fn inspect_document(
             let diag = diag_with_source(
                 *dup_range,
                 Severity::Error,
-                format!("Duplicate YAML key '{dup_key}' (first defined on line {})", first_line + 1),
+                format!(
+                    "Duplicate YAML key '{dup_key}' (first defined on line {})",
+                    first_line + 1
+                ),
                 "duplicate-yaml-key",
                 "kubernetes",
                 false,
                 false,
             );
-            let remove_range =
-                Range::new(Position::new(dup_range.start.line, 0), Position::new(dup_range.start.line + 1, 0));
+            let remove_range = Range::new(
+                Position::new(dup_range.start.line, 0),
+                Position::new(dup_range.start.line + 1, 0),
+            );
             let fix = quickfix(
                 format!("Kubernetes: Remove duplicate key '{dup_key}'"),
-                vec![(doc_path.to_owned(), vec![TextEdit { range: remove_range, text: String::new() }])],
+                vec![(
+                    doc_path.to_owned(),
+                    vec![TextEdit {
+                        range: remove_range,
+                        text: String::new(),
+                    }],
+                )],
             );
-            issues.push(InspectionIssue { diagnostic: diag, fix: Some(fix) });
+            issues.push(InspectionIssue {
+                diagnostic: diag,
+                fix: Some(fix),
+            });
         }
 
         // 7. Read-only / server-managed fields (`metadata.uid`, `metadata.resourceVersion`, `status`, etc.)
@@ -999,13 +1827,24 @@ pub fn inspect_document(
                 false,
                 true,
             );
-            let remove_range =
-                Range::new(Position::new(ro_range.start.line, 0), Position::new(ro_range.start.line + 1, 0));
+            let remove_range = Range::new(
+                Position::new(ro_range.start.line, 0),
+                Position::new(ro_range.start.line + 1, 0),
+            );
             let fix = quickfix(
                 format!("Kubernetes: Remove read-only field '{ro_path}'"),
-                vec![(doc_path.to_owned(), vec![TextEdit { range: remove_range, text: String::new() }])],
+                vec![(
+                    doc_path.to_owned(),
+                    vec![TextEdit {
+                        range: remove_range,
+                        text: String::new(),
+                    }],
+                )],
             );
-            issues.push(InspectionIssue { diagnostic: diag, fix: Some(fix) });
+            issues.push(InspectionIssue {
+                diagnostic: diag,
+                fix: Some(fix),
+            });
         }
 
         // 8. Deprecated fields (`bases`, `patchesStrategicMerge`, `commonLabels`, `spec.serviceAccount`)
@@ -1021,9 +1860,18 @@ pub fn inspect_document(
             );
             let fix = quickfix(
                 format!("Kubernetes: Replace '{dep_field}' with '{replacement}'"),
-                vec![(doc_path.to_owned(), vec![TextEdit { range: *dep_range, text: replacement.clone() }])],
+                vec![(
+                    doc_path.to_owned(),
+                    vec![TextEdit {
+                        range: *dep_range,
+                        text: replacement.clone(),
+                    }],
+                )],
             );
-            issues.push(InspectionIssue { diagnostic: diag, fix: Some(fix) });
+            issues.push(InspectionIssue {
+                diagnostic: diag,
+                fix: Some(fix),
+            });
         }
 
         // 9. Invalid enum values (`spec.type`, `imagePullPolicy`, `restartPolicy`, `pathType`)
@@ -1031,7 +1879,10 @@ pub fn inspect_document(
             let diag = diag_with_source(
                 *enum_range,
                 Severity::Error,
-                format!("Invalid value '{actual}' for '{enum_path}' (expected one of: {})", allowed.join(", ")),
+                format!(
+                    "Invalid value '{actual}' for '{enum_path}' (expected one of: {})",
+                    allowed.join(", ")
+                ),
                 "invalid-enum-value",
                 "kubernetes",
                 false,
@@ -1040,9 +1891,18 @@ pub fn inspect_document(
             let default_val = allowed[0];
             let fix = quickfix(
                 format!("Kubernetes: Change '{enum_path}' to '{default_val}'"),
-                vec![(doc_path.to_owned(), vec![TextEdit { range: *enum_range, text: default_val.to_owned() }])],
+                vec![(
+                    doc_path.to_owned(),
+                    vec![TextEdit {
+                        range: *enum_range,
+                        text: default_val.to_owned(),
+                    }],
+                )],
             );
-            issues.push(InspectionIssue { diagnostic: diag, fix: Some(fix) });
+            issues.push(InspectionIssue {
+                diagnostic: diag,
+                fix: Some(fix),
+            });
         }
 
         // 10. Kustomization missing local file path inspection
@@ -1056,18 +1916,27 @@ pub fn inspect_document(
                 }
                 let resolved = join_relative(&base_dir, &kpath.value);
                 let exists = index.files.contains_key(&resolved)
-                    || index.files.keys().any(|k| k.starts_with(&format!("{resolved}/")));
+                    || index
+                        .files
+                        .keys()
+                        .any(|k| k.starts_with(&format!("{resolved}/")));
                 if !exists {
                     let diag = diag_with_source(
                         kpath.range,
                         Severity::Warning,
-                        format!("Kustomize path '{}' does not match any manifest in the project", kpath.value),
+                        format!(
+                            "Kustomize path '{}' does not match any manifest in the project",
+                            kpath.value
+                        ),
                         "unresolved-kustomize-path",
                         "kubernetes",
                         false,
                         false,
                     );
-                    issues.push(InspectionIssue { diagnostic: diag, fix: None });
+                    issues.push(InspectionIssue {
+                        diagnostic: diag,
+                        fix: None,
+                    });
                 }
             }
         }
@@ -1084,18 +1953,29 @@ pub fn inspect_document(
             preferred: false,
             edits: vec![(
                 doc_path.to_owned(),
-                vec![TextEdit { range: Range::new(start, start), text: "# nonk8s\n".into() }],
+                vec![TextEdit {
+                    range: Range::new(start, start),
+                    text: "# nonk8s\n".into(),
+                }],
             )],
             data: None,
         };
-        issues.push(InspectionIssue { diagnostic: first.diagnostic.clone(), fix: Some(mark_non_k8s) });
+        issues.push(InspectionIssue {
+            diagnostic: first.diagnostic.clone(),
+            fix: Some(mark_non_k8s),
+        });
     }
 
     issues
 }
 
 /// Computes completions at `at` in `doc`.
-pub fn completions_at(index: &ProjectIndex, doc: &Document, at: Position, parsed: &ParsedFile) -> Vec<CompletionItem> {
+pub fn completions_at(
+    index: &ProjectIndex,
+    doc: &Document,
+    at: Position,
+    parsed: &ParsedFile,
+) -> Vec<CompletionItem> {
     let (parent_path, current_line, doc_kind) = yaml_context_at(&doc.text, at);
     let col_utf16 = at.character as usize;
     let units: Vec<u16> = current_line.encode_utf16().take(col_utf16).collect();
@@ -1104,7 +1984,10 @@ pub fn completions_at(index: &ProjectIndex, doc: &Document, at: Position, parsed
     let mut items = Vec::new();
 
     // 1. Helm template `{{ .Values.xxx }}` and `{{ include "xxx" . }}` completion
-    if let Some(idx) = line_prefix.rfind("include \"").or_else(|| line_prefix.rfind("template \"")) {
+    if let Some(idx) = line_prefix
+        .rfind("include \"")
+        .or_else(|| line_prefix.rfind("template \""))
+    {
         let quote_pos = line_prefix[idx..].find('"').unwrap_or(0) + idx + 1;
         let typed = &line_prefix[quote_pos..];
         if !typed.contains('"') {
@@ -1129,7 +2012,10 @@ pub fn completions_at(index: &ProjectIndex, doc: &Document, at: Position, parsed
 
     if let Some(idx) = line_prefix.rfind(".Values.") {
         let typed = &line_prefix[idx + ".Values.".len()..];
-        if typed.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')) {
+        if typed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        {
             let start_col = at.character.saturating_sub(utf16_len(typed));
             let replace = Range::new(Position::new(at.line, start_col), at);
             let mut seen = BTreeSet::new();
@@ -1159,11 +2045,18 @@ pub fn completions_at(index: &ProjectIndex, doc: &Document, at: Position, parsed
 
     // 2. Value completion after `key: `
     if let Some(colon_idx) = trimmed_prefix.find(':') {
-        let key = trimmed_prefix[..colon_idx].trim().trim_start_matches("- ").trim();
+        let key = trimmed_prefix[..colon_idx]
+            .trim()
+            .trim_start_matches("- ")
+            .trim();
         let raw_val = trimmed_prefix[colon_idx + 1..].trim_start();
         let start_col = at.character.saturating_sub(utf16_len(raw_val));
         let replace = Range::new(Position::new(at.line, start_col), at);
-        let full_key = if parent_path.is_empty() { key.to_owned() } else { format!("{parent_path}.{key}") };
+        let full_key = if parent_path.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{parent_path}.{key}")
+        };
 
         match full_key.as_str() {
             "apiVersion" => {
@@ -1195,7 +2088,9 @@ pub fn completions_at(index: &ProjectIndex, doc: &Document, at: Position, parsed
             }
             "kind" => {
                 for &(k, desc) in KINDS {
-                    if k.to_ascii_lowercase().starts_with(&raw_val.to_ascii_lowercase()) {
+                    if k.to_ascii_lowercase()
+                        .starts_with(&raw_val.to_ascii_lowercase())
+                    {
                         items.push(CompletionItem {
                             replace: Some(replace),
                             detail: Some(desc.into()),
@@ -1206,7 +2101,11 @@ pub fn completions_at(index: &ProjectIndex, doc: &Document, at: Position, parsed
                 for (path, kdoc) in index.all_docs() {
                     if let Some(ref crd) = kdoc.crd
                         && !crd.kind.value.is_empty()
-                        && crd.kind.value.to_ascii_lowercase().starts_with(&raw_val.to_ascii_lowercase())
+                        && crd
+                            .kind
+                            .value
+                            .to_ascii_lowercase()
+                            .starts_with(&raw_val.to_ascii_lowercase())
                     {
                         let fname = path.rsplit('/').next().unwrap_or(path);
                         items.push(CompletionItem {
@@ -1292,7 +2191,11 @@ pub fn completions_at(index: &ProjectIndex, doc: &Document, at: Position, parsed
 
         // ConfigMap / Secret `key:` completion based on the referenced ConfigMap/Secret in the current doc
         if full_key.ends_with("configMapKeyRef.key") || full_key.ends_with("secretKeyRef.key") {
-            let target_kind = if full_key.contains("configMapKeyRef") { "ConfigMap" } else { "Secret" };
+            let target_kind = if full_key.contains("configMapKeyRef") {
+                "ConfigMap"
+            } else {
+                "Secret"
+            };
             let active_doc = parsed
                 .docs
                 .iter()
@@ -1300,7 +2203,11 @@ pub fn completions_at(index: &ProjectIndex, doc: &Document, at: Position, parsed
                 .or_else(|| parsed.docs.first());
             let referenced_names: Vec<String> = active_doc
                 .map(|d| {
-                    d.data_refs.iter().filter(|r| r.target_kind == target_kind).map(|r| r.name.value.clone()).collect()
+                    d.data_refs
+                        .iter()
+                        .filter(|r| r.target_kind == target_kind)
+                        .map(|r| r.name.value.clone())
+                        .collect()
                 })
                 .unwrap_or_default();
 
@@ -1441,7 +2348,11 @@ pub fn completions_at(index: &ProjectIndex, doc: &Document, at: Position, parsed
     // Root-level IntelliJ-style Kubernetes live templates (`kdep`, `ksvc`, `kcm`, `ksec`, `king`, `kpod`, `kust`)
     if parent_path.is_empty() {
         for (abbr, title, body) in live_templates() {
-            if abbr.starts_with(typed_key) || title.to_ascii_lowercase().contains(&typed_key.to_ascii_lowercase()) {
+            if abbr.starts_with(typed_key)
+                || title
+                    .to_ascii_lowercase()
+                    .contains(&typed_key.to_ascii_lowercase())
+            {
                 let mut item = snippet_item(abbr, *body, replace, title);
                 item.filter_text = Some(format!("{abbr} {title}"));
                 items.push(item);
@@ -1452,26 +2363,57 @@ pub fn completions_at(index: &ProjectIndex, doc: &Document, at: Position, parsed
     items
 }
 
-fn schema_keys_for(parent_path: &str, kind: Option<&str>) -> &'static [(&'static str, &'static str, &'static str)] {
+fn schema_keys_for(
+    parent_path: &str,
+    kind: Option<&str>,
+) -> &'static [(&'static str, &'static str, &'static str)] {
     match parent_path {
         "" => &[
-            ("apiVersion", "apiVersion: ${1:apps/v1}", "API group and version"),
+            (
+                "apiVersion",
+                "apiVersion: ${1:apps/v1}",
+                "API group and version",
+            ),
             ("kind", "kind: ${1:Deployment}", "Resource kind"),
-            ("metadata", "metadata:\n  name: ${1:my-app}", "Standard object metadata"),
+            (
+                "metadata",
+                "metadata:\n  name: ${1:my-app}",
+                "Standard object metadata",
+            ),
             ("spec", "spec:\n  $0", "Desired state specification"),
-            ("data", "data:\n  ${1:KEY}: \"${2:value}\"", "ConfigMap / Secret data entries"),
-            ("stringData", "stringData:\n  ${1:KEY}: \"${2:value}\"", "Unencoded Secret string entries"),
+            (
+                "data",
+                "data:\n  ${1:KEY}: \"${2:value}\"",
+                "ConfigMap / Secret data entries",
+            ),
+            (
+                "stringData",
+                "stringData:\n  ${1:KEY}: \"${2:value}\"",
+                "Unencoded Secret string entries",
+            ),
         ],
         "metadata" => &[
             ("name", "name: ${1:my-app}", "Resource name"),
             ("namespace", "namespace: ${1:default}", "Target namespace"),
-            ("labels", "labels:\n  app.kubernetes.io/name: ${1:my-app}", "Resource labels"),
-            ("annotations", "annotations:\n  ${1:key}: \"${2:value}\"", "Resource annotations"),
+            (
+                "labels",
+                "labels:\n  app.kubernetes.io/name: ${1:my-app}",
+                "Resource labels",
+            ),
+            (
+                "annotations",
+                "annotations:\n  ${1:key}: \"${2:value}\"",
+                "Resource annotations",
+            ),
         ],
         "spec" => match kind {
             Some("Service") => &[
                 ("type", "type: ${1:ClusterIP}", "Service exposure type"),
-                ("selector", "selector:\n  app.kubernetes.io/name: ${1:my-app}", "Pod label selector"),
+                (
+                    "selector",
+                    "selector:\n  app.kubernetes.io/name: ${1:my-app}",
+                    "Pod label selector",
+                ),
                 (
                     "ports",
                     "ports:\n  - name: ${1:http}\n    port: ${2:80}\n    targetPort: ${3:http}",
@@ -1479,7 +2421,11 @@ fn schema_keys_for(parent_path: &str, kind: Option<&str>) -> &'static [(&'static
                 ),
             ],
             Some("Ingress") => &[
-                ("ingressClassName", "ingressClassName: ${1:nginx}", "Ingress controller class"),
+                (
+                    "ingressClassName",
+                    "ingressClassName: ${1:nginx}",
+                    "Ingress controller class",
+                ),
                 (
                     "rules",
                     "rules:\n  - host: ${1:example.com}\n    http:\n      paths:\n        - path: /\n          pathType: Prefix\n          backend:\n            service:\n              name: ${2:my-service}\n              port:\n                name: ${3:http}",
@@ -1503,8 +2449,16 @@ fn schema_keys_for(parent_path: &str, kind: Option<&str>) -> &'static [(&'static
                     "template:\n  metadata:\n    labels:\n      app.kubernetes.io/name: ${1:my-app}\n  spec:\n    containers:\n      - name: ${1:my-app}\n        image: ${2:nginx:1.27-alpine}",
                     "Pod template specification",
                 ),
-                ("strategy", "strategy:\n  type: ${1:RollingUpdate}", "Deployment update strategy"),
-                ("serviceAccountName", "serviceAccountName: ${1:default}", "Pod ServiceAccount name"),
+                (
+                    "strategy",
+                    "strategy:\n  type: ${1:RollingUpdate}",
+                    "Deployment update strategy",
+                ),
+                (
+                    "serviceAccountName",
+                    "serviceAccountName: ${1:default}",
+                    "Pod ServiceAccount name",
+                ),
                 (
                     "containers",
                     "containers:\n  - name: ${1:app}\n    image: ${2:nginx:1.27-alpine}",
@@ -1515,9 +2469,21 @@ fn schema_keys_for(parent_path: &str, kind: Option<&str>) -> &'static [(&'static
         p if p.ends_with("spec.containers") || p.ends_with("spec.initContainers") => &[
             ("name", "name: ${1:app}", "Container name"),
             ("image", "image: ${1:nginx:1.27-alpine}", "Container image"),
-            ("imagePullPolicy", "imagePullPolicy: ${1:IfNotPresent}", "Image pull policy"),
-            ("ports", "ports:\n  - name: ${1:http}\n    containerPort: ${2:8080}", "Container ports"),
-            ("env", "env:\n  - name: ${1:ENV_VAR}\n    value: \"${2:value}\"", "Environment variables"),
+            (
+                "imagePullPolicy",
+                "imagePullPolicy: ${1:IfNotPresent}",
+                "Image pull policy",
+            ),
+            (
+                "ports",
+                "ports:\n  - name: ${1:http}\n    containerPort: ${2:8080}",
+                "Container ports",
+            ),
+            (
+                "env",
+                "env:\n  - name: ${1:ENV_VAR}\n    value: \"${2:value}\"",
+                "Environment variables",
+            ),
             (
                 "envFrom",
                 "envFrom:\n  - configMapRef:\n      name: ${1:my-config}",

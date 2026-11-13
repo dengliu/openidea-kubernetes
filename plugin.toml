@@ -1,20 +1,22 @@
 id = "dengliu.kubernetes"
 name = "Kubernetes"
-version = "0.3.6"
+version = "0.3.7"
 icon = "icons/kubernetes-logo.svg"
 description = "Manage Kubernetes clusters, Helm releases and Kustomize overlays: cluster explorer with live Pod logs, shell and port-forward, YAML completion, cross-resource navigation, gutter markers and manifest inspections."
 authors = ["Deng Liu"]
 homepage = "https://github.com/dengliu/openidea-kubernetes"
 license = "Apache-2.0"
-change-notes = "0.3.6 — add multi-namespace selection, Freelens-style zero-button virtualized auto-scroll (<= 500 items full load + live watch; > 500 items predictive scroll streaming), fast watch-cache Table ground-truth cluster search across 80k+ resources (with documented loopback net:127.0.0.1 + ephemeral kubectl proxy data flow), and unfocused poll pause for clean OIDC/PIM token refreshes."
+change-notes = "0.3.7 — add IntelliJ-style Kubernetes, Helm (chart directories, Chart.yaml, values.yaml, templates), and Kustomize (overlay/component directories, kustomization.yaml, patches/plugins) file and folder icons with automatic project structure and YAML content detection."
 categories = ["tools", "frameworks"]
-engines.openidea = "^1.3"
+engines.openidea = "^1.8"
 wasm = "dist/plugin.wasm"
 activation = [
+    "on-startup-finished",
     "on-view:kubernetes",
     "on-language:yaml",
     "on-event:file-opened",
     "on-event:file-saved",
+    "on-event:files-changed",
     "on-command:*",
 ]
 
@@ -233,8 +235,36 @@ args = ["template", "."]
 [[contributes.fileIcons]]
 id = "kubernetes"
 patterns = ["*.k8s.yaml", "*.k8s.yml", "kubeconfig", "*.kubeconfig"]
-icon = "icons/kubernetes.svg"
-iconDark = "icons/kubernetes_dark.svg"
+icon = "icons/k8s-manifest.svg"
+iconDark = "icons/k8s-manifest_dark.svg"
+
+[[contributes.fileIcons]]
+id = "helm-chart-dir"
+icon = "icons/helm-chart-dir.svg"
+iconDark = "icons/helm-chart-dir_dark.svg"
+
+[[contributes.fileIcons]]
+id = "helm-chart"
+patterns = ["Chart.yaml", "Chart.yml", "Chart.lock", "requirements.lock", "helmfile.yaml", "helmfile.yml", "*.helmfile.yaml", "*.helmfile.yml"]
+icon = "icons/helm-chart.svg"
+iconDark = "icons/helm-chart_dark.svg"
+
+[[contributes.fileIcons]]
+id = "helm-values"
+patterns = ["values.yaml", "values.yml", "values.*.yaml", "values.*.yml", "values-*.yaml", "values-*.yml", "*.values.yaml", "*.values.yml", "values.schema.json"]
+icon = "icons/helm-values.svg"
+iconDark = "icons/helm-values_dark.svg"
+
+[[contributes.fileIcons]]
+id = "helm-template"
+patterns = ["*.tpl", "*.helm.yaml", "*.helm.yml", ".helmignore"]
+icon = "icons/helm-template.svg"
+iconDark = "icons/helm-template_dark.svg"
+
+[[contributes.fileIcons]]
+id = "kustomize-dir"
+icon = "icons/kustomize-dir.svg"
+iconDark = "icons/kustomize-dir_dark.svg"
 
 [[contributes.fileIcons]]
 id = "kustomize"
@@ -243,10 +273,10 @@ icon = "icons/kustomize.svg"
 iconDark = "icons/kustomize_dark.svg"
 
 [[contributes.fileIcons]]
-id = "helm"
-patterns = ["Chart.yaml", "Chart.lock", "values.yaml", "values.*.yaml"]
-icon = "icons/helm.svg"
-iconDark = "icons/helm_dark.svg"
+id = "kustomize-patch"
+patterns = ["*.kustomize.yaml", "*.kustomize.yml"]
+icon = "icons/kustomize-patch.svg"
+iconDark = "icons/kustomize-patch_dark.svg"
 
 [[contributes.fileTemplates]]
 id = "deployment"
