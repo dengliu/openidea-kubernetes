@@ -1280,6 +1280,37 @@ impl KubernetesPlugin {
                 let cat = v.get("category").and_then(Value::as_str).unwrap_or("Pod");
                 let query = v.get("query").and_then(Value::as_str).unwrap_or("");
                 let request_id = v.get("requestId").and_then(Value::as_u64).unwrap_or(0);
+                // If the user switched context or namespace while this search message was queued,
+                // drop it immediately in 0 ms so subsequent UI actions never queue behind stale scans.
+                if let Some(req_ctx) = v
+                    .get("context")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    && !cfg.context.trim().is_empty()
+                    && req_ctx != cfg.context.trim()
+                {
+                    return Ok(());
+                }
+                if let Some(req_sig) = v
+                    .get("scopeSignature")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    let cur_sig = if cfg.all_namespaces {
+                        "*".to_owned()
+                    } else {
+                        let mut active = cfg.active_namespaces();
+                        active.sort();
+                        if active.is_empty() {
+                            "*".to_owned()
+                        } else {
+                            active.join(",")
+                        }
+                    };
+                    if req_sig != cur_sig {
+                        return Ok(());
+                    }
+                }
                 let is_cancelled = || _task.as_ref().is_some_and(|t| t.is_cancelled());
                 let outcome = if let Some(ref mut snap) = self.snapshot {
                     kubectl::search_cluster_category_ground_truth(
@@ -4233,9 +4264,9 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
                 return Err(openidea_plugin::Error::Failed(
                     "process stdout exceeded 16 MiB limit".into(),
                 ));
-            } else if joined.contains("/api/v1/configmaps?limit=500&continue=cm-tok-2") {
+            } else if joined.contains("/api/v1/configmaps?limit=250&continue=cm-tok-2") {
                 r#"{"kind":"ConfigMapList","metadata":{"resourceVersion":"9602"},"items":[{"metadata":{"name":"brix-feature-flags","namespace":"dayan","creationTimestamp":"2026-11-12T10:00:00Z"},"data":{"ENABLE_GPU":"true"}}]}"#.to_owned()
-            } else if joined.contains("/api/v1/configmaps?limit=500") {
+            } else if joined.contains("/api/v1/configmaps?limit=250") {
                 r#"{"kind":"ConfigMapList","metadata":{"resourceVersion":"9601","continue":"cm-tok-2","remainingItemCount":1},"items":[{"metadata":{"name":"adx-config","namespace":"adx-mon","creationTimestamp":"2026-11-12T10:00:00Z"},"data":{"A":"1"}}]}"#.to_owned()
             } else {
                 String::new()
@@ -4592,5 +4623,148 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
         assert_eq!(sec_msg["resources"][0]["name"], "deng-tls-cert");
         assert_eq!(sec_msg["resources"][0]["namespace"], "dengliu");
         assert_eq!(sec_msg["resources"][0]["ready"], "2 keys");
+    }
+
+    #[test]
+    fn proxy_search_pages_table_on_response_size_cap_and_drops_stale_queued_scopes() {
+        use openidea_plugin::HttpResponse;
+
+        let host = install_mock_with_kubectl();
+        host.on_process("kubectl", move |args, _stdin| {
+            let joined = args.join(" ");
+            if joined.contains("--raw /api/v1/pods?limit=250")
+                || joined.contains("--raw /api/v1/pods?limit=500")
+            {
+                panic!("must page Table via proxy instead of raw full-JSON fallback: {joined}");
+            }
+            let stdout = if joined.contains("config view") {
+                KUBECONFIG_JSON.to_owned()
+            } else if joined.contains("get namespaces --no-headers") {
+                "adx-mon Active 30d\ndengliu Active 30d\nshared-jobs Active 30d\n".to_owned()
+            } else if joined.contains("/api/v1/pods?limit=200") {
+                r#"{"kind":"PodList","metadata":{"resourceVersion":"9500","continue":"p2-tok","remainingItemCount":88048},"items":[{"metadata":{"name":"worker-0","namespace":"adx-mon","creationTimestamp":"2026-11-12T10:00:00Z"},"status":{"phase":"Running"}}]}"#.to_owned()
+            } else if joined.contains("/api/v1/namespaces/dengliu/pods?limit=200") {
+                r#"{"kind":"PodList","metadata":{"resourceVersion":"9505"},"items":[]}"#.to_owned()
+            } else {
+                String::new()
+            };
+            Ok(ProcessOutput {
+                status: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        });
+
+        host.on_fetch(move |req| {
+            if req
+                .url
+                .contains("/api/v1/pods?resourceVersion=0&includeObject=None")
+            {
+                // Simulate decompressed 88k-pod Table exceeding an 8 MiB `MAX_RESPONSE` host cap
+                return Err(Error::Failed("response larger than 8 MiB".into()));
+            }
+            let body = if req
+                .url
+                .contains("/api/v1/pods?limit=20000&includeObject=None&continue=tbl-p2")
+            {
+                br#"{"kind":"Table","apiVersion":"meta.k8s.io/v1","metadata":{},"columnDefinitions":[{"name":"Name","priority":0}],"rows":[{"cells":["gpu-trainer-99","1/1","Running",0,"2h","10.20.9.9","aks-gpu-99"],"object":null}]}"#.to_vec()
+            } else if req
+                .url
+                .contains("/api/v1/pods?limit=20000&includeObject=None")
+            {
+                br#"{"kind":"Table","apiVersion":"meta.k8s.io/v1","metadata":{"continue":"tbl-p2"},"columnDefinitions":[{"name":"Name","priority":0}],"rows":[{"cells":["worker-0","1/1","Running",0,"5d","10.20.0.1","aks-pool-01"],"object":null}]}"#.to_vec()
+            } else if req
+                .url
+                .contains("fieldSelector=metadata.name%3Dgpu-trainer-99&includeObject=Metadata")
+            {
+                br#"{"kind":"Table","apiVersion":"meta.k8s.io/v1","columnDefinitions":[{"name":"Name","priority":0}],"rows":[{"cells":["gpu-trainer-99","1/1","Running",0,"2h","10.20.9.9","aks-gpu-99"],"object":{"metadata":{"namespace":"shared-jobs","ownerReferences":[{"kind":"Job","name":"gpu-trainer"}]}}}]}"#.to_vec()
+            } else {
+                panic!("unexpected proxy URL: {}", req.url);
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body,
+            })
+        });
+        host.add_file("k8s/app.yaml", SAMPLE_MANIFEST);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"set-all-namespaces","all":true,"category":"Pod","limit":200}"#.into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+
+        let proxy_child = host::start(
+            &host::Command::new("kubectl").args(["proxy", "--port=0"]),
+            None,
+        )
+        .unwrap();
+        plugin
+            .watches
+            .install_test_proxy("", "prod-east", 51466, proxy_child);
+
+        // 1. Single-shot `resourceVersion=0&includeObject=None` hits `"response larger than 8 MiB"` ->
+        //    automatically pages `?limit=20000&includeObject=None&continue=...` and resolves `shared-jobs`!
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"search-category","requestId":101,"category":"Pod","query":"gpu-trainer","context":"prod-east","scopeSignature":"*"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        let msg: serde_json::Value = serde_json::from_str(
+            &host
+                .view_messages()
+                .into_iter()
+                .rev()
+                .find_map(|(v, m)| (v == VIEW_ID && m.contains(r#""requestId":101"#)).then_some(m))
+                .expect("paged proxy search-results"),
+        )
+        .unwrap();
+        assert_eq!(msg["scannedTotal"], 2);
+        assert_eq!(msg["totalMatches"], 1);
+        assert_eq!(msg["resources"][0]["name"], "gpu-trainer-99");
+        assert_eq!(msg["resources"][0]["namespace"], "shared-jobs");
+
+        // 2. User switches to `dengliu` namespace -> any queued `scopeSignature: "*"` search is dropped in 0 HTTP requests!
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"set-namespace","namespace":"dengliu","category":"Pod","limit":200}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        let reqs_before = host.requests().len();
+        plugin
+            .handle(
+                VIEW_ID,
+                ViewEvent::Message(
+                    r#"{"op":"search-category","requestId":102,"category":"Pod","query":"gpu-trainer","context":"prod-east","scopeSignature":"*"}"#
+                        .into(),
+                ),
+                &host.invocation(),
+            )
+            .unwrap();
+        assert_eq!(
+            host.requests().len(),
+            reqs_before,
+            "stale queued search-category must be dropped without issuing HTTP calls"
+        );
     }
 }

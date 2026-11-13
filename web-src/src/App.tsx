@@ -1528,7 +1528,7 @@ export function App() {
   ]);
   const selectedNamespaceSet = useMemo(() => new Set(selectedNamespaces), [selectedNamespaces]);
   const selectedNsSignature = useMemo(
-    () => (snapshot.all_namespaces ? "*" : selectedNamespaces.join(",")),
+    () => computeNamespaceScopeSignature(snapshot.all_namespaces, selectedNamespaces),
     [snapshot.all_namespaces, selectedNamespaces],
   );
   const nsButtonDisplay = useMemo(
@@ -2446,6 +2446,8 @@ export function App() {
       truncated: false,
       error: null,
     });
+    const reqContext = snapshot.current_context;
+    const reqScopeSig = selectedNsSignature;
     const dispatch = () => {
       searchTimerRef.current = null;
       sendToBackend({
@@ -2453,6 +2455,8 @@ export function App() {
         requestId: reqId,
         category: activeKind,
         query: trimmed,
+        context: reqContext,
+        scopeSignature: reqScopeSig,
       });
     };
     if (immediate) {

@@ -7695,6 +7695,10 @@ fn run_kubectl_commands_batch(
 }
 
 const MULTI_NS_SEARCH_CONCURRENCY: usize = 4;
+const RAW_FALLBACK_MAX_PAGES: usize = 8;
+const SEARCH_WALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+const PROXY_NONE_PAGE_LIMIT: u32 = 20_000;
+const PROXY_METADATA_PAGE_LIMIT: u32 = 4_000;
 
 #[allow(clippy::too_many_arguments)]
 fn search_resources_via_raw_pages(
@@ -7709,17 +7713,18 @@ fn search_resources_via_raw_pages(
     outcome: &mut CategorySearchOutcome,
 ) -> bool {
     let mut cursor = String::new();
-    for _ in 0..500 {
+    for _ in 0..RAW_FALLBACK_MAX_PAGES {
         if is_cancelled() {
+            outcome.truncated = true;
             break;
         }
         let opts = FetchOptions {
-            limit: 500,
+            limit: 250,
             continue_token: cursor.clone(),
             append: true,
             ..FetchOptions::default()
         };
-        match fetch_raw_paged_resources(project, cfg, kind, endpoint, &opts, Some(15)) {
+        match fetch_raw_paged_resources(project, cfg, kind, endpoint, &opts, Some(8)) {
             RawPageOutcome::Page(page) => {
                 for mut res in page.items {
                     outcome.scanned_total += 1;
@@ -7754,6 +7759,9 @@ fn search_resources_via_raw_pages(
             }
         }
     }
+    if !cursor.is_empty() {
+        outcome.truncated = true;
+    }
     outcome.scanned_total > 0
 }
 
@@ -7765,17 +7773,18 @@ fn search_events_via_raw_pages(
     outcome: &mut CategorySearchOutcome,
 ) -> bool {
     let mut cursor = String::new();
-    for _ in 0..500 {
+    for _ in 0..RAW_FALLBACK_MAX_PAGES {
         if is_cancelled() {
+            outcome.truncated = true;
             break;
         }
         let opts = FetchOptions {
-            limit: 500,
+            limit: 250,
             continue_token: cursor.clone(),
             append: true,
             ..FetchOptions::default()
         };
-        match fetch_raw_paged_events(project, cfg, &opts, Some(15)) {
+        match fetch_raw_paged_events(project, cfg, &opts, Some(8)) {
             RawPageOutcome::Page(page) => {
                 for ev in page.items {
                     outcome.scanned_total += 1;
@@ -7798,11 +7807,20 @@ fn search_events_via_raw_pages(
             }
         }
     }
+    if !cursor.is_empty() {
+        outcome.truncated = true;
+    }
     outcome.scanned_total > 0
 }
 
 const K8S_TABLE_ACCEPT: &str = "application/json;as=Table;v=v1;g=meta.k8s.io,application/json;as=Table;v=v1beta1;g=meta.k8s.io";
-const METADATA_TABLE_MAX_EST_ITEMS: u64 = 40_000;
+const METADATA_TABLE_MAX_EST_ITEMS: u64 = 12_000;
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct TableListMetaWire {
+    #[serde(default, rename = "continue")]
+    continue_token: String,
+}
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct TableColDefWire {
@@ -7866,8 +7884,8 @@ fn parse_leading_u64(raw: &str) -> u64 {
 }
 
 /// Streams a Kubernetes `meta.k8s.io/v1` `Table` response (raw JSON or gzip-compressed bytes)
-/// row-by-row via `serde::de::Visitor`, avoiding allocating an 88k-row `Vec` or a full decompressed buffer.
-fn stream_k8s_table_rows<F>(raw_bytes: &[u8], mut on_row: F) -> Result<(), String>
+/// row-by-row via `serde::de::Visitor`, returning `metadata.continue` when paginated.
+fn stream_k8s_table_rows<F>(raw_bytes: &[u8], mut on_row: F) -> Result<String, String>
 where
     F: FnMut(&[TableColDefWire], TableRowWire),
 {
@@ -7927,7 +7945,7 @@ where
     where
         CB: FnMut(&[TableColDefWire], TableRowWire),
     {
-        type Value = bool;
+        type Value = (bool, String);
 
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("a Kubernetes Table object")
@@ -7938,6 +7956,7 @@ where
             M: serde::de::MapAccess<'de>,
         {
             let mut cols: Vec<TableColDefWire> = Vec::new();
+            let mut continue_tok = String::new();
             let mut saw_table = false;
             while let Some(key) = map.next_key::<Cow<'de, str>>()? {
                 match key.as_ref() {
@@ -7946,6 +7965,10 @@ where
                         if k == "Table" {
                             saw_table = true;
                         }
+                    }
+                    "metadata" => {
+                        let meta: TableListMetaWire = map.next_value()?;
+                        continue_tok = meta.continue_token;
                     }
                     "columnDefinitions" => {
                         cols = map.next_value()?;
@@ -7963,12 +7986,12 @@ where
                     }
                 }
             }
-            Ok(saw_table)
+            Ok((saw_table, continue_tok))
         }
     }
 
     use serde::Deserializer as _;
-    let saw_table = if raw_bytes.starts_with(&[0x1f, 0x8b]) {
+    let (saw_table, continue_tok) = if raw_bytes.starts_with(&[0x1f, 0x8b]) {
         let gz = flate2::read::GzDecoder::new(raw_bytes).take(96 * 1024 * 1024);
         let reader = BufReader::with_capacity(64 * 1024, gz);
         let mut de = serde_json::Deserializer::from_reader(reader);
@@ -7985,10 +8008,15 @@ where
     };
 
     if saw_table {
-        Ok(())
+        Ok(continue_tok)
     } else {
         Err("response was not a Kubernetes Table".into())
     }
+}
+
+fn is_response_too_large_error(err: &Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("larger than") || msg.contains("exceeded") || msg.contains("too large")
 }
 
 fn proxy_fetch_table_bytes(
@@ -8542,9 +8570,9 @@ fn search_via_watch_cache_table_proxy(
         &mut HashMap<(String, String, String), usize>,
     >,
                             mut dedup_ev: Option<&mut HashMap<(String, String, String), usize>>|
-     -> Result<u64, String> {
+     -> Result<(u64, String), String> {
         let mut rows_seen = 0u64;
-        stream_k8s_table_rows(bytes, |cols, row| {
+        let cont_tok = stream_k8s_table_rows(bytes, |cols, row| {
             if category == "Event" {
                 let Some(ev) = table_row_to_event(&row, default_ns) else {
                     return;
@@ -8699,15 +8727,100 @@ fn search_via_watch_cache_table_proxy(
                 }
             }
         })?;
-        Ok(rows_seen)
+        Ok((rows_seen, cont_tok))
     };
+
+    // Helper: tries single-shot `?resourceVersion=0&includeObject={mode}` first (~0.2–2.3s), and if the
+    // decompressed response exceeds `host::fetch`'s response cap (8–16 MiB), falls back to proxy-paged
+    // `?limit={page_limit}&includeObject={mode}&continue=...` (~3.3 MiB/page) instead of raw full JSON.
+    let fetch_and_scan_with_paged_fallback =
+        |watches: &mut WatchManager,
+         base_path: &str,
+         include_object: &str,
+         page_limit: u32,
+         try_single_shot_first: bool,
+         default_ns: &str,
+         out: &mut CategorySearchOutcome,
+         mut dedup_res: Option<&mut HashMap<(String, String, String), usize>>,
+         mut dedup_ev: Option<&mut HashMap<(String, String, String), usize>>|
+         -> Option<u64> {
+            if try_single_shot_first {
+                let single_uri =
+                    format!("{base_path}?resourceVersion=0&includeObject={include_object}");
+                match proxy_fetch_table_bytes(watches, port, &single_uri, 14_000) {
+                    Ok(bytes) => {
+                        if let Ok((rows, _)) = scan_table_bytes(
+                            &bytes,
+                            default_ns,
+                            out,
+                            dedup_res.as_deref_mut(),
+                            dedup_ev.as_deref_mut(),
+                        ) {
+                            return Some(rows);
+                        }
+                        return None;
+                    }
+                    Err(err) if is_response_too_large_error(&err) => {}
+                    Err(_) => return None,
+                }
+            }
+
+            let mut total_rows = 0u64;
+            let mut cursor = String::new();
+            let mut any_page = false;
+            for _ in 0..20 {
+                if is_cancelled() {
+                    out.truncated = true;
+                    break;
+                }
+                let paged_uri = if cursor.is_empty() {
+                    format!("{base_path}?limit={page_limit}&includeObject={include_object}")
+                } else {
+                    format!(
+                        "{base_path}?limit={page_limit}&includeObject={include_object}&continue={}",
+                        url_encode_component(&cursor)
+                    )
+                };
+                let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &paged_uri, 10_000) else {
+                    break;
+                };
+                let Ok((rows, next_cont)) = scan_table_bytes(
+                    &bytes,
+                    default_ns,
+                    out,
+                    dedup_res.as_deref_mut(),
+                    dedup_ev.as_deref_mut(),
+                ) else {
+                    break;
+                };
+                any_page = true;
+                total_rows += rows;
+                if next_cont.is_empty() || next_cont == cursor {
+                    cursor.clear();
+                    break;
+                }
+                cursor = next_cont;
+            }
+            if !cursor.is_empty() {
+                out.truncated = true;
+            }
+            any_page.then_some(total_rows)
+        };
 
     // 1. Cluster-scoped resources (`Node`, `Namespace`, `PersistentVolume`, `ClusterRole`, etc.)
     if is_cluster_scoped {
-        let uri = format!("{api_prefix}/{plural}?resourceVersion=0&includeObject=None");
-        if let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &uri, 20_000)
-            && let Ok(rows) = scan_table_bytes(&bytes, "", outcome, None, None)
-        {
+        let base_path = format!("{api_prefix}/{plural}");
+        if let Some(rows) = fetch_and_scan_with_paged_fallback(
+            watches,
+            &base_path,
+            "None",
+            PROXY_NONE_PAGE_LIMIT,
+            true,
+            "",
+            outcome,
+            None,
+            None,
+        ) {
             outcome.scanned_total = rows;
             return true;
         }
@@ -8720,14 +8833,21 @@ fn search_via_watch_cache_table_proxy(
         let mut any_ok = false;
         for ns in &active {
             if is_cancelled() {
+                outcome.truncated = true;
                 break;
             }
-            let uri = format!(
-                "{api_prefix}/namespaces/{ns}/{plural}?resourceVersion=0&includeObject=Metadata"
-            );
-            if let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &uri, 15_000)
-                && let Ok(rows) = scan_table_bytes(&bytes, ns, outcome, None, None)
-            {
+            let base_path = format!("{api_prefix}/namespaces/{ns}/{plural}");
+            if let Some(rows) = fetch_and_scan_with_paged_fallback(
+                watches,
+                &base_path,
+                "Metadata",
+                PROXY_METADATA_PAGE_LIMIT,
+                true,
+                ns,
+                outcome,
+                None,
+                None,
+            ) {
                 any_ok = true;
                 outcome.scanned_total += rows;
             }
@@ -8762,14 +8882,21 @@ fn search_via_watch_cache_table_proxy(
             let mut any_ok = false;
             for ns in &target_namespaces {
                 if is_cancelled() {
+                    outcome.truncated = true;
                     break;
                 }
-                let uri = format!(
-                    "{api_prefix}/namespaces/{ns}/{plural}?resourceVersion=0&includeObject=Metadata"
-                );
-                if let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &uri, 12_000)
-                    && let Ok(rows) = scan_table_bytes(&bytes, ns, outcome, None, None)
-                {
+                let base_path = format!("{api_prefix}/namespaces/{ns}/{plural}");
+                if let Some(rows) = fetch_and_scan_with_paged_fallback(
+                    watches,
+                    &base_path,
+                    "Metadata",
+                    PROXY_METADATA_PAGE_LIMIT,
+                    true,
+                    ns,
+                    outcome,
+                    None,
+                    None,
+                ) {
                     any_ok = true;
                     outcome.scanned_total += rows;
                 }
@@ -8787,25 +8914,34 @@ fn search_via_watch_cache_table_proxy(
         .or_else(|| snap.overview_counts.get(category).copied())
         .unwrap_or(0);
 
-    // 3b. Medium/large scopes up to 40,000 items (`Deployments`, `Secrets`, `ConfigMaps`, `Events`, `CR:*`):
-    //     fetch `includeObject=Metadata` in a single gzipped watch-cache request so every row carries exact `namespace`.
-    if est_total > 0 && est_total <= METADATA_TABLE_MAX_EST_ITEMS {
-        let meta_uri = format!("{api_prefix}/{plural}?resourceVersion=0&includeObject=Metadata");
-        if let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &meta_uri, 22_000) {
-            let mut trial = CategorySearchOutcome {
-                category: outcome.category.clone(),
-                query: outcome.query.clone(),
-                ..Default::default()
-            };
-            if let Ok(rows) = scan_table_bytes(&bytes, "", &mut trial, None, None) {
-                trial.scanned_total = rows;
-                *outcome = trial;
-                return true;
-            }
+    // 3b. Events (need `metadata.namespace` since Event Table has no Namespace column) or medium scopes
+    //     up to `METADATA_TABLE_MAX_EST_ITEMS` (`Deployments`, `Secrets`, `ConfigMaps`, `CR:*`):
+    if category == "Event" || (est_total > 0 && est_total <= METADATA_TABLE_MAX_EST_ITEMS) {
+        let base_path = format!("{api_prefix}/{plural}");
+        let try_single = est_total == 0 || est_total <= METADATA_TABLE_MAX_EST_ITEMS;
+        let mut trial = CategorySearchOutcome {
+            category: outcome.category.clone(),
+            query: outcome.query.clone(),
+            ..Default::default()
+        };
+        if let Some(rows) = fetch_and_scan_with_paged_fallback(
+            watches,
+            &base_path,
+            "Metadata",
+            PROXY_METADATA_PAGE_LIMIT,
+            try_single,
+            "",
+            &mut trial,
+            None,
+            None,
+        ) {
+            trial.scanned_total = rows;
+            *outcome = trial;
+            return true;
         }
     }
 
-    // 3c. Massive scopes (`> 40,000` items, e.g. 88k+ Pods on `falcon-phx-ga`):
+    // 3c. Massive scopes (`> 12,000` items, e.g. 88k+ Pods on `falcon-phx-ga`):
     //     Step 1: Fan out to any namespaces in `snap.namespaces` matching query tokens (~0.2s, exact `namespace`).
     let mut dedup_res_without_ns: HashMap<(String, String, String), usize> = HashMap::new();
     let mut dedup_ev_without_ns: HashMap<(String, String, String), usize> = HashMap::new();
@@ -8893,13 +9029,15 @@ fn search_via_watch_cache_table_proxy(
         return outcome.total_matches > 0;
     }
 
-    //     Step 2: Full-cluster `?resourceVersion=0&includeObject=None` watch-cache scan (~2.3s / 1.6 MiB gzipped for 88k pods).
-    let none_uri = format!("{api_prefix}/{plural}?resourceVersion=0&includeObject=None");
-    let Ok(bytes) = proxy_fetch_table_bytes(watches, port, &none_uri, 25_000) else {
-        return false;
-    };
-    let Ok(total_rows) = scan_table_bytes(
-        &bytes,
+    //     Step 2: Full-cluster `?resourceVersion=0&includeObject=None` watch-cache scan (~2.3s on 16 MiB cap,
+    //     automatically falling back to `?limit=20000&includeObject=None&continue=...` if > MAX_RESPONSE).
+    let base_path = format!("{api_prefix}/{plural}");
+    let Some(total_rows) = fetch_and_scan_with_paged_fallback(
+        watches,
+        &base_path,
+        "None",
+        PROXY_NONE_PAGE_LIMIT,
+        true,
         "",
         outcome,
         Some(&mut dedup_res_without_ns),
@@ -8946,6 +9084,10 @@ pub fn search_cluster_category_ground_truth(
     if trimmed_query.is_empty() {
         return outcome;
     }
+
+    let search_started = std::time::Instant::now();
+    let bounded_stop = || is_cancelled() || search_started.elapsed() >= SEARCH_WALL_DEADLINE;
+    let is_cancelled: &dyn Fn() -> bool = &bounded_stop;
 
     let (_, is_builtin_cluster_scoped, _) = kubectl_resource_info(category);
     let is_cluster_scoped = if let Some(crd_name) = category.strip_prefix("CR:") {
