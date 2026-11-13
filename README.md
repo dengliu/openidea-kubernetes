@@ -23,6 +23,10 @@ An [OpenIDEA](https://github.com/l0ng-ai/openidea) plugin (`dengliu.kubernetes`)
   - Live Cluster Resource YAML Editor Tabs with `Reload`, `Diff` (`kubectl diff -f -`), and `Save & Apply` (`kubectl apply -f -`).
 
 ### 2. YAML, Helm & Kustomize Editor Intelligence (`src/`)
+- **IntelliJ-Style Kubernetes, Helm & Kustomize File and Folder Icons**:
+  - **Helm**: Automatically detects chart root folders (`Chart.yaml` / `Chart.yml` → folder with teal Helm wheel badge), chart metadata (`Chart.yaml`, `Chart.lock`, `requirements.yaml`, `helmfile.yaml` → table with Helm wheel badge), values files (`values.yaml`, `values-*.yaml`, `*.values.yaml`, `values.schema.json`, `ci/*.yaml` → lined document with Helm wheel badge), and chart templates (`templates/**`, `*.tpl`, `NOTES.txt`, `.helmignore`, and Go-templated YAML → hollow teal 8-spoke Helm wheel).
+  - **Kustomize**: Automatically detects Kustomize overlay/base/component folders (`kustomization.yaml` / `kustomization.yml` / `Kustomization` → folder with purple Kustomize overlay badge), root kustomization/component manifests (`kustomize` icon), and referenced patches/plugins (`patches`, `patchesStrategicMerge`, `patchesJson6902`, `replacements`, `configurations`, `generators`, `transformers`, `validators`, RFC 6902 patch YAML, and `*.kustomize.config.k8s.io/*` → `kustomize-patch` icon).
+  - **Kubernetes Manifests**: Marks YAML files containing `apiVersion` and `kind` (unless `# nonk8s` or owned by Helm/Kustomize patches) with the blue Kubernetes wheel icon.
 - **Cross-Resource Navigation & Gutter Line Markers**: Navigate between `Service.spec.selector` ↔ `Deployment`/`StatefulSet`/`DaemonSet`/`Pod` labels, `envFrom`/`valueFrom` ↔ `ConfigMap`/`Secret` keys, `Ingress` ↔ backend `Service`, `PVC` ↔ `StorageClass`, and `RoleBinding` ↔ `Role`/`ServiceAccount`.
 - **Context-Aware Completion & Live Templates**: Completes `apiVersion`, `kind`, target `ConfigMap`/`Secret`/`Service`/`StorageClass`/`ServiceAccount` names, data keys, and common container/probe/volume/securityContext fields, plus file templates (`Deployment`, `Service`, `ConfigMap`, `Ingress`, `Kustomization`).
 - **8 Real-Time Manifest Inspections & Quick Fixes**:
@@ -49,10 +53,10 @@ See [design.md](./design.md) for the full architectural and protocol design.
 | `net:127.0.0.1` | Required | Sends local loopback HTTP `GET` requests (`http://127.0.0.1:<port>/...`) to the ephemeral `kubectl proxy` process during ground-truth cluster search (`Accept: application/json;as=Table`) — never connects to external services directly. |
 | `process:helm` | Optional | Lists Helm releases (`helm list -o json`) and renders chart templates (`helm template`). |
 | `process:kustomize` | Optional | Builds Kustomize overlays (`kustomize build`) when previewing or inspecting overlays. |
-| `project.read` | Required | Scans workspace YAML, Helm, and Kustomize files (`*.yaml`, `*.yml`) to build the cross-resource manifest index. |
+| `project.read` | Required | Scans workspace YAML, Helm, and Kustomize files (`*.yaml`, `*.yml`, `Chart.yaml`, `kustomization.yaml`) to build the cross-resource manifest index and assign Project View file/folder icons. |
 | `editor.read` | Required | Reads the active YAML editor buffer and cursor/selection for Go to Definition, completions, and manifest commands (`Apply`, `Diff`, `Dry Run`, `Delete`). |
 | `editor.write` | Required | Applies quick-fix text edits to open YAML manifests. |
-| `events` | Required | Subscribes to `file-opened` and `file-saved` events to re-index workspace manifests and refresh diagnostics automatically. |
+| `events` | Required | Subscribes to `file-opened`, `file-saved`, and path-filtered `files-changed` events to re-index workspace manifests, refresh diagnostics, and update file/folder icons automatically. |
 | `storage` | Required | Persists the selected cluster context, namespace, `allNamespaces` toggle, and custom kubeconfig path across IDE restarts. |
 | `clipboard` | Required | Copies resource names, `kubectl` commands, and rendered Helm/Kustomize output to the system clipboard. |
 

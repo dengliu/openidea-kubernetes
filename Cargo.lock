@@ -138,7 +138,7 @@ dependencies = [
 [[package]]
 name = "openidea-plugin"
 version = "0.1.0"
-source = "git+https://github.com/l0ng-ai/openidea?branch=main#b746a0a3a99d969c1d9af5c1eae494ee98a52cbd"
+source = "git+https://github.com/l0ng-ai/openidea?branch=main#22fe1702be413bd1356a356c68ee19c18e1c6d28"
 dependencies = [
  "serde",
  "serde_json",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "openidea-plugin-dengliu-kubernetes"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "flate2",
  "openidea-plugin",

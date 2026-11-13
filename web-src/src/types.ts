@@ -125,6 +125,8 @@ export interface WorkspaceManifest {
   path: string;
   fullPath: string;
   line: number;
+  source?: "kubernetes" | "helm" | "kustomize";
+  icon?: string;
 }
 
 export interface ColumnDef {

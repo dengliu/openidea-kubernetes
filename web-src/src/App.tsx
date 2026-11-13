@@ -211,6 +211,64 @@ function SidebarIcon({ id }: { id: string }) {
   }
 }
 
+export function WorkspaceFileIcon({ icon }: { icon?: string }) {
+  switch (icon) {
+    case "helm-chart":
+      return (
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-label="Helm chart" style={{ flexShrink: 0 }}>
+          <path d="M3 2H13C14.105 2 15 2.895 15 4V8C14.164 7.372 13.126 7 12 7C9.239 7 7 9.239 7 12C7 12.711 7.149 13.387 7.417 14H3C1.895 14 1 13.105 1 12V4C1 2.895 1.895 2 3 2Z" fill="var(--fl-bg-subtle, #43454A)" />
+          <path d="M3 2H13C14.105 2 15 2.895 15 4V8C14.692 7.769 14.357 7.572 14 7.416V6H11V7.101C10.659 7.17 10.326 7.275 10.004 7.411V6H6V13H7.101C7.171 13.348 7.278 13.682 7.417 14H3C1.895 14 1 13.105 1 12V4C1 2.895 1.895 2 3 2ZM2 6V12C2 12.552 2.448 13 3 13H5V6H2ZM2 5H5V3H3C2.448 3 2 3.448 2 4V5ZM6 5H10V3H6V5ZM11 5H14V4C14 3.448 13.552 3 13 3H11V5Z" fill="currentColor" opacity="0.7" />
+          <circle cx="12" cy="12" r="2.15" stroke="#4AB0B8" strokeWidth="1.15" />
+          <path d="M12 8.3V9.85M12 14.15V15.7M8.3 12H9.85M14.15 12H15.7M9.38 9.38L10.48 10.48M13.52 13.52L14.62 14.62M14.62 9.38L13.52 10.48M10.48 13.52L9.38 14.62" stroke="#4AB0B8" strokeWidth="1.05" strokeLinecap="round" />
+        </svg>
+      );
+    case "helm-values":
+      return (
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-label="Helm values" style={{ flexShrink: 0 }}>
+          <path d="M4 1H11C12.105 1 13 1.895 13 3V7.101C12.677 7.034 12.343 7 12 7C9.239 7 7 9.239 7 12C7 13.126 7.372 14.164 8 15H4C2.895 15 2 14.105 2 13V3C2 1.895 2.895 1 4 1Z" fill="var(--fl-bg-subtle, #43454A)" />
+          <path d="M4 1H11C12.105 1 13 1.895 13 3V7.101C12.677 7.034 12.343 7 12 7V3C12 2.448 11.552 2 11 2H4C3.448 2 3 2.448 3 3V13C3 13.552 3.448 14 4 14H7.416C7.572 14.357 7.768 14.692 8 15H4C2.895 15 2 14.105 2 13V3C2 1.895 2.895 1 4 1Z" fill="currentColor" opacity="0.7" />
+          <rect x="4.5" y="4.25" width="6" height="1.1" rx="0.55" fill="currentColor" opacity="0.7" />
+          <rect x="4.5" y="7" width="4" height="1.1" rx="0.55" fill="currentColor" opacity="0.7" />
+          <rect x="4.5" y="9.75" width="2.2" height="1.1" rx="0.55" fill="currentColor" opacity="0.7" />
+          <circle cx="12" cy="12" r="2.15" stroke="#4AB0B8" strokeWidth="1.15" />
+          <path d="M12 8.3V9.85M12 14.15V15.7M8.3 12H9.85M14.15 12H15.7M9.38 9.38L10.48 10.48M13.52 13.52L14.62 14.62M14.62 9.38L13.52 10.48M10.48 13.52L9.38 14.62" stroke="#4AB0B8" strokeWidth="1.05" strokeLinecap="round" />
+        </svg>
+      );
+    case "helm-template":
+      return (
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-label="Helm template" style={{ flexShrink: 0 }}>
+          <circle cx="8" cy="8" r="3.7" stroke="#4AB0B8" strokeWidth="1.35" />
+          <path d="M8 1.45V4.3M8 11.7V14.55M1.45 8H4.3M11.7 8H14.55M3.37 3.37L5.38 5.38M10.62 10.62L12.63 12.63M12.63 3.37L10.62 5.38M5.38 10.62L3.37 12.63" stroke="#4AB0B8" strokeWidth="1.3" strokeLinecap="round" />
+        </svg>
+      );
+    case "kustomize":
+      return (
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-label="Kustomization" style={{ flexShrink: 0 }}>
+          <path d="M3 2H13C14.105 2 15 2.895 15 4V8C14.164 7.372 13.126 7 12 7C9.239 7 7 9.239 7 12C7 12.711 7.149 13.387 7.417 14H3C1.895 14 1 13.105 1 12V4C1 2.895 1.895 2 3 2Z" fill="var(--fl-bg-subtle, #43454A)" />
+          <path d="M3 2H13C14.105 2 15 2.895 15 4V8C14.692 7.769 14.357 7.572 14 7.416V6H11V7.101C10.659 7.17 10.326 7.275 10.004 7.411V6H6V13H7.101C7.171 13.348 7.278 13.682 7.417 14H3C1.895 14 1 13.105 1 12V4C1 2.895 1.895 2 3 2ZM2 6V12C2 12.552 2.448 13 3 13H5V6H2ZM2 5H5V3H3C2.448 3 2 3.448 2 4V5ZM6 5H10V3H6V5ZM11 5H14V4C14 3.448 13.552 3 13 3H11V5Z" fill="currentColor" opacity="0.7" />
+          <rect x="8.35" y="8.35" width="4.5" height="4.5" rx="1" fill="#2A203E" stroke="#A571F7" strokeWidth="1.1" />
+          <rect x="10.55" y="10.55" width="4.7" height="4.7" rx="1" fill="#3B2A5A" stroke="#A571F7" strokeWidth="1.1" />
+        </svg>
+      );
+    case "kustomize-patch":
+      return (
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-label="Kustomize patch" style={{ flexShrink: 0 }}>
+          <rect x="2" y="2" width="8.2" height="8.2" rx="1.6" fill="#2A203E" stroke="#A571F7" strokeWidth="1.2" />
+          <rect x="5.8" y="5.8" width="8.2" height="8.2" rx="1.6" fill="#3B2A5A" stroke="#A571F7" strokeWidth="1.2" />
+          <path d="M9.9 8.15V11.65M8.15 9.9H11.65" stroke="#A571F7" strokeWidth="1.2" strokeLinecap="round" />
+        </svg>
+      );
+    default:
+      return (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-label="Kubernetes manifest" style={{ flexShrink: 0 }}>
+          <polygon points="12,1.65 20.44,5.72 22.53,14.85 16.69,22.18 7.31,22.18 1.47,14.85 3.56,5.72" fill="#548AF7" stroke="#548AF7" strokeWidth="1.6" strokeLinejoin="round" />
+          <circle cx="12" cy="12.3" r="4.8" stroke="#ffffff" strokeWidth="1.7" />
+          <circle cx="12" cy="12.3" r="1.4" fill="#ffffff" />
+        </svg>
+      );
+  }
+}
+
 const SIDEBAR_TREE: SidebarGroup[] = [
   {
     id: "favorites",
@@ -4547,7 +4605,12 @@ export function App() {
                         <td>{w.name}</td>
                         <td>{w.namespace}</td>
                         <td className="fl-link-teal">
-                          {w.path}:{w.line + 1}
+                          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                            <WorkspaceFileIcon icon={w.icon} />
+                            <span>
+                              {w.path}:{w.line + 1}
+                            </span>
+                          </span>
                         </td>
                       </tr>
                     ))}

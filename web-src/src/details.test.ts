@@ -22,6 +22,7 @@ import {
   SOFT_AUTO_LOAD_CAP,
   toggleNamespaceInSelection,
   VIRTUAL_ROW_HEIGHT,
+  WorkspaceFileIcon,
 } from "./App";
 import { bytesToUnits, cpuUnitsToNumber, formatKubeMemory, toYamlLines, unitsToBytes } from "./ResourceDetails";
 
@@ -601,5 +602,15 @@ describe("ResourceDetails helpers", () => {
     expect(isPluginWindowActive({ visibilityState: "visible", hasFocus: () => false })).toBe(false);
     expect(isPluginWindowActive({ visibilityState: "hidden", hasFocus: () => true })).toBe(false);
     expect(isPluginWindowActive(undefined)).toBe(true);
+  });
+
+  it("renders distinct accessible labels in WorkspaceFileIcon for Helm, Kustomize, and Kubernetes files", () => {
+    expect(WorkspaceFileIcon({ icon: "helm-chart" }).props["aria-label"]).toBe("Helm chart");
+    expect(WorkspaceFileIcon({ icon: "helm-values" }).props["aria-label"]).toBe("Helm values");
+    expect(WorkspaceFileIcon({ icon: "helm-template" }).props["aria-label"]).toBe("Helm template");
+    expect(WorkspaceFileIcon({ icon: "kustomize" }).props["aria-label"]).toBe("Kustomization");
+    expect(WorkspaceFileIcon({ icon: "kustomize-patch" }).props["aria-label"]).toBe("Kustomize patch");
+    expect(WorkspaceFileIcon({ icon: "kubernetes" }).props["aria-label"]).toBe("Kubernetes manifest");
+    expect(WorkspaceFileIcon({}).props["aria-label"]).toBe("Kubernetes manifest");
   });
 });
