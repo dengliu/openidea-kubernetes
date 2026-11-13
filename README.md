@@ -8,6 +8,7 @@ An [OpenIDEA](https://github.com/l0ng-ai/openidea) plugin (`dengliu.kubernetes`)
 
 ### 1. Freelens-Style Cluster Explorer (`web-src/`)
 - **Multi-Cluster Hotbar & Catalog**: Automatically discovers contexts from `~/.kube/config` and Freelens cluster store metadata (`kubeconfig-sync` / `cluster-store.json`), with 1-click hotbar switching.
+- **Multi-Namespace Picker, Auto-Scroll & Ground-Truth Cluster Search**: Select one, multiple, or all namespaces; stream virtualized scopes automatically (full load + live `watch=true` deltas for scopes ≤ 500 items, predictive scroll prefetch above 500 items); and search across 80k+ cluster resources via watch-cache Kubernetes `Table` streaming over a short-lived local `kubectl proxy`.
 - **32+ Built-in Kubernetes Resource Kinds**:
   - **Cluster & Nodes**: Cluster Overview, Nodes (with live CPU/Memory progress bars from `kubectl top nodes`, Disk, Roles, Taints, Version, Internal IP, Age, Schedulable badge, Conditions, and Node Cordon/Uncordon/Drain/Shell actions), Namespaces, Events.
   - **Workloads**: Workloads Overview, Pods (with live CPU/Memory metrics from `kubectl top pods`, container status dots, QoS, Controlled By), Deployments, DaemonSets, StatefulSets, ReplicaSets, Jobs, CronJobs (Trigger & Suspend/Resume).
@@ -44,7 +45,8 @@ See [design.md](./design.md) for the full architectural and protocol design.
 
 | Capability | Required / Optional | Why it is needed |
 | --- | --- | --- |
-| `process:kubectl` | Required | Queries cluster contexts, namespaces, resources, metrics (`kubectl get`, `kubectl top`, `kubectl describe`, `kubectl config view`), and executes user-initiated cluster actions (`apply`, `diff`, `delete`, `scale`, `rollout restart`, `cordon`, `uncordon`, `drain`, `port-forward`). |
+| `process:kubectl` | Required | Queries cluster contexts, namespaces, resources, live watches, and metrics (`kubectl get`, `kubectl get --raw`, `kubectl top`, `kubectl describe`, `kubectl config view`), runs short-lived loopback `kubectl proxy` tunnels during cluster search, and executes user-initiated cluster actions (`apply`, `diff`, `delete`, `scale`, `rollout restart`, `cordon`, `uncordon`, `drain`, `port-forward`). |
+| `net:127.0.0.1` | Required | Sends local loopback HTTP `GET` requests (`http://127.0.0.1:<port>/...`) to the ephemeral `kubectl proxy` process during ground-truth cluster search (`Accept: application/json;as=Table`) — never connects to external services directly. |
 | `process:helm` | Optional | Lists Helm releases (`helm list -o json`) and renders chart templates (`helm template`). |
 | `process:kustomize` | Optional | Builds Kustomize overlays (`kustomize build`) when previewing or inspecting overlays. |
 | `project.read` | Required | Scans workspace YAML, Helm, and Kustomize files (`*.yaml`, `*.yml`) to build the cross-resource manifest index. |
@@ -53,6 +55,15 @@ See [design.md](./design.md) for the full architectural and protocol design.
 | `events` | Required | Subscribes to `file-opened` and `file-saved` events to re-index workspace manifests and refresh diagnostics automatically. |
 | `storage` | Required | Persists the selected cluster context, namespace, `allNamespaces` toggle, and custom kubeconfig path across IDE restarts. |
 | `clipboard` | Required | Copies resource names, `kubectl` commands, and rendered Helm/Kustomize output to the system clipboard. |
+
+### Loopback Network Data Flow (`net:127.0.0.1` & `kubectl proxy`)
+
+Ground-truth cluster search across large or partially loaded scopes uses `net:127.0.0.1` together with `process:kubectl` strictly over local loopback:
+
+1. **Ephemeral loopback proxy**: When a cluster search runs, the plugin starts `kubectl proxy --port=0 --address=127.0.0.1` using the user's selected kubeconfig and cluster context. The OS assigns an ephemeral port bound exclusively to `127.0.0.1`.
+2. **Read-only `Table` requests via selected context**: The OpenIDEA host sends read-only Kubernetes `Table` `GET` requests (`Accept: application/json;as=Table`, `?resourceVersion=0&includeObject=None` with paged `limit`/`continue` fallback) to `http://127.0.0.1:<port>/...` (`kubectl get --raw` cannot send custom `Accept` headers on its own). `kubectl proxy` authenticates and forwards those requests to the cluster's `kube-apiserver` using the chosen kubeconfig/context credentials (including exec/OIDC auth plugins).
+3. **Stopped on search completion & teardown**: The `kubectl proxy` child process is stopped immediately when the search finishes, as well as on cluster refresh/context switches and plugin `deactivate` teardown — no proxy stays running in the background, and short-lived OIDC/PIM tokens are never held across searches.
+4. **Loopback-only vs. external service connections**: Unlike an external host grant (`net:<external-host>`), `net:127.0.0.1` restricts HTTP access strictly to the local loopback interface (`127.0.0.1`). The plugin cannot contact external third-party services, telemetry endpoints, or arbitrary internet hosts; all outbound cluster traffic still goes solely from your local `kubectl` binary to the Kubernetes API server configured in your kubeconfig.
 
 ## Building & Packaging
 

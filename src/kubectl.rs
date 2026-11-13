@@ -6988,10 +6988,11 @@ impl ActiveWatchStream {
     }
 }
 
-/// Persistent `kubectl proxy --port=0 --address=127.0.0.1` loopback tunnel for the active context,
-/// allowing `host::fetch` (`net:127.0.0.1`) to send custom `Accept: application/json;as=Table` +
-/// `Accept-Encoding: gzip` + `?resourceVersion=0&includeObject=None` queries to `kube-apiserver`'s
-/// watch cache (~2.3s / 1.6 MiB for 88k pods instead of 880 MB across 177 `kubectl get` chunks).
+/// Ephemeral per-search `kubectl proxy --port=0 --address=127.0.0.1` loopback tunnel for the active
+/// context, allowing `host::fetch` (`net:127.0.0.1`) to send custom `Accept: application/json;as=Table`
+/// + `Accept-Encoding: gzip` + `?resourceVersion=0&includeObject=None` queries to `kube-apiserver`'s
+/// watch cache (~2.3s / 1.6 MiB for 88k pods instead of 880 MB across 177 `kubectl get` chunks),
+/// and torn down immediately when the search finishes (and on plugin teardown).
 pub struct KubeApiProxy {
     pub kubeconfig: String,
     pub context: String,
@@ -7007,8 +7008,8 @@ impl KubeApiProxy {
 
 /// Manages concurrent `kubectl --raw ?watch=true` child processes
 /// (up to `MAX_MULTI_NAMESPACE_WATCHES` for the active table category when `total <= 1,000`,
-/// 1 for the open Drawer resource, and 1 reusable `kubectl proxy` tunnel), staying safely within
-/// OpenIDEA's 8-child-per-plugin cap.
+/// 1 for the open Drawer resource, and at most 1 ephemeral per-search `kubectl proxy` tunnel),
+/// staying safely within OpenIDEA's 8-child-per-plugin cap.
 #[derive(Default)]
 pub struct WatchManager {
     pub category_streams: Vec<ActiveWatchStream>,
