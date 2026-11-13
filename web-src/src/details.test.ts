@@ -9,6 +9,7 @@ import {
   formatGroundTruthSearchSummary,
   formatNamespaceButtonLabel,
   formatPaginationStatus,
+  isPluginWindowActive,
   isResourceInNamespaceScope,
   matchesEventSearch,
   matchesResourceSearch,
@@ -593,5 +594,12 @@ describe("ResourceDetails helpers", () => {
       ],
     });
     expect(afterStaleWatch.resources.some((r) => r.namespace === "abhaldar")).toBe(false);
+  });
+
+  it("pauses background polling when the desktop window is unfocused or hidden", () => {
+    expect(isPluginWindowActive({ visibilityState: "visible", hasFocus: () => true })).toBe(true);
+    expect(isPluginWindowActive({ visibilityState: "visible", hasFocus: () => false })).toBe(false);
+    expect(isPluginWindowActive({ visibilityState: "hidden", hasFocus: () => true })).toBe(false);
+    expect(isPluginWindowActive(undefined)).toBe(true);
   });
 });

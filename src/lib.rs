@@ -986,6 +986,7 @@ impl KubernetesPlugin {
                     let mut cfg = KubeConfigState::load();
                     self.ensure_catalog_loaded(&project, &mut cfg);
                     self.watches.stop_category();
+                    self.watches.stop_proxy();
                     if let Some(ref mut snap) = self.snapshot {
                         fetch_namespaces_into_snapshot(&project, &cfg, snap);
                         fetch_category_with_options(
@@ -1336,6 +1337,9 @@ impl KubernetesPlugin {
                     self.snapshot = Some(snap);
                     out
                 };
+                // Tear down the `kubectl proxy` child immediately after the search finishes so
+                // it never lingers idle or holds a stale pre-PIM OIDC token in process memory.
+                self.watches.stop_proxy();
                 Self::send_view_payload(json!({
                     "op": "search-results",
                     "requestId": request_id,
@@ -4591,8 +4595,20 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
         assert_eq!(pod_msg["resources"][1]["name"], "deng-eval-job-9");
         assert_eq!(pod_msg["resources"][1]["restarts"], 1);
         assert_eq!(pod_msg["resources"][1]["controlled_by_kind"], "Job");
+        assert!(
+            plugin.watches.api_proxy.is_none(),
+            "ephemeral kubectl proxy must be stopped right after search-category finishes"
+        );
 
-        // 2. Search `"deng"` on Secrets (<= 40,000 items -> single `includeObject=Metadata` request, numeric Data cell `2`)
+        // 2. Search `"deng"` on Secrets (<= 12,000 items -> single `includeObject=Metadata` request, numeric Data cell `2`)
+        let proxy_child_2 = host::start(
+            &host::Command::new("kubectl").args(["proxy", "--port=0"]),
+            None,
+        )
+        .unwrap();
+        plugin
+            .watches
+            .install_test_proxy("", "prod-east", 51466, proxy_child_2);
         plugin
             .snapshot
             .as_mut()

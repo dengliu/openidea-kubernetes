@@ -1039,6 +1039,15 @@ export function computePollDelayMs(durationMs: number, itemCount: number): numbe
   return 5000;
 }
 
+export function isPluginWindowActive(
+  doc: { visibilityState?: string; hasFocus?: () => boolean } | undefined,
+): boolean {
+  if (!doc) return true;
+  if (doc.visibilityState && doc.visibilityState !== "visible") return false;
+  if (typeof doc.hasFocus === "function" && !doc.hasFocus()) return false;
+  return true;
+}
+
 const NON_PAGED_LOCAL_CATEGORIES = new Set<string>([
   "ClusterCatalog",
   "Workspace",
@@ -1582,11 +1591,21 @@ export function App() {
   // Throttled 15-second Age ticker so large clusters avoid re-reconciling every second
   useEffect(() => {
     const id = window.setInterval(() => {
-      if (document.visibilityState === "visible") {
+      if (isPluginWindowActive(document)) {
         setAgeTick((t) => (t + 1) % 1_000_000);
       }
     }, 15000);
     return () => window.clearInterval(id);
+  }, []);
+
+  // Immediately resume watch draining / background polling when the OpenIDEA window regains focus
+  useEffect(() => {
+    const onFocus = () => {
+      setWatchTrigger((n) => (n + 1) % 1_000_000);
+      setPollTrigger((n) => (n + 1) % 1_000_000);
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   }, []);
 
   useEffect(() => {
@@ -1660,7 +1679,7 @@ export function App() {
         setWatchTrigger((n) => (n + 1) % 1_000_000);
         return;
       }
-      if (document.visibilityState === "visible") {
+      if (isPluginWindowActive(document)) {
         let inspectKind: string | null = null;
         let inspectNs: string | null = null;
         let inspectName: string | null = null;
@@ -1720,7 +1739,7 @@ export function App() {
         setPollTrigger((n) => (n + 1) % 1_000_000);
         return;
       }
-      if (document.visibilityState === "visible") {
+      if (isPluginWindowActive(document)) {
         let inspectKind: string | null = null;
         let inspectNs: string | null = null;
         let inspectName: string | null = null;
