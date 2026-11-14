@@ -168,6 +168,15 @@ impl KubeDoc {
     }
 }
 
+/// Resolved `$var` reference in a Go/Helm template, bound at its lexical point of use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelmVarRef {
+    pub name: String,
+    pub range: Range,
+    /// Range of the lexical `$var := ...` declaration active at `range`.
+    pub target_def: Range,
+}
+
 /// Parsed file representation: multi-doc resources, Helm values, `.Values` references,
 /// and named Helm templates (`define` / `include` / `template`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -181,10 +190,8 @@ pub struct ParsedFile {
     pub helm_template_defs: BTreeMap<String, Spanned>,
     /// `{{ include "mychart.fullname" . }}` or `{{ template "mychart.fullname" . }}` references.
     pub helm_template_refs: Vec<Spanned>,
-    /// `{{- $config := $.Values.config -}}` variable definitions (`$var` -> `(def_span, optional_values_prefix)`).
-    pub helm_var_defs: BTreeMap<String, (Spanned, Option<String>)>,
-    /// `$var` usages inside `{{ ... }}` actions (`(var_name, usage_range)`).
-    pub helm_var_refs: Vec<(String, Range)>,
+    /// Lexically bound `$var` usages inside `{{ ... }}` actions.
+    pub helm_var_refs: Vec<HelmVarRef>,
     /// Whether Go/Helm template directives (`{{ ... }}`) appear in the file.
     pub has_helm_directives: bool,
     /// Whether top-level RFC 6902 JSON Patch operations (`- op: replace|add|remove|...`) appear in the file.
@@ -291,12 +298,138 @@ fn is_helm_path_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
 }
 
+#[derive(Clone, Debug, Default)]
+struct HelmScopeFrame {
+    /// Active `.` values path prefix (`None` when `.` is not bound to a `.Values` subtree).
+    dot: Option<String>,
+    /// Variables declared in a control-flow header (`if $x := ...`, `with $x := ...`, `range $k, $v := ...`).
+    header_vars: BTreeMap<String, (Spanned, Option<String>)>,
+    /// Variables declared inside the current branch body (`$x := ...`), popped on `else` and `end`.
+    body_vars: BTreeMap<String, (Spanned, Option<String>)>,
+    is_range: bool,
+    /// `true` for `define "..."` so outer template variables do not leak across separate named templates.
+    isolated: bool,
+}
+
+#[derive(Clone, Debug)]
+struct HelmScopeStack {
+    frames: Vec<HelmScopeFrame>,
+}
+
+impl Default for HelmScopeStack {
+    fn default() -> Self {
+        Self {
+            frames: vec![HelmScopeFrame::default()],
+        }
+    }
+}
+
+impl HelmScopeStack {
+    fn current_dot(&self) -> Option<String> {
+        self.frames.last().and_then(|f| f.dot.clone())
+    }
+
+    fn parent_dot(&self) -> Option<String> {
+        self.frames
+            .len()
+            .checked_sub(2)
+            .and_then(|idx| self.frames.get(idx))
+            .and_then(|f| f.dot.clone())
+    }
+
+    fn lookup_var(&self, name: &str) -> Option<&(Spanned, Option<String>)> {
+        for frame in self.frames.iter().rev() {
+            if let Some(v) = frame.body_vars.get(name) {
+                return Some(v);
+            }
+            if let Some(v) = frame.header_vars.get(name) {
+                return Some(v);
+            }
+            if frame.isolated {
+                break;
+            }
+        }
+        None
+    }
+
+    fn reassign_var(&mut self, name: &str, new_bound: Option<String>) {
+        for frame in self.frames.iter_mut().rev() {
+            if let Some(v) = frame.body_vars.get_mut(name) {
+                v.1 = new_bound;
+                return;
+            }
+            if let Some(v) = frame.header_vars.get_mut(name) {
+                v.1 = new_bound;
+                return;
+            }
+            if frame.isolated {
+                break;
+            }
+        }
+    }
+
+    fn visible_vars(&self) -> BTreeMap<String, Option<String>> {
+        let start = self.frames.iter().rposition(|f| f.isolated).unwrap_or(0);
+        let mut out = BTreeMap::new();
+        for frame in &self.frames[start..] {
+            for (k, (_, bound)) in &frame.header_vars {
+                out.insert(k.clone(), bound.clone());
+            }
+            for (k, (_, bound)) in &frame.body_vars {
+                out.insert(k.clone(), bound.clone());
+            }
+        }
+        out
+    }
+}
+
+/// Finds a top-level Go-template `:=` declaration or `=` reassignment outside quoted strings,
+/// returning `(lhs_end, rhs_start, is_declare)`.
+fn find_helm_assignment(raw: &str) -> Option<(usize, usize, bool)> {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' || b == b'\'' || b == b'`' {
+            let q = b;
+            i += 1;
+            while i < bytes.len() {
+                if q != b'`' && bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == q {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b':' && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+            return Some((i, i + 2, true));
+        }
+        if b == b'=' {
+            let prev = if i > 0 { bytes[i - 1] } else { 0 };
+            let next = bytes.get(i + 1).copied().unwrap_or(0);
+            if !matches!(prev, b':' | b'!' | b'<' | b'>' | b'=')
+                && next != b'='
+                && raw[..i].contains('$')
+            {
+                return Some((i, i + 1, false));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Resolves a Go-template expression (e.g. `.Values.apps`, `$.Values.config`, `$cfg.spec`, `.tool`)
 /// into its underlying `values.yaml` dotted key path when possible.
 fn resolve_helm_values_expr(
     expr: &str,
     current_dot: Option<&str>,
-    var_defs: &BTreeMap<String, (Spanned, Option<String>)>,
+    scopes: &HelmScopeStack,
 ) -> Option<String> {
     let trimmed = expr.trim();
     let head = trimmed
@@ -314,7 +447,7 @@ fn resolve_helm_values_expr(
         return Some(String::new());
     }
     if head == "." {
-        return current_dot.filter(|s| !s.is_empty()).map(str::to_owned);
+        return current_dot.map(str::to_owned);
     }
     if let Some(after_dollar) = head.strip_prefix('$')
         && !after_dollar.is_empty()
@@ -327,9 +460,9 @@ fn resolve_helm_values_expr(
             ),
             None => (head, ""),
         };
-        let base = var_defs.get(var_part)?.1.as_deref()?;
+        let base = scopes.lookup_var(var_part)?.1.as_deref()?;
         return if base.is_empty() {
-            (!subpath.is_empty()).then(|| subpath.to_owned())
+            Some(subpath.to_owned())
         } else if subpath.is_empty() {
             Some(base.to_owned())
         } else {
@@ -339,19 +472,23 @@ fn resolve_helm_values_expr(
     if let Some(rel) = head.strip_prefix('.') {
         let rel = rel.trim_end_matches('.');
         if rel.is_empty() {
-            return current_dot.filter(|s| !s.is_empty()).map(str::to_owned);
+            return current_dot.map(str::to_owned);
         }
         let root_seg = rel.split('.').next().unwrap_or(rel);
         if HELM_BUILTIN_ROOTS.contains(&root_seg) {
             return None;
         }
-        let base = current_dot.filter(|s| !s.is_empty())?;
-        return Some(format!("{base}.{rel}"));
+        let base = current_dot?;
+        return if base.is_empty() {
+            Some(rel.to_owned())
+        } else {
+            Some(format!("{base}.{rel}"))
+        };
     }
     None
 }
 
-/// Scans one `{{ ... }}` action body `[body_start..body_end]` on `line`, updating scopes,
+/// Scans one `{{ ... }}` action body `[body_start..body_end]` on `line`, updating lexical scopes,
 /// `$var` definitions/usages, named template defs/refs, and `.Values` / scoped references.
 #[allow(clippy::too_many_arguments)]
 fn scan_helm_action(
@@ -359,15 +496,13 @@ fn scan_helm_action(
     line: &str,
     body_start: usize,
     body_end: usize,
-    helm_scopes: &mut Vec<Option<String>>,
+    scopes: &mut HelmScopeStack,
     value_refs: &mut Vec<Spanned>,
     template_defs: &mut BTreeMap<String, Spanned>,
     template_refs: &mut Vec<Spanned>,
-    var_defs: &mut BTreeMap<String, (Spanned, Option<String>)>,
-    var_refs: &mut Vec<(String, Range)>,
+    var_refs: &mut Vec<HelmVarRef>,
 ) {
     let raw = &line[body_start..body_end];
-    let lead_ws = raw.len() - raw.trim_start().len();
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return;
@@ -401,50 +536,70 @@ fn scan_helm_action(
         }
     }
 
-    let current_dot = helm_scopes.last().and_then(|s| s.clone());
+    // 2. Identify control-flow keyword and apply `end` / `else` scope exits before scanning RHS tokens
+    let first_word = trimmed
+        .split(|c: char| c.is_ascii_whitespace() || c == '(')
+        .next()
+        .unwrap_or("");
+    let rest_after_kw = trimmed[first_word.len()..].trim_start();
+    if first_word == "end" {
+        if scopes.frames.len() > 1 {
+            scopes.frames.pop();
+        }
+        return;
+    }
+    if first_word == "else" && scopes.frames.len() > 1 {
+        let parent_dot = scopes.parent_dot();
+        if let Some(top) = scopes.frames.last_mut() {
+            top.body_vars.clear();
+            if top.is_range {
+                top.header_vars.clear();
+                top.is_range = false;
+            }
+            top.dot = parent_dot;
+        }
+    }
 
-    // 2. Track `$var := <rhs>` or `range $k, $v := <rhs>` definitions and byte ranges of LHS vars
-    let mut lhs_var_ranges: Vec<(usize, usize)> = Vec::new();
-    if let Some(assign_rel) = raw.find(":=") {
-        let lhs_raw = &raw[..assign_rel];
-        let rhs_raw = &raw[assign_rel + 2..];
-        let rhs_resolved = resolve_helm_values_expr(rhs_raw, current_dot.as_deref(), var_defs);
-        // Extract `$var` tokens on LHS (for `range $i, $app := ...`, the last `$var` receives the item scope)
-        let mut lhs_vars: Vec<(String, usize, usize)> = Vec::new();
+    let current_dot = scopes.current_dot();
+
+    // 3. Parse LHS `$var` tokens for `:=` or `=` (evaluating RHS in the pre-assignment scope)
+    let mut lhs_vars: Vec<(String, usize, usize)> = Vec::new();
+    let mut decl_lhs_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut reassign_lhs_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut assign_info: Option<(Option<String>, bool)> = None;
+    if let Some((lhs_end, rhs_start, is_declare)) = find_helm_assignment(raw) {
+        let lhs_raw = &raw[..lhs_end];
+        let rhs_raw = &raw[rhs_start..];
+        let rhs_resolved = resolve_helm_values_expr(rhs_raw, current_dot.as_deref(), scopes);
         let mut idx = 0;
-        let bytes = lhs_raw.as_bytes();
-        while idx < bytes.len() {
-            if bytes[idx] == b'$' {
+        let lbytes = lhs_raw.as_bytes();
+        while idx < lbytes.len() {
+            if lbytes[idx] == b'$' {
                 let start = idx;
                 idx += 1;
-                while idx < bytes.len() && is_helm_ident_char(bytes[idx] as char) {
+                while idx < lbytes.len() && is_helm_ident_char(lbytes[idx] as char) {
                     idx += 1;
                 }
                 if idx > start + 1 {
-                    lhs_vars.push((
-                        lhs_raw[start..idx].to_owned(),
-                        body_start + start,
-                        body_start + idx,
-                    ));
+                    let abs_s = body_start + start;
+                    let abs_e = body_start + idx;
+                    lhs_vars.push((lhs_raw[start..idx].to_owned(), abs_s, abs_e));
+                    if is_declare {
+                        decl_lhs_ranges.push((abs_s, abs_e));
+                    } else {
+                        reassign_lhs_ranges.push((abs_s, abs_e));
+                    }
                 }
             } else {
                 idx += 1;
             }
         }
-        let last_idx = lhs_vars.len().saturating_sub(1);
-        for (i, (vname, abs_s, abs_e)) in lhs_vars.into_iter().enumerate() {
-            lhs_var_ranges.push((abs_s, abs_e));
-            let bound = if i == last_idx {
-                rhs_resolved.clone()
-            } else {
-                None
-            };
-            let sp = Spanned::new(vname.clone(), range_in_line(line_no, line, abs_s, abs_e));
-            var_defs.insert(vname, (sp, bound));
+        if !lhs_vars.is_empty() {
+            assign_info = Some((rhs_resolved, is_declare));
         }
     }
 
-    // 3. Scan token references inside `raw` (skipping quoted literals) before mutating scope stack
+    // 4. Scan token references inside `raw` (skipping quoted literals and `:=` LHS declarations)
     let bytes = raw.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -494,44 +649,60 @@ fn scan_helm_action(
                 let var_name = &raw[var_start..i];
                 let abs_var_s = body_start + var_start;
                 let abs_var_e = body_start + i;
-                let is_lhs = lhs_var_ranges
+                let is_decl_lhs = decl_lhs_ranges
                     .iter()
                     .any(|&(s, e)| s == abs_var_s && e == abs_var_e);
-                if !is_lhs {
-                    var_refs.push((
-                        var_name.to_owned(),
-                        range_in_line(line_no, line, abs_var_s, abs_var_e),
-                    ));
-                    if i < bytes.len() && bytes[i] == b'.' {
-                        let sub_start = i + 1;
-                        let after_dot = &raw[sub_start..];
-                        let plen = after_dot
-                            .find(|c: char| !is_helm_path_char(c))
-                            .unwrap_or(after_dot.len());
-                        let sub_clean = after_dot[..plen].trim_end_matches('.');
-                        if !sub_clean.is_empty()
-                            && let Some((_, Some(base))) = var_defs.get(var_name)
-                        {
-                            let full = if base.is_empty() {
-                                sub_clean.to_owned()
-                            } else {
-                                format!("{base}.{sub_clean}")
-                            };
-                            let abs_sub_s = body_start + i;
-                            let abs_sub_e = body_start + sub_start + sub_clean.len();
-                            value_refs.push(Spanned::new(
-                                full,
-                                range_in_line(line_no, line, abs_sub_s, abs_sub_e),
-                            ));
+                let is_reassign_lhs = reassign_lhs_ranges
+                    .iter()
+                    .any(|&(s, e)| s == abs_var_s && e == abs_var_e);
+                if !is_decl_lhs {
+                    if let Some((def_sp, bound_opt)) = scopes.lookup_var(var_name) {
+                        var_refs.push(HelmVarRef {
+                            name: var_name.to_owned(),
+                            range: range_in_line(line_no, line, abs_var_s, abs_var_e),
+                            target_def: def_sp.range,
+                        });
+                        if !is_reassign_lhs {
+                            if i < bytes.len() && bytes[i] == b'.' {
+                                let sub_start = i + 1;
+                                let after_dot = &raw[sub_start..];
+                                let plen = after_dot
+                                    .find(|c: char| !is_helm_path_char(c))
+                                    .unwrap_or(after_dot.len());
+                                let sub_clean = after_dot[..plen].trim_end_matches('.');
+                                if !sub_clean.is_empty()
+                                    && let Some(base) = bound_opt.as_deref()
+                                {
+                                    let full = if base.is_empty() {
+                                        sub_clean.to_owned()
+                                    } else {
+                                        format!("{base}.{sub_clean}")
+                                    };
+                                    let abs_sub_s = body_start + i;
+                                    let abs_sub_e = body_start + sub_start + sub_clean.len();
+                                    value_refs.push(Spanned::new(
+                                        full,
+                                        range_in_line(line_no, line, abs_sub_s, abs_sub_e),
+                                    ));
+                                }
+                                i = sub_start + plen;
+                                continue;
+                            } else if let Some(base) = bound_opt.as_deref()
+                                && !base.is_empty()
+                            {
+                                value_refs.push(Spanned::new(
+                                    base.to_owned(),
+                                    range_in_line(line_no, line, abs_var_s, abs_var_e),
+                                ));
+                            }
                         }
+                    } else if i < bytes.len() && bytes[i] == b'.' {
+                        let sub_start = i + 1;
+                        let plen = raw[sub_start..]
+                            .find(|c: char| !is_helm_path_char(c))
+                            .unwrap_or(raw.len() - sub_start);
                         i = sub_start + plen;
-                    } else if let Some((_, Some(base))) = var_defs.get(var_name)
-                        && !base.is_empty()
-                    {
-                        value_refs.push(Spanned::new(
-                            base.clone(),
-                            range_in_line(line_no, line, abs_var_s, abs_var_e),
-                        ));
+                        continue;
                     }
                 }
             }
@@ -603,26 +774,35 @@ fn scan_helm_action(
         i += 1;
     }
 
-    // 4. Update `helm_scopes` for control-flow actions (`range`, `with`, `if`, `define`, `block`, `else`, `end`)
-    let first_word = trimmed
-        .split(|c: char| c.is_ascii_whitespace() || c == '(')
-        .next()
-        .unwrap_or("");
-    let rest_after_kw = trimmed[first_word.len()..].trim_start();
+    // 5. Push/update block frames (`range`, `with`, `if`, `define`, `block`, `else with`)
+    let mut is_header_decl = false;
     match first_word {
-        "end" => {
-            helm_scopes.pop();
-        }
         "range" | "with" => {
-            let expr = match rest_after_kw.find(":=") {
-                Some(idx) => rest_after_kw[idx + 2..].trim_start(),
-                None => rest_after_kw,
+            is_header_decl = true;
+            let expr = match find_helm_assignment(rest_after_kw) {
+                Some((_, rhs_s, true)) => rest_after_kw[rhs_s..].trim_start(),
+                _ => rest_after_kw,
             };
-            let next_scope = resolve_helm_values_expr(expr, current_dot.as_deref(), var_defs);
-            helm_scopes.push(next_scope);
+            let next_scope = resolve_helm_values_expr(expr, current_dot.as_deref(), scopes);
+            scopes.frames.push(HelmScopeFrame {
+                dot: next_scope,
+                is_range: first_word == "range",
+                ..Default::default()
+            });
         }
-        "if" | "define" | "block" => {
-            helm_scopes.push(current_dot);
+        "if" | "block" => {
+            is_header_decl = first_word == "if";
+            scopes.frames.push(HelmScopeFrame {
+                dot: current_dot,
+                ..Default::default()
+            });
+        }
+        "define" => {
+            scopes.frames.push(HelmScopeFrame {
+                dot: None,
+                isolated: true,
+                ..Default::default()
+            });
         }
         "else" => {
             if let Some(with_expr) = rest_after_kw.strip_prefix("with")
@@ -631,38 +811,62 @@ fn scan_helm_action(
                     .next()
                     .is_some_and(|c| c.is_ascii_whitespace() || c == '(')
             {
-                let parent_dot = helm_scopes
-                    .len()
-                    .checked_sub(2)
-                    .and_then(|idx| helm_scopes.get(idx))
-                    .and_then(|s| s.clone());
-                let next_scope = resolve_helm_values_expr(
-                    with_expr.trim_start(),
-                    parent_dot.as_deref(),
-                    var_defs,
-                );
-                if let Some(top) = helm_scopes.last_mut() {
-                    *top = next_scope;
+                is_header_decl = true;
+                let trimmed_with = with_expr.trim_start();
+                let expr = match find_helm_assignment(trimmed_with) {
+                    Some((_, rhs_s, true)) => trimmed_with[rhs_s..].trim_start(),
+                    _ => trimmed_with,
+                };
+                let next_scope = resolve_helm_values_expr(expr, current_dot.as_deref(), scopes);
+                if let Some(top) = scopes.frames.last_mut() {
+                    top.dot = next_scope;
                 }
+            } else if let Some(if_expr) = rest_after_kw.strip_prefix("if")
+                && if_expr
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_whitespace() || c == '(')
+            {
+                is_header_decl = true;
             }
         }
-        _ => {
-            let _ = lead_ws;
+        _ => {}
+    }
+
+    // 6. Commit `:=` declarations or `=` reassignments into the active lexical frame
+    if let Some((rhs_resolved, is_declare)) = assign_info {
+        let last_idx = lhs_vars.len().saturating_sub(1);
+        for (idx, (vname, abs_s, abs_e)) in lhs_vars.into_iter().enumerate() {
+            let bound = if idx == last_idx {
+                rhs_resolved.clone()
+            } else {
+                None
+            };
+            if is_declare {
+                let sp = Spanned::new(vname.clone(), range_in_line(line_no, line, abs_s, abs_e));
+                if let Some(top) = scopes.frames.last_mut() {
+                    if is_header_decl {
+                        top.header_vars.insert(vname, (sp, bound));
+                    } else {
+                        top.body_vars.insert(vname, (sp, bound));
+                    }
+                }
+            } else {
+                scopes.reassign_var(&vname, bound);
+            }
         }
     }
 }
 
 /// Extracts Helm template references, `$var` bindings/usages, and named templates across all `{{ ... }}` blocks on `line`.
-#[allow(clippy::too_many_arguments)]
 fn extract_helm_constructs(
     line_no: u32,
     line: &str,
-    helm_scopes: &mut Vec<Option<String>>,
+    scopes: &mut HelmScopeStack,
     value_refs: &mut Vec<Spanned>,
     template_defs: &mut BTreeMap<String, Spanned>,
     template_refs: &mut Vec<Spanned>,
-    var_defs: &mut BTreeMap<String, (Spanned, Option<String>)>,
-    var_refs: &mut Vec<(String, Range)>,
+    var_refs: &mut Vec<HelmVarRef>,
 ) {
     let mut from = 0;
     while let Some(open_rel) = line[from..].find("{{") {
@@ -695,11 +899,10 @@ fn extract_helm_constructs(
             line,
             body_start,
             body_end,
-            helm_scopes,
+            scopes,
             value_refs,
             template_defs,
             template_refs,
-            var_defs,
             var_refs,
         );
         from = close + 2;
@@ -775,7 +978,7 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
     let mut pending_role_ref: Option<PendingRoleRef> = None;
     let mut pending_subject: Option<PendingSubject> = None;
     let mut pending_scale_target: Option<PendingScaleTargetRef> = None;
-    let mut helm_scopes: Vec<Option<String>> = Vec::new();
+    let mut helm_scopes = HelmScopeStack::default();
 
     let flush_pending =
         |doc: &mut KubeDoc,
@@ -830,7 +1033,6 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
             &mut result.helm_value_refs,
             &mut result.helm_template_defs,
             &mut result.helm_template_refs,
-            &mut result.helm_var_defs,
             &mut result.helm_var_refs,
         );
         if !result.has_helm_directives
@@ -1593,11 +1795,10 @@ pub fn helm_action_context_at(text: &str, pos: Position) -> Option<HelmActionCon
         return None;
     }
     let target_line_idx = (pos.line as usize).min(lines.len().saturating_sub(1));
-    let mut helm_scopes: Vec<Option<String>> = Vec::new();
+    let mut helm_scopes = HelmScopeStack::default();
     let mut value_refs = Vec::new();
     let mut template_defs = BTreeMap::new();
     let mut template_refs = Vec::new();
-    let mut var_defs: BTreeMap<String, (Spanned, Option<String>)> = BTreeMap::new();
     let mut var_refs = Vec::new();
 
     for (i, raw_line) in lines[..target_line_idx].iter().enumerate() {
@@ -1609,7 +1810,6 @@ pub fn helm_action_context_at(text: &str, pos: Position) -> Option<HelmActionCon
             &mut value_refs,
             &mut template_defs,
             &mut template_refs,
-            &mut var_defs,
             &mut var_refs,
         );
     }
@@ -1656,15 +1856,14 @@ pub fn helm_action_context_at(text: &str, pos: Position) -> Option<HelmActionCon
                 &mut value_refs,
                 &mut template_defs,
                 &mut template_refs,
-                &mut var_defs,
                 &mut var_refs,
             );
             from = close + 2;
         } else {
             return Some(HelmActionContext {
                 action_prefix: prefix[body_start..].to_owned(),
-                dot_scope: helm_scopes.last().and_then(|s| s.clone()),
-                vars: var_defs.into_iter().map(|(k, (_, v))| (k, v)).collect(),
+                dot_scope: helm_scopes.current_dot(),
+                vars: helm_scopes.visible_vars(),
             });
         }
     }

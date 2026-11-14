@@ -5754,4 +5754,230 @@ spec:
             "leaked Secret marker from /project-b into /project-a: {markers_a:?}"
         );
     }
+
+    #[test]
+    fn helm_lexical_variable_scopes_bind_per_reference_and_restore_after_shadowing() {
+        let host = MockHost::install();
+        host.add_file(
+            "shadow-chart/Chart.yaml",
+            "apiVersion: v2\nname: shadow-chart\nversion: 0.1.0\n",
+        );
+        host.add_file(
+            "shadow-chart/values.yaml",
+            "outer:\n  name: OUTER\n  outer_only: true\ninner:\n  name: INNER\n  inner_only: true\n",
+        );
+        let tpl = "\
+{{- $cfg := .Values.outer -}}
+before: {{ $cfg.name }}
+{{- with .Values.inner -}}
+{{- $cfg := . -}}
+inside: {{ $cfg.name }}
+{{- end -}}
+after: {{ $cfg.name }}
+";
+        host.add_file("shadow-chart/templates/configmap.yaml", tpl);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        let doc = Document {
+            path: "/project/shadow-chart/templates/configmap.yaml".into(),
+            language: "helm-template".into(),
+            version: 1,
+            text: tpl.into(),
+        };
+
+        // 1. `before: {{ $cfg.name }}` (line 1): `$cfg` -> line 0, `.name` -> `outer.name` (line 1 of values.yaml)
+        let before_var = plugin.definition(&doc, Position::new(1, 12));
+        assert_eq!(before_var.len(), 1);
+        assert_eq!(before_var[0].path, doc.path);
+        assert_eq!(before_var[0].range.start.line, 0);
+
+        let before_prop = plugin.definition(&doc, Position::new(1, 17));
+        assert_eq!(before_prop.len(), 1);
+        assert!(before_prop[0].path.ends_with("shadow-chart/values.yaml"));
+        assert_eq!(before_prop[0].range.start.line, 1);
+
+        // 2. `inside: {{ $cfg.name }}` (line 4): `$cfg` -> line 3, `.name` -> `inner.name` (line 4 of values.yaml)
+        let inside_var = plugin.definition(&doc, Position::new(4, 12));
+        assert_eq!(inside_var.len(), 1);
+        assert_eq!(inside_var[0].path, doc.path);
+        assert_eq!(inside_var[0].range.start.line, 3);
+
+        let inside_prop = plugin.definition(&doc, Position::new(4, 17));
+        assert_eq!(inside_prop.len(), 1);
+        assert!(inside_prop[0].path.ends_with("shadow-chart/values.yaml"));
+        assert_eq!(inside_prop[0].range.start.line, 4);
+
+        // 3. `after: {{ $cfg.name }}` (line 6): `$cfg` -> line 0 (restored!), `.name` -> `outer.name` (line 1)
+        let after_var = plugin.definition(&doc, Position::new(6, 11));
+        assert_eq!(after_var.len(), 1);
+        assert_eq!(after_var[0].path, doc.path);
+        assert_eq!(after_var[0].range.start.line, 0);
+
+        let after_prop = plugin.definition(&doc, Position::new(6, 16));
+        assert_eq!(after_prop.len(), 1);
+        assert!(after_prop[0].path.ends_with("shadow-chart/values.yaml"));
+        assert_eq!(after_prop[0].range.start.line, 1);
+
+        // 4. Completion on `$cfg.` inside `with` offers `inner_only` and omits `outer_only`
+        let inside_comp_doc = Document {
+            text: "\
+{{- $cfg := .Values.outer -}}
+{{- with .Values.inner -}}
+{{- $cfg := . -}}
+inside: {{ $cfg.
+{{- end -}}
+"
+            .into(),
+            ..doc.clone()
+        };
+        let inside_labels: Vec<String> = plugin
+            .completion(&inside_comp_doc, Position::new(3, 16), Some("."))
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(
+            inside_labels.contains(&"inner_only".to_owned())
+                && !inside_labels.contains(&"outer_only".to_owned()),
+            "got {inside_labels:?}"
+        );
+
+        // 5. Completion on `$cfg.` after `end` offers `outer_only` and omits `inner_only`,
+        //    and range-header `$idx` goes out of scope after `end`
+        let after_comp_doc = Document {
+            text: "\
+{{- $cfg := .Values.outer -}}
+{{- range $idx, $cfg := .Values.inner -}}
+inside: {{ $cfg.name }}
+{{- end -}}
+after: {{ $cfg.
+"
+            .into(),
+            ..doc.clone()
+        };
+        let after_labels: Vec<String> = plugin
+            .completion(&after_comp_doc, Position::new(4, 15), Some("."))
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(
+            after_labels.contains(&"outer_only".to_owned())
+                && !after_labels.contains(&"inner_only".to_owned()),
+            "got {after_labels:?}"
+        );
+
+        let after_vars_doc = Document {
+            text: "\
+{{- $cfg := .Values.outer -}}
+{{- range $idx, $cfg := .Values.inner -}}
+{{- end -}}
+after: {{ $
+"
+            .into(),
+            ..doc
+        };
+        let visible_vars: Vec<String> = plugin
+            .completion(&after_vars_doc, Position::new(3, 11), Some("$"))
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(visible_vars.contains(&"$cfg".to_owned()));
+        assert!(
+            !visible_vars.contains(&"$idx".to_owned()),
+            "range-scoped $idx leaked past end: {visible_vars:?}"
+        );
+    }
+
+    #[test]
+    fn kustomize_image_name_completion_preserves_registry_host_and_port() {
+        let host = MockHost::install();
+        host.add_file(
+            "kustomize-reg/deployment.yaml",
+            "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry-app
+spec:
+  selector:
+    matchLabels:
+      app: registry-app
+  template:
+    metadata:
+      labels:
+        app: registry-app
+    spec:
+      containers:
+        - name: web
+          image: localhost:5000/team/app:v1
+        - name: worker
+          image: registry.corp.internal:8443/ns/worker@sha256:0123456789abcdef
+        - name: ipv6
+          image: \"[::1]:5000/org/svc:v2@sha256:fedcba9876543210\"
+        - name: proxy
+          image: nginx:1.27
+",
+        );
+        let kust_text = "\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+images:
+  - name: 
+";
+        host.add_file("kustomize-reg/kustomization.yaml", kust_text);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        let doc = Document {
+            path: "/project/kustomize-reg/kustomization.yaml".into(),
+            language: "yaml".into(),
+            version: 1,
+            text: kust_text.into(),
+        };
+        let labels: Vec<String> = plugin
+            .completion(&doc, Position::new(5, 10), None)
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(
+            labels.contains(&"localhost:5000/team/app".to_owned()),
+            "expected localhost:5000/team/app, got {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"localhost".to_owned()),
+            "must not truncate at registry port colon: {labels:?}"
+        );
+        assert!(labels.contains(&"registry.corp.internal:8443/ns/worker".to_owned()));
+        assert!(labels.contains(&"[::1]:5000/org/svc".to_owned()));
+        assert!(labels.contains(&"nginx".to_owned()));
+
+        // Typing past the port colon (`name: localhost:5000/`) still matches and replaces the full image name
+        let typed_doc = Document {
+            text: "\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+images:
+  - name: localhost:5000/
+"
+            .into(),
+            ..doc
+        };
+        let port_typed = plugin.completion(&typed_doc, Position::new(5, 25), None);
+        assert_eq!(port_typed.len(), 1);
+        assert_eq!(port_typed[0].label, "localhost:5000/team/app");
+        assert_eq!(
+            port_typed[0].replace,
+            Some(Range::new(Position::new(5, 10), Position::new(5, 25)))
+        );
+    }
 }

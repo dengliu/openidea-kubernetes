@@ -1,12 +1,12 @@
 id = "dengliu.kubernetes"
 name = "Kubernetes"
-version = "0.3.9"
+version = "0.3.10"
 icon = "icons/kubernetes-logo.svg"
 description = "Manage Kubernetes clusters, Helm releases and Kustomize overlays: cluster explorer with live Pod logs, shell and port-forward, YAML completion, cross-resource navigation, gutter markers and manifest inspections."
 authors = ["Deng Liu"]
 homepage = "https://github.com/dengliu/openidea-kubernetes"
 license = "Apache-2.0"
-change-notes = "0.3.9 — isolate per-project manifest indices across multi-project workspaces so startup icon warming never leaks cross-project navigation, completions, or inspections; includes Helm Template (helm-template) support, full Kubernetes/Helm/Kustomize completions & links, and dynamic Kubernetes/Helm/Kustomize icons."
+change-notes = "0.3.10 — track Helm template variables lexically across nested blocks (restoring shadowed bindings at end) and preserve registry host:port prefixes in Kustomize image-name completions; includes per-project manifest indices, Helm Template (helm-template) support, full Kubernetes/Helm/Kustomize completions & links, and dynamic Kubernetes/Helm/Kustomize icons."
 categories = ["tools", "frameworks"]
 engines.openidea = "^1.8"
 wasm = "dist/plugin.wasm"

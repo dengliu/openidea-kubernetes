@@ -1066,6 +1066,28 @@ impl ProjectIndex {
     }
 }
 
+/// Splits a container image reference into `(repository_with_registry_port, tag, digest)`,
+/// preserving registry `host:port/...` prefixes (e.g. `localhost:5000/team/app:v1` ->
+/// `("localhost:5000/team/app", Some("v1"), None)`).
+pub fn split_image_reference(image: &str) -> (&str, Option<&str>, Option<&str>) {
+    let (without_digest, digest) = match image.split_once('@') {
+        Some((before, dig)) => (before, Some(dig)),
+        None => (image, None),
+    };
+    let search_start = without_digest.rfind('/').map_or(0, |idx| idx + 1);
+    match without_digest[search_start..].find(':') {
+        Some(colon_rel) => {
+            let colon_idx = search_start + colon_rel;
+            (
+                &without_digest[..colon_idx],
+                Some(&without_digest[colon_idx + 1..]),
+                digest,
+            )
+        }
+        None => (without_digest, None, digest),
+    }
+}
+
 fn contains(range: Range, pos: Position) -> bool {
     range.start <= pos && pos <= range.end
 }
@@ -1103,19 +1125,17 @@ pub fn document_links(
         }
     }
 
-    // 1a. Helm `$var` references -> `$var := ...` definition in the template
-    for (var_name, var_range) in &parsed.helm_var_refs {
-        if let Some((def_sp, _)) = parsed.helm_var_defs.get(var_name) {
-            links.push((
-                *var_range,
-                Location {
-                    path: norm_path.clone(),
-                    range: def_sp.range,
-                },
-                format!("Go to Helm variable '{var_name}'"),
-                "navigate",
-            ));
-        }
+    // 1a. Helm `$var` references -> lexically active `$var := ...` declaration in the template
+    for vref in &parsed.helm_var_refs {
+        links.push((
+            vref.range,
+            Location {
+                path: norm_path.clone(),
+                range: vref.target_def,
+            },
+            format!("Go to Helm variable '{}'", vref.name),
+            "navigate",
+        ));
     }
 
     // 1b. Helm named template `{{ include "name" . }}` / `{{ template "name" . }}` -> `define "name"`
@@ -1749,9 +1769,9 @@ pub fn inspect_document(
                 && let Some(ref img) = container.image
                 && !img.value.contains("{{")
             {
-                let last_segment = img.value.rsplit('/').next().unwrap_or(&img.value);
-                let is_latest_or_untagged = img.value.ends_with(":latest")
-                    || (!last_segment.contains(':') && !img.value.contains('@'));
+                let (repo, tag, digest) = split_image_reference(&img.value);
+                let is_latest_or_untagged =
+                    digest.is_none() && matches!(tag, None | Some("") | Some("latest"));
                 if is_latest_or_untagged {
                     let msg = format!(
                         "Container '{cname}' image '{}' uses ':latest' or omits an explicit version tag",
@@ -1766,8 +1786,7 @@ pub fn inspect_document(
                         false,
                         false,
                     );
-                    let base_img = img.value.strip_suffix(":latest").unwrap_or(&img.value);
-                    let pinned = format!("{base_img}:1.0.0");
+                    let pinned = format!("{repo}:1.0.0");
                     let fix = quickfix(
                         format!("Kubernetes: Pin image version tag ({pinned})"),
                         vec![(
@@ -2907,16 +2926,22 @@ pub fn completions_at(
                     );
                 }
                 "images.name" => {
+                    let raw_clean = raw_val.trim_start_matches(['"', '\'']);
+                    let img_start_col = at.character.saturating_sub(utf16_len(raw_clean));
+                    let img_replace = Range::new(Position::new(at.line, img_start_col), at);
                     let mut seen = BTreeSet::new();
                     for (_, kdoc) in index.all_docs() {
                         for c in &kdoc.containers {
                             if let Some(ref img) = c.image
                                 && !img.value.contains("{{")
                             {
-                                let repo = img.value.split(':').next().unwrap_or(&img.value);
-                                if repo.starts_with(raw_val) && seen.insert(repo.to_owned()) {
+                                let (repo, _, _) = split_image_reference(&img.value);
+                                if !repo.is_empty()
+                                    && repo.starts_with(raw_clean)
+                                    && seen.insert(repo.to_owned())
+                                {
                                     items.push(CompletionItem {
-                                        replace: Some(replace),
+                                        replace: Some(img_replace),
                                         detail: Some(format!("Container image ({})", img.value)),
                                         ..CompletionItem::new(repo, CompletionKind::Value)
                                     });
