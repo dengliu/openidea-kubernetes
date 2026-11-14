@@ -90,13 +90,49 @@ pub struct ContentTabTarget {
 
 #[derive(Default)]
 pub struct KubernetesPlugin {
-    pub index: ProjectIndex,
+    pub indices: std::collections::BTreeMap<String, ProjectIndex>,
     pub snapshot: Option<ClusterSnapshot>,
     pub content_tabs: std::collections::HashMap<String, ContentTabTarget>,
     pub watches: WatchManager,
 }
 
 impl KubernetesPlugin {
+    fn project_index_key(project: Option<&Project>, fallback_doc_path: Option<&str>) -> String {
+        if let Some(proj) = project
+            && let Ok(r) = proj.root()
+        {
+            return normalize_slashes(&r).trim_end_matches('/').to_owned();
+        }
+        if let Some(p) = fallback_doc_path {
+            return format!("standalone:{}", normalize_slashes(p));
+        }
+        String::new()
+    }
+
+    fn index_mut(
+        &mut self,
+        project: Option<&Project>,
+        fallback_doc_path: Option<&str>,
+    ) -> &mut ProjectIndex {
+        let key = Self::project_index_key(project, fallback_doc_path);
+        self.indices.entry(key).or_default()
+    }
+
+    fn index_for(
+        &self,
+        project: Option<&Project>,
+        fallback_doc_path: Option<&str>,
+    ) -> Option<&ProjectIndex> {
+        let key = Self::project_index_key(project, fallback_doc_path);
+        self.indices.get(&key)
+    }
+
+    fn invalidate_project_index(&mut self, project: Option<&Project>) {
+        let key = Self::project_index_key(project, None);
+        if let Some(idx) = self.indices.get_mut(&key) {
+            idx.invalidate();
+        }
+    }
     fn resolve_content_tab_target(&self, key: &str) -> Option<ContentTabTarget> {
         if let Some(t) = self.content_tabs.get(key) {
             return Some(t.clone());
@@ -248,7 +284,8 @@ impl KubernetesPlugin {
             .as_ref()
             .and_then(|p| p.root().ok())
             .unwrap_or_default();
-        self.index.ensure(project.as_ref(), None);
+        self.index_mut(project.as_ref(), None)
+            .ensure(project.as_ref(), None);
         if let Some(ref p) = project {
             self.publish_project_icons(p);
         }
@@ -257,7 +294,9 @@ impl KubernetesPlugin {
         {
             self.refresh_cluster(p);
         }
-        let ws = workspace_manifests_json(&self.index, &root);
+        let empty = ProjectIndex::default();
+        let idx = self.index_for(project.as_ref(), None).unwrap_or(&empty);
+        let ws = workspace_manifests_json(idx, &root);
         let cfg = KubeConfigState::load();
         json!({
             "op": "state",
@@ -837,10 +876,12 @@ impl KubernetesPlugin {
         let Ok(text) = project.read_file(path) else {
             return Ok(0);
         };
-        self.index.ensure(Some(&project), Some((path, &text)));
+        self.index_mut(Some(&project), Some(path))
+            .ensure(Some(&project), Some((path, &text)));
         self.publish_project_icons(&project);
-        let parsed = self
-            .index
+        let empty = ProjectIndex::default();
+        let proj_index = self.index_for(Some(&project), Some(path)).unwrap_or(&empty);
+        let parsed = proj_index
             .files
             .get(&normalize_slashes(path))
             .cloned()
@@ -854,7 +895,7 @@ impl KubernetesPlugin {
         let warn_latest = host::setting_bool("warnLatestTag").unwrap_or(true);
         let warn_resources = host::setting_bool("warnMissingResources").unwrap_or(true);
         let issues = inspect_document(
-            &self.index,
+            proj_index,
             path,
             &text,
             &parsed,
@@ -890,9 +931,12 @@ impl KubernetesPlugin {
     fn scan_project_manifests(&mut self, ctx: &Invocation) -> Result<String, Error> {
         let project = resolve_project(ctx)?;
         let _task = host::begin_task("Kubernetes: Inspecting project manifests", true);
-        self.index.built_at = None;
-        self.index.ensure(Some(&project), None);
-        let paths: Vec<String> = self.index.files.keys().cloned().collect();
+        let paths: Vec<String> = {
+            let idx = self.index_mut(Some(&project), None);
+            idx.invalidate();
+            idx.ensure(Some(&project), None);
+            idx.files.keys().cloned().collect()
+        };
         let mut total_issues = 0usize;
         let mut total_files = 0usize;
         for path in paths {
@@ -928,7 +972,11 @@ impl KubernetesPlugin {
                 }
                 self.update_status_bar(&cfg);
                 let snap = self.snapshot.clone().unwrap_or_default();
-                let ws = workspace_manifests_json(&self.index, &root);
+                self.index_mut(project.as_ref(), None)
+                    .ensure(project.as_ref(), None);
+                let empty = ProjectIndex::default();
+                let idx = self.index_for(project.as_ref(), None).unwrap_or(&empty);
+                let ws = workspace_manifests_json(idx, &root);
                 let cat = v.get("category").and_then(Value::as_str).unwrap_or("Pod");
                 let req_limit = v
                     .get("limit")
@@ -982,8 +1030,9 @@ impl KubernetesPlugin {
                 if let Some(cat) = v.get("category").and_then(Value::as_str) {
                     if cat == "Workspace" {
                         self.watches.stop_category();
-                        self.index.built_at = None;
-                        self.index.ensure(Some(&project), None);
+                        let idx = self.index_mut(Some(&project), None);
+                        idx.invalidate();
+                        idx.ensure(Some(&project), None);
                         self.post_state(ctx);
                         return Ok(());
                     }
@@ -1008,7 +1057,7 @@ impl KubernetesPlugin {
                     self.post_snapshot(false);
                 } else {
                     self.watches.stop_all();
-                    self.index.built_at = None;
+                    self.invalidate_project_index(Some(&project));
                     self.refresh_cluster(&project);
                     self.post_state(ctx);
                 }
@@ -1140,7 +1189,8 @@ impl KubernetesPlugin {
                 if let Some(cat) = v.get("category").and_then(Value::as_str) {
                     if cat == "Workspace" {
                         self.watches.stop_category();
-                        self.index.ensure(Some(&project), None);
+                        self.index_mut(Some(&project), None)
+                            .ensure(Some(&project), None);
                         self.post_state(ctx);
                         return Ok(());
                     }
@@ -2314,8 +2364,10 @@ impl KubernetesPlugin {
             return;
         };
         let norm_root = normalize_slashes(&raw_root);
-        let items: Vec<(String, String)> = self
-            .index
+        let Some(idx) = self.index_for(Some(project), None) else {
+            return;
+        };
+        let items: Vec<(String, String)> = idx
             .compute_workspace_icons(Some(&norm_root))
             .into_iter()
             .map(|(p, icon)| (p, icon.as_str().to_owned()))
@@ -2328,11 +2380,19 @@ impl KubernetesPlugin {
         let Ok(projects) = host::projects() else {
             return;
         };
+        let mut open_keys = std::collections::BTreeSet::new();
         for proj in projects {
-            self.index.invalidate();
-            self.index.ensure(Some(&proj), None);
+            let key = Self::project_index_key(Some(&proj), None);
+            open_keys.insert(key);
+            {
+                let idx = self.index_mut(Some(&proj), None);
+                idx.invalidate();
+                idx.ensure(Some(&proj), None);
+            }
             self.publish_project_icons(&proj);
         }
+        self.indices
+            .retain(|k, _| k.starts_with("standalone:") || open_keys.contains(k));
     }
 }
 
@@ -2374,7 +2434,7 @@ impl Plugin for KubernetesPlugin {
         match id {
             "refresh" => {
                 let project = resolve_project(ctx)?;
-                self.index.built_at = None;
+                self.invalidate_project_index(Some(&project));
                 let snap = self.refresh_cluster(&project);
                 self.post_state(ctx);
                 if let Some(err) = snap.error {
@@ -2523,7 +2583,8 @@ impl Plugin for KubernetesPlugin {
                         } else if let Some(project) = project_of(path)
                             && let Ok(text) = project.read_file(path)
                         {
-                            self.index.ensure(Some(&project), Some((path, &text)));
+                            self.index_mut(Some(&project), Some(path))
+                                .ensure(Some(&project), Some((path, &text)));
                             self.publish_project_icons(&project);
                         }
                     } else {
@@ -2763,15 +2824,16 @@ impl Providers for KubernetesPlugin {
         _trigger: Option<&str>,
     ) -> Vec<CompletionItem> {
         let proj = project_of(&doc.path);
-        self.index
-            .ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
-        let parsed = self
-            .index
-            .files
-            .get(&normalize_slashes(&doc.path))
-            .cloned()
-            .unwrap_or_else(|| parse_yaml(&doc.text));
-        let mut items = completions_at(&self.index, doc, at, &parsed);
+        let mut items = {
+            let idx = self.index_mut(proj.as_ref(), Some(&doc.path));
+            idx.ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
+            let parsed = idx
+                .files
+                .get(&normalize_slashes(&doc.path))
+                .cloned()
+                .unwrap_or_else(|| parse_yaml(&doc.text));
+            completions_at(idx, doc, at, &parsed)
+        };
 
         // Enrich ConfigMap/Secret/Service/ServiceAccount/PVC/CRD completions from the cached live cluster snapshot!
         if manifest::helm_action_context_at(&doc.text, at).is_none()
@@ -2860,24 +2922,25 @@ impl Providers for KubernetesPlugin {
 
     fn code_actions(&mut self, doc: &Document, selection: Range) -> Vec<CodeAction> {
         let proj = project_of(&doc.path);
-        self.index
-            .ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
-        let parsed = self
-            .index
-            .files
-            .get(&normalize_slashes(&doc.path))
-            .cloned()
-            .unwrap_or_else(|| parse_yaml(&doc.text));
         let warn_latest = host::setting_bool("warnLatestTag").unwrap_or(true);
         let warn_resources = host::setting_bool("warnMissingResources").unwrap_or(true);
-        let issues = inspect_document(
-            &self.index,
-            &doc.path,
-            &doc.text,
-            &parsed,
-            warn_latest,
-            warn_resources,
-        );
+        let issues = {
+            let idx = self.index_mut(proj.as_ref(), Some(&doc.path));
+            idx.ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
+            let parsed = idx
+                .files
+                .get(&normalize_slashes(&doc.path))
+                .cloned()
+                .unwrap_or_else(|| parse_yaml(&doc.text));
+            inspect_document(
+                idx,
+                &doc.path,
+                &doc.text,
+                &parsed,
+                warn_latest,
+                warn_resources,
+            )
+        };
         let mut actions = Vec::new();
         let mut seen_titles = std::collections::BTreeSet::new();
         for issue in issues {
@@ -2899,28 +2962,26 @@ impl Providers for KubernetesPlugin {
 
     fn definition(&mut self, doc: &Document, at: Position) -> Vec<Location> {
         let proj = project_of(&doc.path);
-        self.index
-            .ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
-        let parsed = self
-            .index
+        let idx = self.index_mut(proj.as_ref(), Some(&doc.path));
+        idx.ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
+        let parsed = idx
             .files
             .get(&normalize_slashes(&doc.path))
             .cloned()
             .unwrap_or_else(|| parse_yaml(&doc.text));
-        definitions_at(&self.index, doc, at, &parsed)
+        definitions_at(idx, doc, at, &parsed)
     }
 
     fn line_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
         let proj = project_of(&doc.path);
-        self.index
-            .ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
-        let parsed = self
-            .index
+        let idx = self.index_mut(proj.as_ref(), Some(&doc.path));
+        idx.ensure(proj.as_ref(), Some((&doc.path, &doc.text)));
+        let parsed = idx
             .files
             .get(&normalize_slashes(&doc.path))
             .cloned()
             .unwrap_or_else(|| parse_yaml(&doc.text));
-        line_markers_for(&self.index, doc, &parsed)
+        line_markers_for(idx, doc, &parsed)
     }
 }
 
@@ -2942,7 +3003,8 @@ impl Views for KubernetesPlugin {
             .as_ref()
             .and_then(|p| p.root().ok())
             .unwrap_or_default();
-        self.index.ensure(project.as_ref(), None);
+        self.index_mut(project.as_ref(), None)
+            .ensure(project.as_ref(), None);
         if let Some(ref p) = project {
             self.publish_project_icons(p);
         }
@@ -2956,7 +3018,10 @@ impl Views for KubernetesPlugin {
         if initial_snap.resources.len() > MAX_INITIAL_HTML_RESOURCES {
             initial_snap.resources.truncate(MAX_INITIAL_HTML_RESOURCES);
         }
-        let ws = workspace_manifests_json(&self.index, &root);
+        let empty = ProjectIndex::default();
+        let proj_index = self.index_for(project.as_ref(), None).unwrap_or(&empty);
+        let ws = workspace_manifests_json(proj_index, &root);
+        let ws_file_count = proj_index.files.len();
         let initial = json!({
             "op": "state",
             "snapshot": initial_snap,
@@ -2979,7 +3044,7 @@ impl Views for KubernetesPlugin {
                     snap.current_namespace.as_str()
                 },
                 snap.resources.len(),
-                self.index.files.len()
+                ws_file_count
             )
         };
         let initial_b64 = base64_encode(initial.to_string().as_bytes());
@@ -2999,7 +3064,7 @@ impl Views for KubernetesPlugin {
             ViewEvent::Button(id) => match id.as_str() {
                 "refresh" => {
                     let project = resolve_project(ctx)?;
-                    self.index.built_at = None;
+                    self.invalidate_project_index(Some(&project));
                     self.refresh_cluster(&project);
                     self.post_state(ctx);
                     host::refresh_view(VIEW_ID);
@@ -5556,6 +5621,137 @@ spec:
         assert!(
             op_val_items.iter().any(|i| i.label == "replace"),
             "got {op_val_items:?}"
+        );
+    }
+
+    #[test]
+    fn multi_project_activation_keeps_navigation_completions_and_icons_project_scoped() {
+        let host = MockHost::install();
+        host.set_project_root(Some("/project-a"));
+        host.add_project("/project-b");
+
+        let shared_sa = "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: shared\n";
+        let b_only_sa = "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: b-only-sa\n";
+        let b_only_secret = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: b-only-secret\nstringData:\n  TOKEN: abc\n";
+        let pod_a = "\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-a
+spec:
+  serviceAccountName: shared
+  containers:
+    - name: app
+      image: nginx:1.27-alpine
+      envFrom:
+        - secretRef:
+            name: b-only-secret
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 250m
+          memory: 256Mi
+";
+        let pod_b = "\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-b
+spec:
+  serviceAccountName: shared
+  containers:
+    - name: app
+      image: nginx:1.27-alpine
+";
+
+        host.add_file("/project-a/account.yaml", shared_sa);
+        host.add_file("/project-a/pod.yaml", pod_a);
+        host.add_file("/project-b/account.yaml", shared_sa);
+        host.add_file("/project-b/extra-sa.yaml", b_only_sa);
+        host.add_file("/project-b/secret.yaml", b_only_secret);
+        host.add_file("/project-b/pod.yaml", pod_b);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        // 1. Both open projects were warmed into isolated indices during `activate()`,
+        //    and icons publish cleanly for whichever window is active.
+        assert!(plugin.indices.contains_key("/project-a"));
+        assert!(plugin.indices.contains_key("/project-b"));
+        let icons_a = host.file_icons();
+        assert!(
+            icons_a
+                .iter()
+                .any(|((_, p), (ic, _))| p == "/project-a/account.yaml" && ic == "kubernetes"),
+            "expected icon for /project-a/account.yaml, got {icons_a:?}"
+        );
+        host.set_project_root(Some("/project-b"));
+        plugin.sync_all_project_icons();
+        let icons_b = host.file_icons();
+        assert!(
+            icons_b
+                .iter()
+                .any(|((_, p), (ic, _))| p == "/project-b/account.yaml" && ic == "kubernetes"),
+            "expected icon for /project-b/account.yaml, got {icons_b:?}"
+        );
+        host.set_project_root(Some("/project-a"));
+
+        // 2. Go to Definition on `serviceAccountName: shared` (line 5, col 24) in `/project-a/pod.yaml`
+        //    must return ONLY `/project-a/account.yaml`, never `/project-b/account.yaml`.
+        let pod_a_doc = Document {
+            path: "/project-a/pod.yaml".into(),
+            language: "yaml".into(),
+            version: 1,
+            text: pod_a.into(),
+        };
+        let defs_a: Vec<String> = plugin
+            .definition(&pod_a_doc, Position::new(5, 24))
+            .into_iter()
+            .map(|d| d.path)
+            .collect();
+        assert_eq!(defs_a, vec!["/project-a/account.yaml".to_owned()]);
+
+        // 3. Go to Definition on `serviceAccountName: shared` in `/project-b/pod.yaml`
+        //    must return ONLY `/project-b/account.yaml`.
+        let pod_b_doc = Document {
+            path: "/project-b/pod.yaml".into(),
+            language: "yaml".into(),
+            version: 1,
+            text: pod_b.into(),
+        };
+        let defs_b: Vec<String> = plugin
+            .definition(&pod_b_doc, Position::new(5, 24))
+            .into_iter()
+            .map(|d| d.path)
+            .collect();
+        assert_eq!(defs_b, vec!["/project-b/account.yaml".to_owned()]);
+
+        // 4. Completions and gutter markers in `/project-a/pod.yaml` never leak resources from `/project-b`
+        let sa_edit_a = Document {
+            text: "apiVersion: v1\nkind: Pod\nmetadata:\n  name: pod-a\nspec:\n  serviceAccountName: \n".into(),
+            ..pod_a_doc.clone()
+        };
+        let sa_items_a: Vec<String> = plugin
+            .completion(&sa_edit_a, Position::new(5, 22), None)
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(sa_items_a.contains(&"shared".to_owned()));
+        assert!(
+            !sa_items_a.contains(&"b-only-sa".to_owned()),
+            "leaked ServiceAccount from /project-b into /project-a completions: {sa_items_a:?}"
+        );
+
+        let markers_a = plugin.line_markers(&pod_a_doc);
+        assert!(
+            !markers_a
+                .iter()
+                .any(|m| m.tooltip.contains("b-only-secret")),
+            "leaked Secret marker from /project-b into /project-a: {markers_a:?}"
         );
     }
 }

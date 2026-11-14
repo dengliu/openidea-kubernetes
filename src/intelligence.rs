@@ -420,21 +420,10 @@ impl ProjectIndex {
         let fresh = self.built_at.is_some_and(|t| t.elapsed() < INDEX_TTL);
         if !fresh && let Some(proj) = project {
             let started = Instant::now();
-            let proj_root = proj
-                .root()
-                .ok()
-                .map(|r| normalize_slashes(&r).trim_end_matches('/').to_owned());
-            let belongs_to_proj = |p: &str| {
-                proj_root
-                    .as_ref()
-                    .is_some_and(|r| p == r || p.starts_with(&format!("{r}/")))
-            };
-
-            let mut files = std::mem::take(&mut self.files);
-            files.retain(|k, _| !belongs_to_proj(k));
-            self.helm_chart_dirs.retain(|d| !belongs_to_proj(d));
-            self.kustomize_dirs.retain(|d| !belongs_to_proj(d));
-            self.extra_files.retain(|p| !belongs_to_proj(p));
+            let mut files = std::collections::BTreeMap::new();
+            self.helm_chart_dirs.clear();
+            self.kustomize_dirs.clear();
+            self.extra_files.clear();
 
             // 1. Always discover Helm chart roots (`Chart.yaml`), Kustomize roots (`kustomization.yaml`),
             // and auxiliary Helm files first so chart/overlay directory context is complete even in large repos.
