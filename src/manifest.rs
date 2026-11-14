@@ -107,6 +107,9 @@ pub struct KubeDoc {
     pub pvc_refs: Vec<Spanned>,
     pub storage_class_refs: Vec<Spanned>,
     pub role_ref: Option<(String, Spanned)>,
+    pub scale_target_ref: Option<(Option<String>, Spanned)>,
+    pub volumes: Vec<Spanned>,
+    pub volume_mounts: Vec<Spanned>,
     pub ingress_backends: Vec<IngressBackendRef>,
     /// Kustomization file paths (`resources`, `patches`, `components`, `bases`, etc.).
     pub kustomize_paths: Vec<Spanned>,
@@ -178,6 +181,10 @@ pub struct ParsedFile {
     pub helm_template_defs: BTreeMap<String, Spanned>,
     /// `{{ include "mychart.fullname" . }}` or `{{ template "mychart.fullname" . }}` references.
     pub helm_template_refs: Vec<Spanned>,
+    /// `{{- $config := $.Values.config -}}` variable definitions (`$var` -> `(def_span, optional_values_prefix)`).
+    pub helm_var_defs: BTreeMap<String, (Spanned, Option<String>)>,
+    /// `$var` usages inside `{{ ... }}` actions (`(var_name, usage_range)`).
+    pub helm_var_refs: Vec<(String, Range)>,
     /// Whether Go/Helm template directives (`{{ ... }}`) appear in the file.
     pub has_helm_directives: bool,
     /// Whether top-level RFC 6902 JSON Patch operations (`- op: replace|add|remove|...`) appear in the file.
@@ -267,47 +274,120 @@ fn parse_scalar_span(
     ))
 }
 
-/// Extracts `{{ .Values.xxx.yyy }}`, `{{ define "name" }}`, and `{{ include/template "name" }}` from a line.
-fn extract_helm_constructs(
+const HELM_BUILTIN_ROOTS: &[&str] = &[
+    "Values",
+    "Release",
+    "Chart",
+    "Files",
+    "Capabilities",
+    "Template",
+];
+
+fn is_helm_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
+}
+
+fn is_helm_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
+}
+
+/// Resolves a Go-template expression (e.g. `.Values.apps`, `$.Values.config`, `$cfg.spec`, `.tool`)
+/// into its underlying `values.yaml` dotted key path when possible.
+fn resolve_helm_values_expr(
+    expr: &str,
+    current_dot: Option<&str>,
+    var_defs: &BTreeMap<String, (Spanned, Option<String>)>,
+) -> Option<String> {
+    let trimmed = expr.trim();
+    let head = trimmed
+        .split(|c: char| c.is_ascii_whitespace() || c == '|' || c == ')')
+        .next()?
+        .trim_matches(|c| c == '(' || c == ')');
+    if let Some(rest) = head
+        .strip_prefix("$.Values.")
+        .or_else(|| head.strip_prefix(".Values."))
+    {
+        let clean = rest.trim_end_matches('.');
+        return (!clean.is_empty()).then(|| clean.to_owned());
+    }
+    if head == "$.Values" || head == ".Values" {
+        return Some(String::new());
+    }
+    if head == "." {
+        return current_dot.filter(|s| !s.is_empty()).map(str::to_owned);
+    }
+    if let Some(after_dollar) = head.strip_prefix('$')
+        && !after_dollar.is_empty()
+        && !after_dollar.starts_with('.')
+    {
+        let (var_part, subpath) = match after_dollar.find('.') {
+            Some(dot) => (
+                &head[..dot + 1],
+                after_dollar[dot + 1..].trim_end_matches('.'),
+            ),
+            None => (head, ""),
+        };
+        let base = var_defs.get(var_part)?.1.as_deref()?;
+        return if base.is_empty() {
+            (!subpath.is_empty()).then(|| subpath.to_owned())
+        } else if subpath.is_empty() {
+            Some(base.to_owned())
+        } else {
+            Some(format!("{base}.{subpath}"))
+        };
+    }
+    if let Some(rel) = head.strip_prefix('.') {
+        let rel = rel.trim_end_matches('.');
+        if rel.is_empty() {
+            return current_dot.filter(|s| !s.is_empty()).map(str::to_owned);
+        }
+        let root_seg = rel.split('.').next().unwrap_or(rel);
+        if HELM_BUILTIN_ROOTS.contains(&root_seg) {
+            return None;
+        }
+        let base = current_dot.filter(|s| !s.is_empty())?;
+        return Some(format!("{base}.{rel}"));
+    }
+    None
+}
+
+/// Scans one `{{ ... }}` action body `[body_start..body_end]` on `line`, updating scopes,
+/// `$var` definitions/usages, named template defs/refs, and `.Values` / scoped references.
+#[allow(clippy::too_many_arguments)]
+fn scan_helm_action(
     line_no: u32,
     line: &str,
+    body_start: usize,
+    body_end: usize,
+    helm_scopes: &mut Vec<Option<String>>,
     value_refs: &mut Vec<Spanned>,
     template_defs: &mut BTreeMap<String, Spanned>,
     template_refs: &mut Vec<Spanned>,
+    var_defs: &mut BTreeMap<String, (Spanned, Option<String>)>,
+    var_refs: &mut Vec<(String, Range)>,
 ) {
-    let mut search_from = 0;
-    while let Some(idx) = line[search_from..].find(".Values.") {
-        let start_byte = search_from + idx + ".Values.".len();
-        let rest = &line[start_byte..];
-        let path_len = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
-            .unwrap_or(rest.len());
-        let path = rest[..path_len].trim_end_matches('.');
-        if !path.is_empty() {
-            let end_byte = start_byte + path.len();
-            value_refs.push(Spanned::new(
-                path,
-                range_in_line(line_no, line, start_byte, end_byte),
-            ));
-        }
-        search_from = start_byte + path_len.max(1);
+    let raw = &line[body_start..body_end];
+    let lead_ws = raw.len() - raw.trim_start().len();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
     }
 
+    // 1. Named templates: `define "name"`, `include "name"`, `template "name"`
     for (kw, is_def) in [
         ("define \"", true),
         ("include \"", false),
         ("template \"", false),
     ] {
         let mut from = 0;
-        while let Some(idx) = line[from..].find(kw) {
+        while let Some(idx) = raw[from..].find(kw) {
             let name_start = from + idx + kw.len();
-            if let Some(end_rel) = line[name_start..].find('"') {
-                let name = &line[name_start..name_start + end_rel];
+            if let Some(end_rel) = raw[name_start..].find('"') {
+                let name = &raw[name_start..name_start + end_rel];
                 if !name.is_empty() {
-                    let sp = Spanned::new(
-                        name,
-                        range_in_line(line_no, line, name_start, name_start + end_rel),
-                    );
+                    let abs_start = body_start + name_start;
+                    let abs_end = body_start + name_start + end_rel;
+                    let sp = Spanned::new(name, range_in_line(line_no, line, abs_start, abs_end));
                     if is_def {
                         template_defs.insert(name.to_owned(), sp);
                     } else {
@@ -319,6 +399,310 @@ fn extract_helm_constructs(
                 break;
             }
         }
+    }
+
+    let current_dot = helm_scopes.last().and_then(|s| s.clone());
+
+    // 2. Track `$var := <rhs>` or `range $k, $v := <rhs>` definitions and byte ranges of LHS vars
+    let mut lhs_var_ranges: Vec<(usize, usize)> = Vec::new();
+    if let Some(assign_rel) = raw.find(":=") {
+        let lhs_raw = &raw[..assign_rel];
+        let rhs_raw = &raw[assign_rel + 2..];
+        let rhs_resolved = resolve_helm_values_expr(rhs_raw, current_dot.as_deref(), var_defs);
+        // Extract `$var` tokens on LHS (for `range $i, $app := ...`, the last `$var` receives the item scope)
+        let mut lhs_vars: Vec<(String, usize, usize)> = Vec::new();
+        let mut idx = 0;
+        let bytes = lhs_raw.as_bytes();
+        while idx < bytes.len() {
+            if bytes[idx] == b'$' {
+                let start = idx;
+                idx += 1;
+                while idx < bytes.len() && is_helm_ident_char(bytes[idx] as char) {
+                    idx += 1;
+                }
+                if idx > start + 1 {
+                    lhs_vars.push((
+                        lhs_raw[start..idx].to_owned(),
+                        body_start + start,
+                        body_start + idx,
+                    ));
+                }
+            } else {
+                idx += 1;
+            }
+        }
+        let last_idx = lhs_vars.len().saturating_sub(1);
+        for (i, (vname, abs_s, abs_e)) in lhs_vars.into_iter().enumerate() {
+            lhs_var_ranges.push((abs_s, abs_e));
+            let bound = if i == last_idx {
+                rhs_resolved.clone()
+            } else {
+                None
+            };
+            let sp = Spanned::new(vname.clone(), range_in_line(line_no, line, abs_s, abs_e));
+            var_defs.insert(vname, (sp, bound));
+        }
+    }
+
+    // 3. Scan token references inside `raw` (skipping quoted literals) before mutating scope stack
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' || b == b'\'' || b == b'`' {
+            let q = b;
+            i += 1;
+            while i < bytes.len() {
+                if q != b'`' && bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == q {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Handle `$.Values.<path>` or `$var[.subpath]`
+        if b == b'$' {
+            let rest = &raw[i..];
+            if let Some(after_root) = rest.strip_prefix("$.Values.") {
+                let plen = after_root
+                    .find(|c: char| !is_helm_path_char(c))
+                    .unwrap_or(after_root.len());
+                let clean = after_root[..plen].trim_end_matches('.');
+                if !clean.is_empty() {
+                    let abs_s = body_start + i;
+                    let abs_e = body_start + i + "$.Values.".len() + clean.len();
+                    value_refs.push(Spanned::new(
+                        clean,
+                        range_in_line(line_no, line, abs_s, abs_e),
+                    ));
+                }
+                i += "$.Values.".len() + plen.max(1);
+                continue;
+            }
+            let var_start = i;
+            i += 1;
+            while i < bytes.len() && is_helm_ident_char(bytes[i] as char) {
+                i += 1;
+            }
+            if i > var_start + 1 {
+                let var_name = &raw[var_start..i];
+                let abs_var_s = body_start + var_start;
+                let abs_var_e = body_start + i;
+                let is_lhs = lhs_var_ranges
+                    .iter()
+                    .any(|&(s, e)| s == abs_var_s && e == abs_var_e);
+                if !is_lhs {
+                    var_refs.push((
+                        var_name.to_owned(),
+                        range_in_line(line_no, line, abs_var_s, abs_var_e),
+                    ));
+                    if i < bytes.len() && bytes[i] == b'.' {
+                        let sub_start = i + 1;
+                        let after_dot = &raw[sub_start..];
+                        let plen = after_dot
+                            .find(|c: char| !is_helm_path_char(c))
+                            .unwrap_or(after_dot.len());
+                        let sub_clean = after_dot[..plen].trim_end_matches('.');
+                        if !sub_clean.is_empty()
+                            && let Some((_, Some(base))) = var_defs.get(var_name)
+                        {
+                            let full = if base.is_empty() {
+                                sub_clean.to_owned()
+                            } else {
+                                format!("{base}.{sub_clean}")
+                            };
+                            let abs_sub_s = body_start + i;
+                            let abs_sub_e = body_start + sub_start + sub_clean.len();
+                            value_refs.push(Spanned::new(
+                                full,
+                                range_in_line(line_no, line, abs_sub_s, abs_sub_e),
+                            ));
+                        }
+                        i = sub_start + plen;
+                    } else if let Some((_, Some(base))) = var_defs.get(var_name)
+                        && !base.is_empty()
+                    {
+                        value_refs.push(Spanned::new(
+                            base.clone(),
+                            range_in_line(line_no, line, abs_var_s, abs_var_e),
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Handle `.Values.<path>` or relative `.field` inside an active `range` / `with` scope
+        if b == b'.' {
+            let prev_is_ident = i > 0
+                && (bytes[i - 1].is_ascii_alphanumeric()
+                    || matches!(bytes[i - 1], b'_' | b'-' | b'$'));
+            if !prev_is_ident {
+                let rest = &raw[i..];
+                if let Some(after_vals) = rest.strip_prefix(".Values.") {
+                    let plen = after_vals
+                        .find(|c: char| !is_helm_path_char(c))
+                        .unwrap_or(after_vals.len());
+                    let clean = after_vals[..plen].trim_end_matches('.');
+                    if !clean.is_empty() {
+                        let abs_s = body_start + i;
+                        let abs_e = body_start + i + ".Values.".len() + clean.len();
+                        value_refs.push(Spanned::new(
+                            clean,
+                            range_in_line(line_no, line, abs_s, abs_e),
+                        ));
+                    }
+                    i += ".Values.".len() + plen.max(1);
+                    continue;
+                }
+                let after_dot = &rest[1..];
+                let plen = after_dot
+                    .find(|c: char| !is_helm_path_char(c))
+                    .unwrap_or(after_dot.len());
+                let rel_clean = after_dot[..plen].trim_end_matches('.');
+                if rel_clean.is_empty() {
+                    if let Some(ref scope_base) = current_dot
+                        && !scope_base.is_empty()
+                    {
+                        let abs_s = body_start + i;
+                        value_refs.push(Spanned::new(
+                            scope_base.clone(),
+                            range_in_line(line_no, line, abs_s, abs_s + 1),
+                        ));
+                    }
+                    i += 1;
+                    continue;
+                }
+                let first_seg = rel_clean.split('.').next().unwrap_or(rel_clean);
+                if !HELM_BUILTIN_ROOTS.contains(&first_seg)
+                    && first_seg
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && let Some(ref scope_base) = current_dot
+                    && !scope_base.is_empty()
+                {
+                    let abs_s = body_start + i;
+                    let abs_e = body_start + i + 1 + rel_clean.len();
+                    value_refs.push(Spanned::new(
+                        format!("{scope_base}.{rel_clean}"),
+                        range_in_line(line_no, line, abs_s, abs_e),
+                    ));
+                }
+                i += 1 + plen;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    // 4. Update `helm_scopes` for control-flow actions (`range`, `with`, `if`, `define`, `block`, `else`, `end`)
+    let first_word = trimmed
+        .split(|c: char| c.is_ascii_whitespace() || c == '(')
+        .next()
+        .unwrap_or("");
+    let rest_after_kw = trimmed[first_word.len()..].trim_start();
+    match first_word {
+        "end" => {
+            helm_scopes.pop();
+        }
+        "range" | "with" => {
+            let expr = match rest_after_kw.find(":=") {
+                Some(idx) => rest_after_kw[idx + 2..].trim_start(),
+                None => rest_after_kw,
+            };
+            let next_scope = resolve_helm_values_expr(expr, current_dot.as_deref(), var_defs);
+            helm_scopes.push(next_scope);
+        }
+        "if" | "define" | "block" => {
+            helm_scopes.push(current_dot);
+        }
+        "else" => {
+            if let Some(with_expr) = rest_after_kw.strip_prefix("with")
+                && with_expr
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_whitespace() || c == '(')
+            {
+                let parent_dot = helm_scopes
+                    .len()
+                    .checked_sub(2)
+                    .and_then(|idx| helm_scopes.get(idx))
+                    .and_then(|s| s.clone());
+                let next_scope = resolve_helm_values_expr(
+                    with_expr.trim_start(),
+                    parent_dot.as_deref(),
+                    var_defs,
+                );
+                if let Some(top) = helm_scopes.last_mut() {
+                    *top = next_scope;
+                }
+            }
+        }
+        _ => {
+            let _ = lead_ws;
+        }
+    }
+}
+
+/// Extracts Helm template references, `$var` bindings/usages, and named templates across all `{{ ... }}` blocks on `line`.
+#[allow(clippy::too_many_arguments)]
+fn extract_helm_constructs(
+    line_no: u32,
+    line: &str,
+    helm_scopes: &mut Vec<Option<String>>,
+    value_refs: &mut Vec<Spanned>,
+    template_defs: &mut BTreeMap<String, Spanned>,
+    template_refs: &mut Vec<Spanned>,
+    var_defs: &mut BTreeMap<String, (Spanned, Option<String>)>,
+    var_refs: &mut Vec<(String, Range)>,
+) {
+    let mut from = 0;
+    while let Some(open_rel) = line[from..].find("{{") {
+        let open = from + open_rel;
+        let mut body_start = open + 2;
+        if line[body_start..].starts_with("/*") {
+            if let Some(close_rel) = line[body_start + 2..].find("*/}}") {
+                from = body_start + 2 + close_rel + 4;
+                continue;
+            } else if let Some(close_rel) = line[body_start + 2..].find("*/-}}") {
+                from = body_start + 2 + close_rel + 5;
+                continue;
+            }
+            break;
+        }
+        if line[body_start..].starts_with('-') {
+            body_start += 1;
+        }
+        let Some(close_rel) = line[body_start..].find("}}") else {
+            break;
+        };
+        let close = body_start + close_rel;
+        let body_end = if close > body_start && line.as_bytes()[close - 1] == b'-' {
+            close - 1
+        } else {
+            close
+        };
+        scan_helm_action(
+            line_no,
+            line,
+            body_start,
+            body_end,
+            helm_scopes,
+            value_refs,
+            template_defs,
+            template_refs,
+            var_defs,
+            var_refs,
+        );
+        from = close + 2;
     }
 }
 
@@ -357,6 +741,13 @@ struct PendingSubject {
     name: Option<Spanned>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PendingScaleTargetRef {
+    indent: usize,
+    kind: Option<String>,
+    name: Option<Spanned>,
+}
+
 /// Parses a YAML document into `ParsedFile`.
 pub fn parse_yaml(text: &str) -> ParsedFile {
     let mut result = ParsedFile::default();
@@ -383,42 +774,51 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
     let mut pending_backend: Option<PendingIngressBackend> = None;
     let mut pending_role_ref: Option<PendingRoleRef> = None;
     let mut pending_subject: Option<PendingSubject> = None;
+    let mut pending_scale_target: Option<PendingScaleTargetRef> = None;
+    let mut helm_scopes: Vec<Option<String>> = Vec::new();
 
-    let flush_pending = |doc: &mut KubeDoc,
-                         pending_ref: &mut Option<PendingRef>,
-                         pending_backend: &mut Option<PendingIngressBackend>,
-                         pending_role_ref: &mut Option<PendingRoleRef>,
-                         pending_subject: &mut Option<PendingSubject>| {
-        if let Some(r) = pending_ref.take()
-            && let Some(name) = r.name
-        {
-            doc.data_refs.push(DataRef {
-                target_kind: r.kind,
-                name,
-                key: r.key,
-            });
-        }
-        if let Some(b) = pending_backend.take()
-            && let Some(service_name) = b.service_name
-        {
-            doc.ingress_backends.push(IngressBackendRef {
-                service_name,
-                port_name: b.port_name,
-                port_number: b.port_number,
-            });
-        }
-        if let Some(rr) = pending_role_ref.take()
-            && let Some(name) = rr.name
-        {
-            doc.role_ref = Some((rr.kind.unwrap_or_else(|| "Role".into()), name));
-        }
-        if let Some(sub) = pending_subject.take()
-            && sub.kind.as_deref() == Some("ServiceAccount")
-            && let Some(name) = sub.name
-        {
-            doc.service_account_refs.push(name);
-        }
-    };
+    let flush_pending =
+        |doc: &mut KubeDoc,
+         pending_ref: &mut Option<PendingRef>,
+         pending_backend: &mut Option<PendingIngressBackend>,
+         pending_role_ref: &mut Option<PendingRoleRef>,
+         pending_subject: &mut Option<PendingSubject>,
+         pending_scale_target: &mut Option<PendingScaleTargetRef>| {
+            if let Some(r) = pending_ref.take()
+                && let Some(name) = r.name
+            {
+                doc.data_refs.push(DataRef {
+                    target_kind: r.kind,
+                    name,
+                    key: r.key,
+                });
+            }
+            if let Some(b) = pending_backend.take()
+                && let Some(service_name) = b.service_name
+            {
+                doc.ingress_backends.push(IngressBackendRef {
+                    service_name,
+                    port_name: b.port_name,
+                    port_number: b.port_number,
+                });
+            }
+            if let Some(rr) = pending_role_ref.take()
+                && let Some(name) = rr.name
+            {
+                doc.role_ref = Some((rr.kind.unwrap_or_else(|| "Role".into()), name));
+            }
+            if let Some(sub) = pending_subject.take()
+                && sub.kind.as_deref() == Some("ServiceAccount")
+                && let Some(name) = sub.name
+            {
+                doc.service_account_refs.push(name);
+            }
+            if let Some(st) = pending_scale_target.take()
+                && let Some(name) = st.name
+            {
+                doc.scale_target_ref = Some((st.kind, name));
+            }
+        };
 
     for (idx, raw_line) in lines.iter().enumerate() {
         let line_no = idx as u32;
@@ -426,9 +826,12 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
         extract_helm_constructs(
             line_no,
             line,
+            &mut helm_scopes,
             &mut result.helm_value_refs,
             &mut result.helm_template_defs,
             &mut result.helm_template_refs,
+            &mut result.helm_var_defs,
+            &mut result.helm_var_refs,
         );
         if !result.has_helm_directives
             && let Some(open) = line.find("{{")
@@ -460,6 +863,7 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                 &mut pending_backend,
                 &mut pending_role_ref,
                 &mut pending_subject,
+                &mut pending_scale_target,
             );
             doc.end_line = line_no.saturating_sub(1);
             if doc.is_kube_resource() {
@@ -531,6 +935,14 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
             && let Some(name) = sub.name
         {
             doc.service_account_refs.push(name);
+        }
+        if pending_scale_target
+            .as_ref()
+            .is_some_and(|p| raw_indent <= p.indent)
+            && let Some(st) = pending_scale_target.take()
+            && let Some(name) = st.name
+        {
+            doc.scale_target_ref = Some((st.kind, name));
         }
 
         let after_spaces = &line[raw_indent..];
@@ -716,8 +1128,8 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
             format!("{joined_parent}.{key}")
         };
 
-        // Record Helm `values.yaml` flattened path (capped at 512 entries per file).
-        if result.helm_values.len() < 512 {
+        // Record Helm `values.yaml` flattened path (capped at 2048 entries per file).
+        if result.helm_values.len() < 2048 {
             if let Some(ref val) = scalar {
                 result
                     .helm_values
@@ -874,6 +1286,13 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                     name: None,
                 });
             }
+            "scaleTargetRef" if full_path == "spec.scaleTargetRef" => {
+                pending_scale_target = Some(PendingScaleTargetRef {
+                    indent: effective_indent,
+                    kind: None,
+                    name: None,
+                });
+            }
             _ => {}
         }
 
@@ -913,6 +1332,15 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
             match key {
                 "kind" => sub.kind = scalar.as_ref().map(|s| s.value.clone()),
                 "name" => sub.name = scalar.clone(),
+                _ => {}
+            }
+        }
+        if let Some(ref mut st) = pending_scale_target
+            && effective_indent > st.indent
+        {
+            match key {
+                "kind" => st.kind = scalar.as_ref().map(|s| s.value.clone()),
+                "name" => st.name = scalar.clone(),
                 _ => {}
             }
         }
@@ -1049,6 +1477,14 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
                             _ => {}
                         }
                     }
+                } else if full_path.ends_with("spec.volumes.name")
+                    && let Some(s) = scalar.clone()
+                {
+                    doc.volumes.push(s);
+                } else if full_path.ends_with("volumeMounts.name")
+                    && let Some(s) = scalar.clone()
+                {
+                    doc.volume_mounts.push(s);
                 } else if (full_path.contains("spec.containers.")
                     || full_path.contains("spec.initContainers."))
                     && let Some(container) = doc.containers.last_mut()
@@ -1129,12 +1565,110 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
         &mut pending_backend,
         &mut pending_role_ref,
         &mut pending_subject,
+        &mut pending_scale_target,
     );
     if doc.is_kube_resource() {
         result.docs.push(doc);
     }
 
     result
+}
+
+/// Active Go/Helm `{{ ... }}` action context at cursor `pos`, if the cursor is inside an open `{{ ... }}` block.
+#[derive(Clone, Debug, Default)]
+pub struct HelmActionContext {
+    /// Text inside the open `{{` (after optional `-`) up to `pos`.
+    pub action_prefix: String,
+    /// Current `range` / `with` `.` scope resolved to a `values.yaml` key prefix, if any.
+    pub dot_scope: Option<String>,
+    /// Visible `$variables` defined up to `pos` (`$var` -> optional `values.yaml` key prefix).
+    pub vars: BTreeMap<String, Option<String>>,
+}
+
+/// Returns `Some(HelmActionContext)` when `pos` sits inside an unclosed `{{ ... }}` template action
+/// (excluding `{{/* ... */}}` comments).
+pub fn helm_action_context_at(text: &str, pos: Position) -> Option<HelmActionContext> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let target_line_idx = (pos.line as usize).min(lines.len().saturating_sub(1));
+    let mut helm_scopes: Vec<Option<String>> = Vec::new();
+    let mut value_refs = Vec::new();
+    let mut template_defs = BTreeMap::new();
+    let mut template_refs = Vec::new();
+    let mut var_defs: BTreeMap<String, (Spanned, Option<String>)> = BTreeMap::new();
+    let mut var_refs = Vec::new();
+
+    for (i, raw_line) in lines[..target_line_idx].iter().enumerate() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        extract_helm_constructs(
+            i as u32,
+            line,
+            &mut helm_scopes,
+            &mut value_refs,
+            &mut template_defs,
+            &mut template_refs,
+            &mut var_defs,
+            &mut var_refs,
+        );
+    }
+
+    let current_raw = lines.get(target_line_idx).copied().unwrap_or("");
+    let current_line = current_raw.strip_suffix('\r').unwrap_or(current_raw);
+    let units: Vec<u16> = current_line
+        .encode_utf16()
+        .take(pos.character as usize)
+        .collect();
+    let prefix = String::from_utf16_lossy(&units);
+
+    // Advance scopes through any completed `{{ ... }}` blocks earlier on `current_line`
+    let mut from = 0;
+    while let Some(open_rel) = prefix[from..].find("{{") {
+        let open = from + open_rel;
+        let mut body_start = open + 2;
+        if prefix[body_start..].starts_with("/*") {
+            if let Some(close_rel) = prefix[body_start + 2..].find("*/}}") {
+                from = body_start + 2 + close_rel + 4;
+                continue;
+            } else if let Some(close_rel) = prefix[body_start + 2..].find("*/-}}") {
+                from = body_start + 2 + close_rel + 5;
+                continue;
+            }
+            return None;
+        }
+        if prefix[body_start..].starts_with('-') {
+            body_start += 1;
+        }
+        if let Some(close_rel) = prefix[body_start..].find("}}") {
+            let close = body_start + close_rel;
+            let body_end = if close > body_start && prefix.as_bytes()[close - 1] == b'-' {
+                close - 1
+            } else {
+                close
+            };
+            scan_helm_action(
+                target_line_idx as u32,
+                &prefix,
+                body_start,
+                body_end,
+                &mut helm_scopes,
+                &mut value_refs,
+                &mut template_defs,
+                &mut template_refs,
+                &mut var_defs,
+                &mut var_refs,
+            );
+            from = close + 2;
+        } else {
+            return Some(HelmActionContext {
+                action_prefix: prefix[body_start..].to_owned(),
+                dot_scope: helm_scopes.last().and_then(|s| s.clone()),
+                vars: var_defs.into_iter().map(|(k, (_, v))| (k, v)).collect(),
+            });
+        }
+    }
+    None
 }
 
 /// Returns the YAML path hierarchy at `position` (`line`, `character`) for context-aware completion.
@@ -1154,7 +1688,16 @@ pub fn yaml_context_at(text: &str, pos: Position) -> (String, String, Option<Str
 
     let current_line = lines.get(target_line_idx).copied().unwrap_or("");
     let current_line = current_line.strip_suffix('\r').unwrap_or(current_line);
-    let current_indent = current_line.len() - current_line.trim_start_matches(' ').len();
+    let units: Vec<u16> = current_line
+        .encode_utf16()
+        .take(pos.character as usize)
+        .collect();
+    let line_prefix = String::from_utf16_lossy(&units);
+    let current_indent = if current_line.trim().is_empty() {
+        line_prefix.len() - line_prefix.trim_start_matches(' ').len()
+    } else {
+        current_line.len() - current_line.trim_start_matches(' ').len()
+    };
 
     let mut stack: Vec<(usize, String)> = Vec::new();
     let mut doc_kind: Option<String> = None;
@@ -1162,7 +1705,7 @@ pub fn yaml_context_at(text: &str, pos: Position) -> (String, String, Option<Str
     for line_raw in &lines[doc_start..target_line_idx] {
         let line = line_raw.strip_suffix('\r').unwrap_or(line_raw);
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("{{") {
             continue;
         }
         let raw_indent = line.len() - line.trim_start_matches(' ').len();
@@ -1170,6 +1713,8 @@ pub fn yaml_context_at(text: &str, pos: Position) -> (String, String, Option<Str
         let (is_list, eff_indent, content) = if let Some(rest) = after_spaces.strip_prefix("- ") {
             let extra = rest.len() - rest.trim_start_matches(' ').len();
             (true, raw_indent + 2 + extra, &rest[extra..])
+        } else if after_spaces == "-" {
+            (true, raw_indent + 2, "")
         } else {
             (false, raw_indent, after_spaces)
         };
@@ -1186,6 +1731,9 @@ pub fn yaml_context_at(text: &str, pos: Position) -> (String, String, Option<Str
             let key = content[..colon]
                 .trim()
                 .trim_matches(|c| c == '"' || c == '\'');
+            if key.is_empty() || key.contains("{{") {
+                continue;
+            }
             let after = content[colon + 1..].trim();
             if raw_indent == 0 && key == "kind" && !after.is_empty() {
                 doc_kind = Some(after.trim_matches(|c| c == '"' || c == '\'').to_owned());
@@ -1214,8 +1762,17 @@ pub fn yaml_context_at(text: &str, pos: Position) -> (String, String, Option<Str
         }
     }
 
-    while stack.last().is_some_and(|(ind, _)| *ind >= current_indent) {
-        stack.pop();
+    let current_is_list = current_line
+        [current_line.len() - current_line.trim_start_matches(' ').len()..]
+        .starts_with("- ");
+    if current_is_list {
+        while stack.last().is_some_and(|(ind, _)| *ind > current_indent) {
+            stack.pop();
+        }
+    } else {
+        while stack.last().is_some_and(|(ind, _)| *ind >= current_indent) {
+            stack.pop();
+        }
     }
 
     let parent_path = stack

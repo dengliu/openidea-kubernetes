@@ -4,7 +4,10 @@
 //! - Cross-resource Go to Definition & Gutter Line Markers
 //! - Static inspections & Quick Fixes (`CodeAction`)
 
-use crate::manifest::{KubeDoc, ParsedFile, Spanned, parse_yaml, utf16_len, yaml_context_at};
+use crate::manifest::{
+    HelmActionContext, KubeDoc, ParsedFile, Spanned, helm_action_context_at, parse_yaml, utf16_len,
+    yaml_context_at,
+};
 use openidea_plugin::providers::{
     CodeAction, CompletionItem, CompletionKind, Document, LineMarker,
 };
@@ -953,31 +956,111 @@ impl ProjectIndex {
         out
     }
 
-    /// Finds `values.yaml` definitions for a Helm `.Values.<key>` reference.
-    pub fn find_helm_value(&self, key_path: &str) -> Vec<(String, Range, String)> {
-        let mut out = Vec::new();
-        for (path, parsed) in &self.files {
-            let file_name = path.rsplit('/').next().unwrap_or(path);
-            if (file_name == "values.yaml"
-                || file_name == "values.yml"
-                || file_name.starts_with("values."))
-                && let Some(sp) = parsed.helm_values.get(key_path)
-            {
-                out.push((path.clone(), sp.range, sp.value.clone()));
+    /// Infers the enclosing Helm chart root directory for `path`, falling back to `.../templates/..`
+    /// or a values file's parent directory when `Chart.yaml` has not been scanned yet.
+    pub fn infer_helm_chart_dir(&self, path: &str) -> Option<String> {
+        let norm = normalize_slashes(path);
+        if let Some(chart_dir) = self.enclosing_helm_chart_dir(&norm) {
+            return Some(chart_dir.to_owned());
+        }
+        if let Some((before_tpl, _)) = norm.rsplit_once("/templates/")
+            && !before_tpl.is_empty()
+        {
+            return Some(before_tpl.to_owned());
+        }
+        let fname = norm.rsplit('/').next().unwrap_or(&norm);
+        if is_helm_values_filename(fname) || matches!(fname, "Chart.yaml" | "Chart.yml") {
+            let p = parent_dir(&norm);
+            if !p.is_empty() {
+                return Some(p);
             }
         }
-        out
+        None
+    }
+
+    /// Finds `values.yaml` definitions for a Helm `.Values.<key>` reference, preferring the same chart.
+    pub fn find_helm_value_for(
+        &self,
+        doc_path: Option<&str>,
+        key_path: &str,
+    ) -> Vec<(String, Range, String)> {
+        let chart_root = doc_path.and_then(|p| self.infer_helm_chart_dir(p));
+        let mut local = Vec::new();
+        let mut fallback = Vec::new();
+        for (path, parsed) in &self.files {
+            let file_name = path.rsplit('/').next().unwrap_or(path);
+            if is_helm_values_filename(file_name)
+                && let Some(sp) = parsed.helm_values.get(key_path)
+            {
+                let entry = (path.clone(), sp.range, sp.value.clone());
+                if chart_root.as_ref().is_some_and(|root| {
+                    let dir = parent_dir(path);
+                    dir == *root || dir.starts_with(&format!("{root}/"))
+                }) {
+                    local.push(entry);
+                } else {
+                    fallback.push(entry);
+                }
+            }
+        }
+        if !local.is_empty() { local } else { fallback }
+    }
+
+    /// Finds `values.yaml` definitions for a Helm `.Values.<key>` reference across the workspace.
+    pub fn find_helm_value(&self, key_path: &str) -> Vec<(String, Range, String)> {
+        self.find_helm_value_for(None, key_path)
+    }
+
+    /// Finds `{{- define "<name>" -}}` definitions across Helm templates and `_helpers.tpl`, preferring the same chart.
+    pub fn find_helm_template_for(
+        &self,
+        doc_path: Option<&str>,
+        name: &str,
+    ) -> Vec<(String, Range)> {
+        let chart_root = doc_path.and_then(|p| self.infer_helm_chart_dir(p));
+        let mut local = Vec::new();
+        let mut fallback = Vec::new();
+        for (path, parsed) in &self.files {
+            if let Some(sp) = parsed.helm_template_defs.get(name) {
+                if chart_root.as_ref().is_some_and(|root| {
+                    let dir = parent_dir(path);
+                    dir == *root || dir.starts_with(&format!("{root}/"))
+                }) {
+                    local.push((path.clone(), sp.range));
+                } else {
+                    fallback.push((path.clone(), sp.range));
+                }
+            }
+        }
+        if !local.is_empty() { local } else { fallback }
     }
 
     /// Finds `{{- define "<name>" -}}` definitions across Helm templates and `_helpers.tpl`.
     pub fn find_helm_template(&self, name: &str) -> Vec<(String, Range)> {
-        let mut out = Vec::new();
-        for (path, parsed) in &self.files {
-            if let Some(sp) = parsed.helm_template_defs.get(name) {
-                out.push((path.clone(), sp.range));
+        self.find_helm_template_for(None, name)
+    }
+
+    /// Resolves a Kustomize relative path (`patch-deployment.yaml` or directory `../../base`) to an indexed file.
+    pub fn resolve_kustomize_target(&self, base_dir: &str, rel_path: &str) -> Option<String> {
+        let resolved = join_relative(base_dir, rel_path);
+        if self.files.contains_key(&resolved) {
+            return Some(resolved);
+        }
+        let trimmed = resolved.trim_end_matches('/');
+        for kname in ["kustomization.yaml", "kustomization.yml", "Kustomization"] {
+            let candidate = format!("{trimmed}/{kname}");
+            if self.files.contains_key(&candidate) {
+                return Some(candidate);
             }
         }
-        out
+        None
+    }
+
+    /// Returns whether `path` is referenced as a Kustomize patch / transformer / generator / component.
+    pub fn is_kustomize_patch_path(&self, path: &str) -> bool {
+        let norm = normalize_slashes(path);
+        let (patch_files, _, _) = self.collect_kustomize_targets();
+        patch_files.contains(&norm)
     }
 
     /// Finds CRD definitions matching `kind`.
@@ -1008,13 +1091,16 @@ pub fn document_links(
     let norm_path = normalize_slashes(doc_path);
     let base_dir = parent_dir(&norm_path);
 
-    // 1. Helm `.Values.xxx` references -> `values.yaml`
+    let fname = norm_path.rsplit('/').next().unwrap_or(&norm_path);
+
+    // 1. Helm `.Values.xxx` / scoped `.field` / `$var.field` references -> `values.yaml`
     for href in &parsed.helm_value_refs {
-        for (vpath, vrange, vval) in index.find_helm_value(&href.value) {
+        for (vpath, vrange, vval) in index.find_helm_value_for(Some(&norm_path), &href.value) {
+            let vfname = vpath.rsplit('/').next().unwrap_or(&vpath);
             let detail = if vval.is_empty() {
-                format!("values.yaml: {}", href.value)
+                format!("{vfname}: {}", href.value)
             } else {
-                format!("values.yaml: {} = {}", href.value, vval)
+                format!("{vfname}: {} = {}", href.value, vval)
             };
             links.push((
                 href.range,
@@ -1028,26 +1114,72 @@ pub fn document_links(
         }
     }
 
+    // 1a. Helm `$var` references -> `$var := ...` definition in the template
+    for (var_name, var_range) in &parsed.helm_var_refs {
+        if let Some((def_sp, _)) = parsed.helm_var_defs.get(var_name) {
+            links.push((
+                *var_range,
+                Location {
+                    path: norm_path.clone(),
+                    range: def_sp.range,
+                },
+                format!("Go to Helm variable '{var_name}'"),
+                "navigate",
+            ));
+        }
+    }
+
     // 1b. Helm named template `{{ include "name" . }}` / `{{ template "name" . }}` -> `define "name"`
     for tref in &parsed.helm_template_refs {
-        for (tpath, trange) in index.find_helm_template(&tref.value) {
-            let fname = tpath.rsplit('/').next().unwrap_or(&tpath);
+        for (tpath, trange) in index.find_helm_template_for(Some(&norm_path), &tref.value) {
+            let tfname = tpath.rsplit('/').next().unwrap_or(&tpath);
             links.push((
                 tref.range,
                 Location {
                     path: tpath.clone(),
                     range: trange,
                 },
-                format!("Go to Helm template '{}' in {fname}", tref.value),
+                format!("Go to Helm template '{}' in {tfname}", tref.value),
                 "navigate",
             ));
+        }
+    }
+
+    // 1c. Reverse links from `values.yaml` keys -> `templates/*` usages in the same Helm chart
+    if is_helm_values_filename(fname)
+        && let Some(chart_root) = index.infer_helm_chart_dir(&norm_path)
+    {
+        for (val_key, val_sp) in &parsed.helm_values {
+            for (tpath, tfile) in &index.files {
+                if tpath == &norm_path {
+                    continue;
+                }
+                let tdir = parent_dir(tpath);
+                if tdir != chart_root && !tdir.starts_with(&format!("{chart_root}/")) {
+                    continue;
+                }
+                for href in &tfile.helm_value_refs {
+                    if &href.value == val_key {
+                        let tfname = tpath.rsplit('/').next().unwrap_or(tpath);
+                        links.push((
+                            val_sp.range,
+                            Location {
+                                path: tpath.clone(),
+                                range: href.range,
+                            },
+                            format!("Used in Helm template {tfname}"),
+                            "implementing",
+                        ));
+                    }
+                }
+            }
         }
     }
 
     for kdoc in &parsed.docs {
         let kind = kdoc.kind.as_ref().map(|k| k.value.as_str()).unwrap_or("");
 
-        // 1c. Custom Resource `kind` -> CustomResourceDefinition
+        // 1d. Custom Resource `kind` -> CustomResourceDefinition
         if let Some(ref kind_sp) = kdoc.kind
             && kind != "CustomResourceDefinition"
         {
@@ -1064,10 +1196,15 @@ pub fn document_links(
             }
         }
 
-        // 2. Kustomization file paths -> target YAML file
-        for kpath in &kdoc.kustomize_paths {
-            let resolved = join_relative(&base_dir, &kpath.value);
-            if let Some(target_file) = index.files.get(&resolved) {
+        // 2. Kustomization file & directory paths -> target YAML / kustomization.yaml
+        for kpath in kdoc
+            .kustomize_paths
+            .iter()
+            .chain(kdoc.kustomize_helm_values.iter())
+        {
+            if let Some(resolved) = index.resolve_kustomize_target(&base_dir, &kpath.value)
+                && let Some(target_file) = index.files.get(&resolved)
+            {
                 let target_range = target_file
                     .docs
                     .first()
@@ -1080,7 +1217,7 @@ pub fn document_links(
                         path: resolved,
                         range: target_range,
                     },
-                    format!("Go to Kustomize resource {}", kpath.value),
+                    format!("Go to Kustomize target {}", kpath.value),
                     "navigate",
                 ));
             }
@@ -1299,6 +1436,48 @@ pub fn document_links(
                 }
             }
         }
+
+        // 11. HPA / Autoscaler `scaleTargetRef.name` -> target workload
+        if let Some((ref target_kind, ref target_name)) = kdoc.scale_target_ref {
+            let single_kind;
+            let candidate_kinds: &[&str] = match target_kind.as_deref() {
+                Some(k) if !k.is_empty() => {
+                    single_kind = [k];
+                    &single_kind
+                }
+                _ => &["Deployment", "StatefulSet", "ReplicaSet"],
+            };
+            for &ck in candidate_kinds {
+                for (tpath, _, trange) in index.find_by_kind_and_name(ck, &target_name.value) {
+                    links.push((
+                        target_name.range,
+                        Location {
+                            path: tpath,
+                            range: trange,
+                        },
+                        format!("Go to {ck} '{}'", target_name.value),
+                        "navigate",
+                    ));
+                }
+            }
+        }
+
+        // 12. Container `volumeMounts[].name` -> Pod `volumes[].name` in the same document
+        for vm in &kdoc.volume_mounts {
+            for vol in &kdoc.volumes {
+                if vol.value == vm.value {
+                    links.push((
+                        vm.range,
+                        Location {
+                            path: norm_path.clone(),
+                            range: vol.range,
+                        },
+                        format!("Go to volume '{}'", vol.value),
+                        "navigate",
+                    ));
+                }
+            }
+        }
     }
 
     links
@@ -1411,6 +1590,7 @@ pub fn inspect_document(
     let norm_path = normalize_slashes(doc_path);
     let base_dir = parent_dir(&norm_path);
     let has_multiple_manifest_files = index.files.len() > 1;
+    let is_kustomize_patch = index.is_kustomize_patch_path(&norm_path);
 
     for kdoc in &parsed.docs {
         if !kdoc.is_kube_resource() {
@@ -1457,9 +1637,11 @@ pub fn inspect_document(
             }
         }
 
-        // 2. Missing `metadata.name` on standard Kubernetes objects (excluding Kustomization)
-        if !kind.is_empty()
+        // 2. Missing `metadata.name` on standard Kubernetes objects (excluding Kustomization & Kustomize patches)
+        if !is_kustomize_patch
+            && !kind.is_empty()
             && kind != "Kustomization"
+            && kind != "Component"
             && kind != "List"
             && kdoc.name.is_none()
             && let Some(ref kind_sp) = kdoc.kind
@@ -1498,10 +1680,12 @@ pub fn inspect_document(
         }
 
         // 3. Workload selector.matchLabels vs spec.template.metadata.labels mismatch
-        if matches!(
-            kind,
-            "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet"
-        ) && !kdoc.selector_labels.is_empty()
+        if !is_kustomize_patch
+            && matches!(
+                kind,
+                "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet"
+            )
+            && !kdoc.selector_labels.is_empty()
         {
             for (sel_k, sel_v) in &kdoc.selector_labels {
                 let matches_pod = kdoc
@@ -1613,6 +1797,7 @@ pub fn inspect_document(
             }
 
             if warn_missing_resources
+                && !is_kustomize_patch
                 && kdoc.is_workload()
                 && (!container.has_limits || !container.has_requests)
             {
@@ -1969,6 +2154,510 @@ pub fn inspect_document(
     issues
 }
 
+/// Computes relative path from `from_dir` to `target_path` using `/` separators.
+fn relative_path_between(from_dir: &str, target_path: &str) -> Option<String> {
+    let from_norm = normalize_slashes(from_dir);
+    let to_norm = normalize_slashes(target_path);
+    if from_norm.starts_with('/') != to_norm.starts_with('/') {
+        return None;
+    }
+    let from_segs: Vec<&str> = from_norm.split('/').filter(|s| !s.is_empty()).collect();
+    let to_segs: Vec<&str> = to_norm.split('/').filter(|s| !s.is_empty()).collect();
+    let common = from_segs
+        .iter()
+        .zip(to_segs.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let ups = from_segs.len().saturating_sub(common);
+    if ups > 4 {
+        return None;
+    }
+    let mut out: Vec<&str> = std::iter::repeat_n("..", ups).collect();
+    out.extend_from_slice(&to_segs[common..]);
+    if out.is_empty() {
+        Some(".".into())
+    } else {
+        Some(out.join("/"))
+    }
+}
+
+const HELM_RELEASE_FIELDS: &[(&str, &str)] = &[
+    ("Name", "Release name"),
+    ("Namespace", "Target release namespace"),
+    ("Service", "Release service (Helm)"),
+    (
+        "IsUpgrade",
+        "True when current operation is an upgrade or rollback",
+    ),
+    ("IsInstall", "True when current operation is an install"),
+    ("Revision", "Release revision number"),
+];
+
+const HELM_CHART_FIELDS: &[(&str, &str)] = &[
+    ("Name", "Chart name from Chart.yaml"),
+    ("Version", "Chart version from Chart.yaml"),
+    ("AppVersion", "Application version from Chart.yaml"),
+    ("Description", "Chart description"),
+    ("Type", "Chart type (application or library)"),
+    ("Keywords", "Chart keywords list"),
+    ("Home", "Chart home URL"),
+    ("KubeVersion", "Required Kubernetes version constraint"),
+];
+
+const HELM_CAPABILITIES_FIELDS: &[(&str, &str)] = &[
+    ("KubeVersion", "Target cluster Kubernetes version info"),
+    (
+        "APIVersions",
+        "Set of available API versions on the cluster",
+    ),
+    ("HelmVersion", "Helm client build info"),
+];
+
+const HELM_FILES_FIELDS: &[(&str, &str)] = &[
+    ("Get", "Read file contents as string"),
+    ("GetBytes", "Read file contents as byte slice"),
+    ("Glob", "Match chart files by glob pattern"),
+    ("Lines", "Iterate over lines of a file"),
+    ("AsSecrets", "Base64-encode matched files for Secret data"),
+    (
+        "AsConfig",
+        "Format matched files as YAML map for ConfigMap data",
+    ),
+];
+
+const HELM_TEMPLATE_OBJ_FIELDS: &[(&str, &str)] = &[
+    (
+        "Name",
+        "Current template path (e.g. mychart/templates/deployment.yaml)",
+    ),
+    ("BasePath", "Current chart templates directory path"),
+];
+
+const HELM_KEYWORDS: &[(&str, &str)] = &[
+    ("if", "Conditional block"),
+    ("else", "Fallback branch"),
+    ("end", "Close template block"),
+    ("range", "Iterate over list or map"),
+    ("with", "Rebind dot (.) scope if non-empty"),
+    ("define", "Declare named template"),
+    ("include", "Render named template as string (pipeable)"),
+    ("template", "Render named template inline"),
+    ("block", "Define overridable template block"),
+    ("not", "Boolean negation"),
+    ("and", "Short-circuit boolean AND"),
+    ("or", "Short-circuit boolean OR"),
+    ("eq", "Equal comparison"),
+    ("ne", "Not-equal comparison"),
+    ("lt", "Less-than comparison"),
+    ("le", "Less-than-or-equal comparison"),
+    ("gt", "Greater-than comparison"),
+    ("ge", "Greater-than-or-equal comparison"),
+];
+
+const HELM_FUNCTIONS: &[(&str, &str)] = &[
+    ("default", "Fallback value when empty"),
+    ("required", "Fail rendering when value is empty"),
+    ("quote", "Wrap value in double quotes"),
+    ("squote", "Wrap value in single quotes"),
+    ("toYaml", "Serialize value to YAML"),
+    ("fromYaml", "Parse YAML string into map"),
+    ("toJson", "Serialize value to JSON"),
+    ("fromJson", "Parse JSON string into map"),
+    ("nindent", "Prepend newline and indent every line"),
+    ("indent", "Indent every line by N spaces"),
+    ("printf", "Format string with arguments"),
+    ("print", "Concatenate values as string"),
+    ("trunc", "Truncate string to N characters"),
+    ("trim", "Strip leading and trailing whitespace"),
+    ("trimSuffix", "Strip suffix if present"),
+    ("trimPrefix", "Strip prefix if present"),
+    ("replace", "Replace substrings"),
+    ("lower", "Convert string to lowercase"),
+    ("upper", "Convert string to uppercase"),
+    ("title", "Convert string to title case"),
+    ("contains", "Test whether string contains substring"),
+    ("hasPrefix", "Test whether string starts with prefix"),
+    ("hasSuffix", "Test whether string ends with suffix"),
+    ("b64enc", "Base64-encode string"),
+    ("b64dec", "Base64-decode string"),
+    ("sha256sum", "Compute SHA-256 hex digest"),
+    ("dict", "Construct key-value dictionary"),
+    ("list", "Construct slice of values"),
+    ("merge", "Deep-merge maps (destination wins)"),
+    ("hasKey", "Test whether dictionary contains key"),
+    ("pluck", "Extract field across a list of maps"),
+    ("coalesce", "Return first non-empty value"),
+    ("ternary", "Select first or second value by boolean"),
+    ("tpl", "Evaluate string as Helm template"),
+    ("lookup", "Query live cluster resource during render"),
+];
+
+/// Appends chart-scoped `values.yaml` completions under `base_prefix` ("" for root `.Values.`)
+/// matching `typed_rel` (which may contain dots like `image.t` or be empty).
+fn push_helm_values_completions(
+    index: &ProjectIndex,
+    doc_path: &str,
+    at: Position,
+    base_prefix: &str,
+    typed_rel: &str,
+    include_full_paths_at_root: bool,
+    items: &mut Vec<CompletionItem>,
+) {
+    let (sub_prefix, seg_typed) = match typed_rel.rfind('.') {
+        Some(dot) => (&typed_rel[..=dot], &typed_rel[dot + 1..]),
+        None => ("", typed_rel),
+    };
+    let effective_prefix = match (base_prefix.is_empty(), sub_prefix.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => sub_prefix.to_owned(),
+        (false, true) => format!("{base_prefix}."),
+        (false, false) => format!("{base_prefix}.{sub_prefix}"),
+    };
+    let start_col = at.character.saturating_sub(utf16_len(seg_typed));
+    let replace = Range::new(Position::new(at.line, start_col), at);
+
+    let chart_root = index.infer_helm_chart_dir(doc_path);
+    let mut candidate_files: Vec<(&str, &ParsedFile)> = Vec::new();
+    let mut fallback_files: Vec<(&str, &ParsedFile)> = Vec::new();
+    for (path, file) in &index.files {
+        let fname = path.rsplit('/').next().unwrap_or(path);
+        if is_helm_values_filename(fname) {
+            if chart_root.as_ref().is_some_and(|root| {
+                let dir = parent_dir(path);
+                dir == *root || dir.starts_with(&format!("{root}/"))
+            }) {
+                candidate_files.push((fname, file));
+            } else {
+                fallback_files.push((fname, file));
+            }
+        }
+    }
+    if candidate_files.is_empty() {
+        candidate_files = fallback_files;
+    }
+
+    let mut seen = BTreeSet::new();
+    for (fname, file) in candidate_files {
+        for (k, sp) in &file.helm_values {
+            let Some(rem) = (if effective_prefix.is_empty() {
+                Some(k.as_str())
+            } else {
+                k.strip_prefix(&effective_prefix)
+            }) else {
+                continue;
+            };
+            if rem.is_empty() || !rem.starts_with(seg_typed) {
+                continue;
+            }
+            let first_seg = rem.split('.').next().unwrap_or(rem);
+            if seen.insert(first_seg.to_owned()) {
+                let detail = if first_seg == rem && !sp.value.is_empty() {
+                    format!("{} ({fname})", sp.value)
+                } else {
+                    fname.to_owned()
+                };
+                items.push(CompletionItem {
+                    replace: Some(replace),
+                    detail: Some(detail),
+                    ..CompletionItem::new(first_seg, CompletionKind::Property)
+                });
+            }
+            if include_full_paths_at_root
+                && sub_prefix.is_empty()
+                && rem != first_seg
+                && seen.insert(rem.to_owned())
+            {
+                let detail = if sp.value.is_empty() {
+                    fname.to_owned()
+                } else {
+                    format!("{} ({fname})", sp.value)
+                };
+                items.push(CompletionItem {
+                    replace: Some(replace),
+                    detail: Some(detail),
+                    ..CompletionItem::new(rem, CompletionKind::Property)
+                });
+            }
+        }
+    }
+}
+
+/// Computes completions when cursor `at` sits inside an open `{{ ... }}` Helm action.
+fn helm_action_completions(
+    index: &ProjectIndex,
+    doc_path: &str,
+    at: Position,
+    ctx: &HelmActionContext,
+) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
+    let prefix = &ctx.action_prefix;
+
+    // 1. Named template completion: `include "xxx` or `template "xxx`
+    if let Some(idx) = prefix
+        .rfind("include \"")
+        .or_else(|| prefix.rfind("template \""))
+    {
+        let quote_pos = prefix[idx..].find('"').unwrap_or(0) + idx + 1;
+        let typed = &prefix[quote_pos..];
+        if !typed.contains('"') {
+            let start_col = at.character.saturating_sub(utf16_len(typed));
+            let replace = Range::new(Position::new(at.line, start_col), at);
+            let chart_root = index.infer_helm_chart_dir(doc_path);
+            let mut local = Vec::new();
+            let mut fallback = Vec::new();
+            for (path, file) in &index.files {
+                let fname = path.rsplit('/').next().unwrap_or(path);
+                let in_chart = chart_root.as_ref().is_some_and(|root| {
+                    let dir = parent_dir(path);
+                    dir == *root || dir.starts_with(&format!("{root}/"))
+                });
+                for name in file.helm_template_defs.keys() {
+                    if name.starts_with(typed) {
+                        let entry = (name.clone(), fname.to_owned());
+                        if in_chart {
+                            local.push(entry);
+                        } else {
+                            fallback.push(entry);
+                        }
+                    }
+                }
+            }
+            let chosen = if !local.is_empty() { local } else { fallback };
+            let mut seen = BTreeSet::new();
+            for (name, fname) in chosen {
+                if seen.insert(name.clone()) {
+                    items.push(CompletionItem {
+                        replace: Some(replace),
+                        detail: Some(format!("Helm template in {fname}")),
+                        ..CompletionItem::new(&name, CompletionKind::Function)
+                    });
+                }
+            }
+            return items;
+        }
+    }
+
+    // Extract the active expression token right before cursor (bounded by whitespace, `(`, `|`, `=`)
+    let tok_start = prefix
+        .rfind(|c: char| c.is_ascii_whitespace() || matches!(c, '(' | '|' | '=' | ':'))
+        .map_or(0, |i| i + 1);
+    let token = &prefix[tok_start..];
+    let before_tok = prefix[..tok_start].trim_end();
+    let after_pipe = before_tok.ends_with('|');
+
+    // 2. `$.Values.<typed>` or `.Values.<typed>`
+    if let Some(typed_rel) = token
+        .strip_prefix("$.Values.")
+        .or_else(|| token.strip_prefix(".Values."))
+    {
+        push_helm_values_completions(index, doc_path, at, "", typed_rel, true, &mut items);
+        return items;
+    }
+
+    // 3. Built-in Helm object fields (`.Release.*`, `.Chart.*`, `.Capabilities.*`, `.Files.*`, `.Template.*`)
+    for (obj_prefix, table) in [
+        (".Release.", HELM_RELEASE_FIELDS),
+        ("$.Release.", HELM_RELEASE_FIELDS),
+        (".Chart.", HELM_CHART_FIELDS),
+        ("$.Chart.", HELM_CHART_FIELDS),
+        (".Capabilities.", HELM_CAPABILITIES_FIELDS),
+        ("$.Capabilities.", HELM_CAPABILITIES_FIELDS),
+        (".Files.", HELM_FILES_FIELDS),
+        ("$.Files.", HELM_FILES_FIELDS),
+        (".Template.", HELM_TEMPLATE_OBJ_FIELDS),
+        ("$.Template.", HELM_TEMPLATE_OBJ_FIELDS),
+    ] {
+        if let Some(typed) = token.strip_prefix(obj_prefix)
+            && !typed.contains('.')
+        {
+            let start_col = at.character.saturating_sub(utf16_len(typed));
+            let replace = Range::new(Position::new(at.line, start_col), at);
+            for &(field, desc) in table {
+                if field.starts_with(typed) {
+                    items.push(CompletionItem {
+                        replace: Some(replace),
+                        detail: Some(desc.into()),
+                        ..CompletionItem::new(field, CompletionKind::Property)
+                    });
+                }
+            }
+            return items;
+        }
+    }
+
+    // 4. `$var` or `$var.<subpath>` completions
+    if let Some(after_dollar) = token.strip_prefix('$') {
+        if let Some(dot_idx) = after_dollar.find('.') {
+            let var_name = &token[..dot_idx + 1];
+            let sub_typed = &after_dollar[dot_idx + 1..];
+            if var_name == "$" {
+                // `$.<root>` -> root objects
+                if !sub_typed.contains('.') {
+                    let start_col = at.character.saturating_sub(utf16_len(sub_typed));
+                    let replace = Range::new(Position::new(at.line, start_col), at);
+                    for &(root_obj, desc) in &[
+                        ("Values", "Chart values from values.yaml"),
+                        ("Release", "Helm release metadata"),
+                        ("Chart", "Chart.yaml metadata"),
+                        ("Capabilities", "Cluster capabilities"),
+                        ("Files", "Chart file access helpers"),
+                        ("Template", "Current template metadata"),
+                    ] {
+                        if root_obj.starts_with(sub_typed) {
+                            items.push(CompletionItem {
+                                replace: Some(replace),
+                                detail: Some(desc.into()),
+                                ..CompletionItem::new(root_obj, CompletionKind::Module)
+                            });
+                        }
+                    }
+                }
+                return items;
+            }
+            if let Some(Some(bound_base)) = ctx.vars.get(var_name) {
+                push_helm_values_completions(
+                    index, doc_path, at, bound_base, sub_typed, false, &mut items,
+                );
+            }
+            return items;
+        }
+        // Complete `$var` names in scope
+        let start_col = at.character.saturating_sub(utf16_len(token));
+        let replace = Range::new(Position::new(at.line, start_col), at);
+        for (vname, bound) in &ctx.vars {
+            if vname.starts_with(token) {
+                let detail = match bound {
+                    Some(b) if !b.is_empty() => format!("Helm variable (.Values.{b})"),
+                    _ => "Helm template variable".into(),
+                };
+                items.push(CompletionItem {
+                    replace: Some(replace),
+                    detail: Some(detail),
+                    ..CompletionItem::new(vname, CompletionKind::Variable)
+                });
+            }
+        }
+        return items;
+    }
+
+    // 5. Leading `.` (`{{ .` or `{{ .na` or `{{ .destination.na`)
+    if let Some(after_dot) = token.strip_prefix('.') {
+        if !after_dot.contains('.') {
+            let start_col = at.character.saturating_sub(utf16_len(after_dot));
+            let replace = Range::new(Position::new(at.line, start_col), at);
+            for &(root_obj, desc) in &[
+                ("Values", "Chart values from values.yaml"),
+                ("Release", "Helm release metadata"),
+                ("Chart", "Chart.yaml metadata"),
+                ("Capabilities", "Cluster capabilities"),
+                ("Files", "Chart file access helpers"),
+                ("Template", "Current template metadata"),
+            ] {
+                if root_obj.starts_with(after_dot) {
+                    items.push(CompletionItem {
+                        replace: Some(replace),
+                        detail: Some(desc.into()),
+                        ..CompletionItem::new(root_obj, CompletionKind::Module)
+                    });
+                }
+            }
+        }
+        if let Some(ref scope_base) = ctx.dot_scope
+            && !scope_base.is_empty()
+        {
+            push_helm_values_completions(
+                index, doc_path, at, scope_base, after_dot, false, &mut items,
+            );
+        }
+        return items;
+    }
+
+    // 6. Pipeline functions (`| quote`) or keywords + functions inside `{{ ... }}`
+    let start_col = at.character.saturating_sub(utf16_len(token));
+    let replace = Range::new(Position::new(at.line, start_col), at);
+    if !after_pipe {
+        for &(kw, desc) in HELM_KEYWORDS {
+            if kw.starts_with(token) {
+                items.push(CompletionItem {
+                    replace: Some(replace),
+                    detail: Some(desc.into()),
+                    ..CompletionItem::new(kw, CompletionKind::Keyword)
+                });
+            }
+        }
+    }
+    for &(fn_name, desc) in HELM_FUNCTIONS {
+        if fn_name.starts_with(token) {
+            items.push(CompletionItem {
+                replace: Some(replace),
+                detail: Some(desc.into()),
+                ..CompletionItem::new(fn_name, CompletionKind::Function)
+            });
+        }
+    }
+    items
+}
+
+/// Suggests relative YAML file and Kustomize directory paths from `base_dir` for `kustomization.yaml`.
+fn push_kustomize_path_completions(
+    index: &ProjectIndex,
+    doc_norm_path: &str,
+    base_dir: &str,
+    typed: &str,
+    dirs_only: bool,
+    replace: Range,
+    items: &mut Vec<CompletionItem>,
+) {
+    let mut seen = BTreeSet::new();
+    // 1. Kustomize directories (`base`, `components/*`, `overlays/*`)
+    for kdir in &index.kustomize_dirs {
+        if kdir == base_dir {
+            continue;
+        }
+        if let Some(rel) = relative_path_between(base_dir, kdir)
+            && rel != "."
+            && rel.starts_with(typed)
+            && seen.insert(rel.clone())
+        {
+            items.push(CompletionItem {
+                replace: Some(replace),
+                detail: Some("Kustomize directory".into()),
+                ..CompletionItem::new(&rel, CompletionKind::Folder)
+            });
+        }
+    }
+    if dirs_only {
+        return;
+    }
+    // 2. Sibling and child YAML files
+    for path in index.files.keys() {
+        if path == doc_norm_path {
+            continue;
+        }
+        let fname = path.rsplit('/').next().unwrap_or(path);
+        if matches!(
+            fname,
+            "kustomization.yaml" | "kustomization.yml" | "Kustomization"
+        ) {
+            continue;
+        }
+        let pdir = parent_dir(path);
+        if pdir != base_dir && !pdir.starts_with(&format!("{base_dir}/")) {
+            continue;
+        }
+        if let Some(rel) = relative_path_between(base_dir, path)
+            && rel.starts_with(typed)
+            && seen.insert(rel.clone())
+        {
+            items.push(CompletionItem {
+                replace: Some(replace),
+                detail: Some("Workspace manifest".into()),
+                ..CompletionItem::new(&rel, CompletionKind::File)
+            });
+        }
+    }
+}
+
 /// Computes completions at `at` in `doc`.
 pub fn completions_at(
     index: &ProjectIndex,
@@ -1976,14 +2665,22 @@ pub fn completions_at(
     at: Position,
     parsed: &ParsedFile,
 ) -> Vec<CompletionItem> {
+    let norm_path = normalize_slashes(&doc.path);
+    let fname = norm_path.rsplit('/').next().unwrap_or(&norm_path);
+    let base_dir = parent_dir(&norm_path);
+
+    // 1. Cursor inside an open `{{ ... }}` Go/Helm template action
+    if let Some(helm_ctx) = helm_action_context_at(&doc.text, at) {
+        return helm_action_completions(index, &norm_path, at, &helm_ctx);
+    }
+
     let (parent_path, current_line, doc_kind) = yaml_context_at(&doc.text, at);
     let col_utf16 = at.character as usize;
     let units: Vec<u16> = current_line.encode_utf16().take(col_utf16).collect();
     let line_prefix = String::from_utf16_lossy(&units);
-
     let mut items = Vec::new();
 
-    // 1. Helm template `{{ .Values.xxx }}` and `{{ include "xxx" . }}` completion
+    // Fallback inline `.Values.` / `include "` check when line has no `{{` (e.g. partial edit)
     if let Some(idx) = line_prefix
         .rfind("include \"")
         .or_else(|| line_prefix.rfind("template \""))
@@ -1991,58 +2688,374 @@ pub fn completions_at(
         let quote_pos = line_prefix[idx..].find('"').unwrap_or(0) + idx + 1;
         let typed = &line_prefix[quote_pos..];
         if !typed.contains('"') {
-            let start_col = at.character.saturating_sub(utf16_len(typed));
-            let replace = Range::new(Position::new(at.line, start_col), at);
-            let mut seen = BTreeSet::new();
-            for (path, file) in &index.files {
-                let fname = path.rsplit('/').next().unwrap_or(path);
-                for name in file.helm_template_defs.keys() {
-                    if name.starts_with(typed) && seen.insert(name.clone()) {
-                        items.push(CompletionItem {
-                            replace: Some(replace),
-                            detail: Some(format!("Helm template in {fname}")),
-                            ..CompletionItem::new(name, CompletionKind::Function)
-                        });
-                    }
-                }
-            }
-            return items;
+            let ctx = HelmActionContext {
+                action_prefix: line_prefix[idx..].to_owned(),
+                dot_scope: None,
+                vars: BTreeMap::new(),
+            };
+            return helm_action_completions(index, &norm_path, at, &ctx);
         }
     }
-
     if let Some(idx) = line_prefix.rfind(".Values.") {
         let typed = &line_prefix[idx + ".Values.".len()..];
         if typed
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
         {
-            let start_col = at.character.saturating_sub(utf16_len(typed));
+            push_helm_values_completions(index, &norm_path, at, "", typed, true, &mut items);
+            return items;
+        }
+    }
+
+    if fname.ends_with(".tpl") || fname.ends_with(".gotmpl") {
+        return items;
+    }
+
+    let trimmed_prefix = line_prefix.trim_start();
+    let is_chart_yaml = matches!(fname, "Chart.yaml" | "Chart.yml");
+    let (_, kustomize_helm_vals, _) = index.collect_kustomize_targets();
+    let is_values_yaml = is_helm_values_filename(fname) || kustomize_helm_vals.contains(&norm_path);
+    let is_kustomization = ProjectIndex::is_kustomization_file(fname, doc_kind.as_deref());
+    let is_json6902_patch = parsed.has_json6902_ops
+        || (index.is_kustomize_patch_path(&norm_path)
+            && doc_kind.is_none()
+            && parsed.docs.is_empty()
+            && (trimmed_prefix.starts_with('-') || parent_path.is_empty()));
+
+    // Role A: Helm `Chart.yaml`
+    if is_chart_yaml {
+        if let Some(colon_idx) = trimmed_prefix.find(':') {
+            let key = trimmed_prefix[..colon_idx]
+                .trim()
+                .trim_start_matches("- ")
+                .trim();
+            let raw_val = trimmed_prefix[colon_idx + 1..].trim_start();
+            let start_col = at.character.saturating_sub(utf16_len(raw_val));
             let replace = Range::new(Position::new(at.line, start_col), at);
-            let mut seen = BTreeSet::new();
-            for (path, file) in &index.files {
-                let fname = path.rsplit('/').next().unwrap_or(path);
-                if fname == "values.yaml" || fname == "values.yml" || fname.starts_with("values.") {
-                    for (k, sp) in &file.helm_values {
-                        if k.starts_with(typed) && seen.insert(k.clone()) {
+            match (parent_path.as_str(), key) {
+                ("", "apiVersion") => {
+                    for (v, desc) in [
+                        ("v2", "Helm 3 chart API version"),
+                        ("v1", "Legacy Helm 2 chart API version"),
+                    ] {
+                        if v.starts_with(raw_val) {
                             items.push(CompletionItem {
                                 replace: Some(replace),
-                                detail: Some(if sp.value.is_empty() {
-                                    fname.to_owned()
-                                } else {
-                                    format!("{} ({fname})", sp.value)
-                                }),
-                                ..CompletionItem::new(k, CompletionKind::Property)
+                                detail: Some(desc.into()),
+                                ..CompletionItem::new(v, CompletionKind::Value)
                             });
                         }
+                    }
+                }
+                ("", "type") => {
+                    for (t, desc) in [
+                        ("application", "Standard installable Helm chart"),
+                        ("library", "Reusable helper/template library chart"),
+                    ] {
+                        if t.starts_with(raw_val) {
+                            items.push(CompletionItem {
+                                replace: Some(replace),
+                                detail: Some(desc.into()),
+                                ..CompletionItem::new(t, CompletionKind::EnumMember)
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return items;
+        }
+        let typed_key = trimmed_prefix.trim_start_matches("- ");
+        let start_col = at.character.saturating_sub(utf16_len(typed_key));
+        let replace = Range::new(Position::new(at.line, start_col), at);
+        for (field, snippet, detail) in chart_yaml_keys_for(&parent_path) {
+            if field.starts_with(typed_key) {
+                items.push(snippet_item(field, *snippet, replace, detail));
+            }
+        }
+        return items;
+    }
+
+    // Role B: Helm `values.yaml` / `values-*.yaml` — suggest keys referenced by `.Values.*` in chart templates
+    if is_values_yaml {
+        if trimmed_prefix.contains(':') {
+            return items;
+        }
+        let typed_key = trimmed_prefix.trim_start_matches("- ");
+        let start_col = at.character.saturating_sub(utf16_len(typed_key));
+        let replace = Range::new(Position::new(at.line, start_col), at);
+        if let Some(chart_root) = index.infer_helm_chart_dir(&norm_path) {
+            let mut seen = BTreeSet::new();
+            let prefix_dot = if parent_path.is_empty() {
+                String::new()
+            } else {
+                format!("{parent_path}.")
+            };
+            for (tpath, tfile) in &index.files {
+                if tpath == &norm_path {
+                    continue;
+                }
+                let tdir = parent_dir(tpath);
+                if tdir != chart_root && !tdir.starts_with(&format!("{chart_root}/")) {
+                    continue;
+                }
+                let tfname = tpath.rsplit('/').next().unwrap_or(tpath);
+                for href in &tfile.helm_value_refs {
+                    let Some(rem) = (if prefix_dot.is_empty() {
+                        Some(href.value.as_str())
+                    } else {
+                        href.value.strip_prefix(&prefix_dot)
+                    }) else {
+                        continue;
+                    };
+                    let seg = rem.split('.').next().unwrap_or(rem);
+                    if !seg.is_empty() && seg.starts_with(typed_key) && seen.insert(seg.to_owned())
+                    {
+                        let has_children = rem.contains('.');
+                        let snip = if has_children {
+                            format!("{seg}:\n  $0")
+                        } else {
+                            format!("{seg}: ${{1:value}}")
+                        };
+                        items.push(snippet_item(
+                            seg,
+                            snip,
+                            replace,
+                            &format!("Referenced in {tfname}"),
+                        ));
+                    }
+                }
+            }
+        }
+        return items;
+    }
+
+    // Role C: Kustomize `kustomization.yaml` / `Component`
+    if is_kustomization {
+        // Scalar list item under `resources:`, `components:`, `patches:`, etc.
+        if let Some(after_dash) = trimmed_prefix.strip_prefix('-')
+            && !after_dash.contains(':')
+        {
+            let raw_val = after_dash.trim_start();
+            if matches!(
+                parent_path.as_str(),
+                "resources"
+                    | "components"
+                    | "bases"
+                    | "patches"
+                    | "patchesStrategicMerge"
+                    | "patchesJson6902"
+                    | "configurations"
+                    | "generators"
+                    | "transformers"
+                    | "validators"
+                    | "helmCharts.additionalValuesFiles"
+            ) {
+                let start_col = at.character.saturating_sub(utf16_len(raw_val));
+                let replace = Range::new(Position::new(at.line, start_col), at);
+                let dirs_only = matches!(parent_path.as_str(), "components" | "bases");
+                push_kustomize_path_completions(
+                    index, &norm_path, &base_dir, raw_val, dirs_only, replace, &mut items,
+                );
+                return items;
+            }
+        }
+
+        if let Some(colon_idx) = trimmed_prefix.find(':') {
+            let key = trimmed_prefix[..colon_idx]
+                .trim()
+                .trim_start_matches("- ")
+                .trim();
+            let raw_val = trimmed_prefix[colon_idx + 1..].trim_start();
+            let start_col = at.character.saturating_sub(utf16_len(raw_val));
+            let replace = Range::new(Position::new(at.line, start_col), at);
+            let full_key = if parent_path.is_empty() {
+                key.to_owned()
+            } else {
+                format!("{parent_path}.{key}")
+            };
+            match full_key.as_str() {
+                "apiVersion" => {
+                    for (v, desc) in [
+                        ("kustomize.config.k8s.io/v1beta1", "Kustomization API"),
+                        (
+                            "kustomize.config.k8s.io/v1alpha1",
+                            "Kustomize Component API",
+                        ),
+                    ] {
+                        if v.starts_with(raw_val) {
+                            items.push(CompletionItem {
+                                replace: Some(replace),
+                                detail: Some(desc.into()),
+                                ..CompletionItem::new(v, CompletionKind::Value)
+                            });
+                        }
+                    }
+                }
+                "kind" => {
+                    for (k, desc) in [
+                        ("Kustomization", "Kustomize overlay / base"),
+                        ("Component", "Reusable Kustomize component"),
+                    ] {
+                        if k.to_ascii_lowercase()
+                            .starts_with(&raw_val.to_ascii_lowercase())
+                        {
+                            items.push(CompletionItem {
+                                replace: Some(replace),
+                                detail: Some(desc.into()),
+                                ..CompletionItem::new(k, CompletionKind::Class)
+                            });
+                        }
+                    }
+                }
+                "patches.path"
+                | "patchesJson6902.path"
+                | "replacements.path"
+                | "helmCharts.valuesFile"
+                | "openapi.path" => {
+                    push_kustomize_path_completions(
+                        index, &norm_path, &base_dir, raw_val, false, replace, &mut items,
+                    );
+                }
+                "images.name" => {
+                    let mut seen = BTreeSet::new();
+                    for (_, kdoc) in index.all_docs() {
+                        for c in &kdoc.containers {
+                            if let Some(ref img) = c.image
+                                && !img.value.contains("{{")
+                            {
+                                let repo = img.value.split(':').next().unwrap_or(&img.value);
+                                if repo.starts_with(raw_val) && seen.insert(repo.to_owned()) {
+                                    items.push(CompletionItem {
+                                        replace: Some(replace),
+                                        detail: Some(format!("Container image ({})", img.value)),
+                                        ..CompletionItem::new(repo, CompletionKind::Value)
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                "replicas.name" | "patches.target.name" | "patchesJson6902.target.name" => {
+                    let mut seen = BTreeSet::new();
+                    for (p, kdoc) in index.all_docs() {
+                        if let Some(ref n) = kdoc.name
+                            && !n.value.contains("{{")
+                            && n.value.starts_with(raw_val)
+                            && seen.insert(n.value.clone())
+                        {
+                            let k = kdoc.kind.as_ref().map_or("Resource", |k| k.value.as_str());
+                            let pf = p.rsplit('/').next().unwrap_or(p);
+                            items.push(CompletionItem {
+                                replace: Some(replace),
+                                detail: Some(format!("{k} in {pf}")),
+                                ..CompletionItem::new(&n.value, CompletionKind::Reference)
+                            });
+                        }
+                    }
+                }
+                "patches.target.kind" | "patchesJson6902.target.kind" => {
+                    for &(k, desc) in KINDS {
+                        if k != "Kustomization"
+                            && k.to_ascii_lowercase()
+                                .starts_with(&raw_val.to_ascii_lowercase())
+                        {
+                            items.push(CompletionItem {
+                                replace: Some(replace),
+                                detail: Some(desc.into()),
+                                ..CompletionItem::new(k, CompletionKind::Class)
+                            });
+                        }
+                    }
+                }
+                "configMapGenerator.behavior" | "secretGenerator.behavior" => {
+                    for b in ["create", "merge", "replace"] {
+                        if b.starts_with(raw_val) {
+                            items.push(CompletionItem {
+                                replace: Some(replace),
+                                detail: Some("Generator merge behavior".into()),
+                                ..CompletionItem::new(b, CompletionKind::EnumMember)
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return items;
+        }
+
+        let typed_key = trimmed_prefix
+            .trim_start_matches("- ")
+            .trim_start_matches('-')
+            .trim_start();
+        let start_col = at.character.saturating_sub(utf16_len(typed_key));
+        let replace = Range::new(Position::new(at.line, start_col), at);
+        for (field, snippet, detail) in kustomize_keys_for(&parent_path) {
+            if field.starts_with(typed_key) {
+                items.push(snippet_item(field, *snippet, replace, detail));
+            }
+        }
+        return items;
+    }
+
+    // Role D: JSON 6902 Patch file (`- op: replace`, `path: /spec/replicas`, `value: ...`)
+    if is_json6902_patch {
+        if let Some(colon_idx) = trimmed_prefix.find(':') {
+            let key = trimmed_prefix[..colon_idx]
+                .trim()
+                .trim_start_matches("- ")
+                .trim();
+            let raw_val = trimmed_prefix[colon_idx + 1..].trim_start();
+            let start_col = at.character.saturating_sub(utf16_len(raw_val));
+            let replace = Range::new(Position::new(at.line, start_col), at);
+            if key == "op" {
+                for (op, desc) in [
+                    ("replace", "Replace existing field value"),
+                    ("add", "Add field or array element"),
+                    ("remove", "Remove field or array element"),
+                    ("move", "Move value from `from` to `path`"),
+                    ("copy", "Copy value from `from` to `path`"),
+                    ("test", "Assert value at `path` equals `value`"),
+                ] {
+                    if op.starts_with(raw_val) {
+                        items.push(CompletionItem {
+                            replace: Some(replace),
+                            detail: Some(desc.into()),
+                            ..CompletionItem::new(op, CompletionKind::EnumMember)
+                        });
                     }
                 }
             }
             return items;
         }
+        let typed_key = trimmed_prefix
+            .trim_start_matches("- ")
+            .trim_start_matches('-')
+            .trim_start();
+        let start_col = at.character.saturating_sub(utf16_len(typed_key));
+        let replace = Range::new(Position::new(at.line, start_col), at);
+        for (field, snippet, detail) in [
+            ("op", "op: ${1:replace}", "JSON 6902 patch operation"),
+            (
+                "path",
+                "path: ${1:/spec/replicas}",
+                "JSON Pointer target path",
+            ),
+            ("value", "value: ${1:value}", "New or expected value"),
+            (
+                "from",
+                "from: ${1:/spec/source}",
+                "Source JSON Pointer (move/copy)",
+            ),
+        ] {
+            if field.starts_with(typed_key) {
+                items.push(snippet_item(field, snippet, replace, detail));
+            }
+        }
+        return items;
     }
 
-    let trimmed_prefix = line_prefix.trim_start();
-
+    // Role E: Kubernetes resource manifest, Helm YAML template, or Strategic Merge Patch
     // 2. Value completion after `key: `
     if let Some(colon_idx) = trimmed_prefix.find(':') {
         let key = trimmed_prefix[..colon_idx]
@@ -2107,11 +3120,39 @@ pub fn completions_at(
                             .to_ascii_lowercase()
                             .starts_with(&raw_val.to_ascii_lowercase())
                     {
-                        let fname = path.rsplit('/').next().unwrap_or(path);
+                        let pfname = path.rsplit('/').next().unwrap_or(path);
                         items.push(CompletionItem {
                             replace: Some(replace),
-                            detail: Some(format!("CRD ({}) in {fname}", crd.group)),
+                            detail: Some(format!("CRD ({}) in {pfname}", crd.group)),
                             ..CompletionItem::new(&crd.kind.value, CompletionKind::Class)
+                        });
+                    }
+                }
+                return items;
+            }
+            "type" if doc_kind.as_deref() == Some("Secret") => {
+                for (st, desc) in [
+                    ("Opaque", "Arbitrary user-defined data"),
+                    ("kubernetes.io/tls", "TLS certificate and private key"),
+                    (
+                        "kubernetes.io/dockerconfigjson",
+                        "Docker registry credentials",
+                    ),
+                    (
+                        "kubernetes.io/basic-auth",
+                        "Basic authentication credentials",
+                    ),
+                    ("kubernetes.io/ssh-auth", "SSH private key credentials"),
+                    (
+                        "kubernetes.io/service-account-token",
+                        "ServiceAccount token",
+                    ),
+                ] {
+                    if st.starts_with(raw_val) {
+                        items.push(CompletionItem {
+                            replace: Some(replace),
+                            detail: Some(desc.into()),
+                            ..CompletionItem::new(st, CompletionKind::EnumMember)
                         });
                     }
                 }
@@ -2119,32 +3160,178 @@ pub fn completions_at(
             }
             "spec.type" if doc_kind.as_deref() == Some("Service") => {
                 for st in ["ClusterIP", "NodePort", "LoadBalancer", "ExternalName"] {
-                    items.push(CompletionItem {
-                        replace: Some(replace),
-                        detail: Some("Service type".into()),
-                        ..CompletionItem::new(st, CompletionKind::EnumMember)
-                    });
+                    if st.starts_with(raw_val) {
+                        items.push(CompletionItem {
+                            replace: Some(replace),
+                            detail: Some("Service type".into()),
+                            ..CompletionItem::new(st, CompletionKind::EnumMember)
+                        });
+                    }
+                }
+                return items;
+            }
+            "spec.concurrencyPolicy" if doc_kind.as_deref() == Some("CronJob") => {
+                for cp in ["Allow", "Forbid", "Replace"] {
+                    if cp.starts_with(raw_val) {
+                        items.push(CompletionItem {
+                            replace: Some(replace),
+                            detail: Some("CronJob concurrency policy".into()),
+                            ..CompletionItem::new(cp, CompletionKind::EnumMember)
+                        });
+                    }
+                }
+                return items;
+            }
+            "spec.scaleTargetRef.kind" => {
+                for wk in ["Deployment", "StatefulSet", "ReplicaSet"] {
+                    if wk.starts_with(raw_val) {
+                        items.push(CompletionItem {
+                            replace: Some(replace),
+                            detail: Some("Scalable workload kind".into()),
+                            ..CompletionItem::new(wk, CompletionKind::Class)
+                        });
+                    }
+                }
+                return items;
+            }
+            "spec.scaleTargetRef.name" => {
+                let active_doc = parsed
+                    .docs
+                    .iter()
+                    .find(|d| d.start_line <= at.line && at.line <= d.end_line)
+                    .or_else(|| parsed.docs.first());
+                let wanted_kind = active_doc
+                    .and_then(|d| d.scale_target_ref.as_ref())
+                    .and_then(|(k, _)| k.as_deref());
+                let mut seen = BTreeSet::new();
+                for (path, kdoc) in index.all_docs() {
+                    let k = kdoc.kind.as_ref().map(|s| s.value.as_str()).unwrap_or("");
+                    let matches_kind = match wanted_kind {
+                        Some(wk) if !wk.is_empty() => k == wk,
+                        _ => matches!(k, "Deployment" | "StatefulSet" | "ReplicaSet"),
+                    };
+                    if matches_kind
+                        && let Some(ref n) = kdoc.name
+                        && !n.value.contains("{{")
+                        && n.value.starts_with(raw_val)
+                        && seen.insert(n.value.clone())
+                    {
+                        let pfname = path.rsplit('/').next().unwrap_or(path);
+                        items.push(CompletionItem {
+                            replace: Some(replace),
+                            detail: Some(format!("{k} in {pfname}")),
+                            ..CompletionItem::new(&n.value, CompletionKind::Reference)
+                        });
+                    }
+                }
+                return items;
+            }
+            "roleRef.kind" => {
+                for rk in ["Role", "ClusterRole"] {
+                    if rk.starts_with(raw_val) {
+                        items.push(CompletionItem {
+                            replace: Some(replace),
+                            ..CompletionItem::new(rk, CompletionKind::Class)
+                        });
+                    }
+                }
+                return items;
+            }
+            "roleRef.name" => {
+                let mut seen = BTreeSet::new();
+                for (path, kdoc) in index.all_docs() {
+                    let k = kdoc.kind.as_ref().map(|s| s.value.as_str()).unwrap_or("");
+                    if matches!(k, "Role" | "ClusterRole")
+                        && let Some(ref n) = kdoc.name
+                        && n.value.starts_with(raw_val)
+                        && seen.insert(n.value.clone())
+                    {
+                        let pfname = path.rsplit('/').next().unwrap_or(path);
+                        items.push(CompletionItem {
+                            replace: Some(replace),
+                            detail: Some(format!("{k} in {pfname}")),
+                            ..CompletionItem::new(&n.value, CompletionKind::Reference)
+                        });
+                    }
+                }
+                return items;
+            }
+            "subjects.kind" => {
+                for sk in ["ServiceAccount", "User", "Group"] {
+                    if sk.starts_with(raw_val) {
+                        items.push(CompletionItem {
+                            replace: Some(replace),
+                            ..CompletionItem::new(sk, CompletionKind::Class)
+                        });
+                    }
                 }
                 return items;
             }
             _ => {}
         }
 
+        if full_key.ends_with("volumeMounts.name") {
+            let active_doc = parsed
+                .docs
+                .iter()
+                .find(|d| d.start_line <= at.line && at.line <= d.end_line)
+                .or_else(|| parsed.docs.first());
+            if let Some(d) = active_doc {
+                let mut seen = BTreeSet::new();
+                for vol in &d.volumes {
+                    if vol.value.starts_with(raw_val) && seen.insert(vol.value.clone()) {
+                        items.push(CompletionItem {
+                            replace: Some(replace),
+                            detail: Some("Pod volume".into()),
+                            ..CompletionItem::new(&vol.value, CompletionKind::Reference)
+                        });
+                    }
+                }
+            }
+            return items;
+        }
+
         if key == "imagePullPolicy" {
             for p in ["IfNotPresent", "Always", "Never"] {
-                items.push(CompletionItem {
-                    replace: Some(replace),
-                    ..CompletionItem::new(p, CompletionKind::EnumMember)
-                });
+                if p.starts_with(raw_val) {
+                    items.push(CompletionItem {
+                        replace: Some(replace),
+                        ..CompletionItem::new(p, CompletionKind::EnumMember)
+                    });
+                }
             }
             return items;
         }
         if key == "restartPolicy" {
             for p in ["Always", "OnFailure", "Never"] {
-                items.push(CompletionItem {
-                    replace: Some(replace),
-                    ..CompletionItem::new(p, CompletionKind::EnumMember)
-                });
+                if p.starts_with(raw_val) {
+                    items.push(CompletionItem {
+                        replace: Some(replace),
+                        ..CompletionItem::new(p, CompletionKind::EnumMember)
+                    });
+                }
+            }
+            return items;
+        }
+        if key == "pathType" {
+            for p in ["Prefix", "Exact", "ImplementationSpecific"] {
+                if p.starts_with(raw_val) {
+                    items.push(CompletionItem {
+                        replace: Some(replace),
+                        ..CompletionItem::new(p, CompletionKind::EnumMember)
+                    });
+                }
+            }
+            return items;
+        }
+        if key == "protocol" {
+            for p in ["TCP", "UDP", "SCTP"] {
+                if p.starts_with(raw_val) {
+                    items.push(CompletionItem {
+                        replace: Some(replace),
+                        ..CompletionItem::new(p, CompletionKind::EnumMember)
+                    });
+                }
             }
             return items;
         }
@@ -2157,11 +3344,12 @@ pub fn completions_at(
             for (path, kdoc) in index.all_docs() {
                 if kdoc.kind.as_ref().map(|k| k.value.as_str()) == Some("ConfigMap")
                     && let Some(ref n) = kdoc.name
+                    && !n.value.contains("{{")
                 {
-                    let fname = path.rsplit('/').next().unwrap_or(path);
+                    let pfname = path.rsplit('/').next().unwrap_or(path);
                     items.push(CompletionItem {
                         replace: Some(replace),
-                        detail: Some(format!("ConfigMap in {fname}")),
+                        detail: Some(format!("ConfigMap in {pfname}")),
                         ..CompletionItem::new(&n.value, CompletionKind::Reference)
                     });
                 }
@@ -2173,15 +3361,17 @@ pub fn completions_at(
             || full_key.contains("secretRef.name")
             || full_key.ends_with("secret.secretName")
             || full_key.ends_with("tls.secretName")
+            || full_key.ends_with("imagePullSecrets.name")
         {
             for (path, kdoc) in index.all_docs() {
                 if kdoc.kind.as_ref().map(|k| k.value.as_str()) == Some("Secret")
                     && let Some(ref n) = kdoc.name
+                    && !n.value.contains("{{")
                 {
-                    let fname = path.rsplit('/').next().unwrap_or(path);
+                    let pfname = path.rsplit('/').next().unwrap_or(path);
                     items.push(CompletionItem {
                         replace: Some(replace),
-                        detail: Some(format!("Secret in {fname}")),
+                        detail: Some(format!("Secret in {pfname}")),
                         ..CompletionItem::new(&n.value, CompletionKind::Reference)
                     });
                 }
@@ -2232,11 +3422,12 @@ pub fn completions_at(
             for (path, kdoc) in index.all_docs() {
                 if kdoc.kind.as_ref().map(|k| k.value.as_str()) == Some("Service")
                     && let Some(ref n) = kdoc.name
+                    && !n.value.contains("{{")
                 {
-                    let fname = path.rsplit('/').next().unwrap_or(path);
+                    let pfname = path.rsplit('/').next().unwrap_or(path);
                     items.push(CompletionItem {
                         replace: Some(replace),
-                        detail: Some(format!("Service in {fname}")),
+                        detail: Some(format!("Service in {pfname}")),
                         ..CompletionItem::new(&n.value, CompletionKind::Reference)
                     });
                 }
@@ -2248,11 +3439,12 @@ pub fn completions_at(
             for (path, kdoc) in index.all_docs() {
                 if kdoc.kind.as_ref().map(|k| k.value.as_str()) == Some("ServiceAccount")
                     && let Some(ref n) = kdoc.name
+                    && !n.value.contains("{{")
                 {
-                    let fname = path.rsplit('/').next().unwrap_or(path);
+                    let pfname = path.rsplit('/').next().unwrap_or(path);
                     items.push(CompletionItem {
                         replace: Some(replace),
-                        detail: Some(format!("ServiceAccount in {fname}")),
+                        detail: Some(format!("ServiceAccount in {pfname}")),
                         ..CompletionItem::new(&n.value, CompletionKind::Reference)
                     });
                 }
@@ -2264,11 +3456,29 @@ pub fn completions_at(
             for (path, kdoc) in index.all_docs() {
                 if kdoc.kind.as_ref().map(|k| k.value.as_str()) == Some("PersistentVolumeClaim")
                     && let Some(ref n) = kdoc.name
+                    && !n.value.contains("{{")
                 {
-                    let fname = path.rsplit('/').next().unwrap_or(path);
+                    let pfname = path.rsplit('/').next().unwrap_or(path);
                     items.push(CompletionItem {
                         replace: Some(replace),
-                        detail: Some(format!("PVC in {fname}")),
+                        detail: Some(format!("PVC in {pfname}")),
+                        ..CompletionItem::new(&n.value, CompletionKind::Reference)
+                    });
+                }
+            }
+            return items;
+        }
+
+        if full_key.ends_with("storageClassName") {
+            for (path, kdoc) in index.all_docs() {
+                if kdoc.kind.as_ref().map(|k| k.value.as_str()) == Some("StorageClass")
+                    && let Some(ref n) = kdoc.name
+                    && !n.value.contains("{{")
+                {
+                    let pfname = path.rsplit('/').next().unwrap_or(path);
+                    items.push(CompletionItem {
+                        replace: Some(replace),
+                        detail: Some(format!("StorageClass in {pfname}")),
                         ..CompletionItem::new(&n.value, CompletionKind::Reference)
                     });
                 }
@@ -2294,10 +3504,14 @@ pub fn completions_at(
             }
             return items;
         }
+        return items;
     }
 
     // 3. Key and live-template completions when typing a key at `parent_path`
-    let typed_key = trimmed_prefix.trim_start_matches("- ");
+    let typed_key = trimmed_prefix
+        .trim_start_matches("- ")
+        .trim_start_matches('-')
+        .trim_start();
     let start_col = at.character.saturating_sub(utf16_len(typed_key));
     let replace = Range::new(Position::new(at.line, start_col), at);
 
@@ -2307,6 +3521,9 @@ pub fn completions_at(
         for (_, kdoc) in index.all_docs() {
             if kdoc.is_workload() {
                 for (lk, lv) in kdoc.target_labels() {
+                    if lv.value.contains("{{") {
+                        continue;
+                    }
                     let pair = format!("{lk}: {}", lv.value);
                     if pair.starts_with(typed_key) && seen.insert(pair.clone()) {
                         let wname = kdoc.name.as_ref().map_or("workload", |n| n.value.as_str());
@@ -2363,36 +3580,665 @@ pub fn completions_at(
     items
 }
 
+impl ProjectIndex {
+    fn is_kustomization_file(fname: &str, doc_kind: Option<&str>) -> bool {
+        matches!(
+            fname,
+            "kustomization.yaml" | "kustomization.yml" | "Kustomization"
+        ) || matches!(doc_kind, Some("Kustomization" | "Component"))
+    }
+}
+
+fn chart_yaml_keys_for(parent_path: &str) -> &'static [(&'static str, &'static str, &'static str)] {
+    match parent_path {
+        "" => &[
+            (
+                "apiVersion",
+                "apiVersion: ${1:v2}",
+                "Helm chart API version (v2)",
+            ),
+            ("name", "name: ${1:my-chart}", "Chart name"),
+            ("version", "version: ${1:0.1.0}", "Chart SemVer 2 version"),
+            (
+                "appVersion",
+                "appVersion: \"${1:1.0.0}\"",
+                "Version of the packaged app",
+            ),
+            (
+                "description",
+                "description: ${1:A Helm chart for Kubernetes}",
+                "Single-sentence description",
+            ),
+            (
+                "type",
+                "type: ${1:application}",
+                "Chart type (application or library)",
+            ),
+            (
+                "kubeVersion",
+                "kubeVersion: \"${1:>= 1.26.0-0}\"",
+                "SemVer range of compatible Kubernetes versions",
+            ),
+            (
+                "keywords",
+                "keywords:\n  - ${1:kubernetes}",
+                "Search keywords",
+            ),
+            ("home", "home: ${1:https://example.com}", "Project home URL"),
+            (
+                "sources",
+                "sources:\n  - ${1:https://github.com/org/repo}",
+                "Source code URLs",
+            ),
+            (
+                "dependencies",
+                "dependencies:\n  - name: ${1:subchart}\n    version: \"${2:1.0.0}\"\n    repository: \"${3:https://charts.example.com}\"",
+                "Chart dependencies",
+            ),
+            (
+                "maintainers",
+                "maintainers:\n  - name: ${1:Maintainer}\n    email: ${2:dev@example.com}",
+                "Chart maintainers",
+            ),
+            (
+                "icon",
+                "icon: ${1:https://example.com/icon.svg}",
+                "URL to SVG or PNG icon",
+            ),
+            (
+                "deprecated",
+                "deprecated: ${1:false}",
+                "Whether this chart is deprecated",
+            ),
+            (
+                "annotations",
+                "annotations:\n  ${1:key}: \"${2:value}\"",
+                "Custom chart annotations",
+            ),
+        ],
+        "dependencies" => &[
+            ("name", "name: ${1:subchart}", "Dependency chart name"),
+            (
+                "version",
+                "version: \"${1:1.0.0}\"",
+                "Dependency version or SemVer constraint",
+            ),
+            (
+                "repository",
+                "repository: \"${1:https://charts.example.com}\"",
+                "Chart repository URL or oci:// URI",
+            ),
+            (
+                "condition",
+                "condition: ${1:subchart.enabled}",
+                "Boolean values path toggling dependency",
+            ),
+            (
+                "tags",
+                "tags:\n  - ${1:frontend}",
+                "Tags enabling dependency group",
+            ),
+            (
+                "alias",
+                "alias: ${1:custom-name}",
+                "Alias name for dependency chart",
+            ),
+            (
+                "import-values",
+                "import-values:\n  - ${1:data}",
+                "Values keys imported from subchart",
+            ),
+        ],
+        "maintainers" => &[
+            ("name", "name: ${1:Maintainer}", "Maintainer name"),
+            ("email", "email: ${1:dev@example.com}", "Maintainer email"),
+            ("url", "url: ${1:https://github.com/user}", "Maintainer URL"),
+        ],
+        _ => &[],
+    }
+}
+
+fn kustomize_keys_for(parent_path: &str) -> &'static [(&'static str, &'static str, &'static str)] {
+    match parent_path {
+        "" => &[
+            (
+                "apiVersion",
+                "apiVersion: kustomize.config.k8s.io/v1beta1",
+                "Kustomize API group and version",
+            ),
+            ("kind", "kind: Kustomization", "Kustomization or Component"),
+            (
+                "resources",
+                "resources:\n  - ${1:deployment.yaml}",
+                "Kubernetes manifests or Kustomize directories",
+            ),
+            (
+                "components",
+                "components:\n  - ${1:../components/feature}",
+                "Reusable Kustomize components",
+            ),
+            (
+                "patches",
+                "patches:\n  - path: ${1:patch-deployment.yaml}",
+                "Strategic merge or JSON 6902 patches",
+            ),
+            (
+                "namespace",
+                "namespace: ${1:default}",
+                "Namespace applied to all resources",
+            ),
+            (
+                "namePrefix",
+                "namePrefix: ${1:dev-}",
+                "Prefix prepended to resource names",
+            ),
+            (
+                "nameSuffix",
+                "nameSuffix: ${1:-v1}",
+                "Suffix appended to resource names",
+            ),
+            (
+                "labels",
+                "labels:\n  - pairs:\n      ${1:app.kubernetes.io/part-of}: ${2:my-app}\n    includeSelectors: false",
+                "Labels added to resources",
+            ),
+            (
+                "commonAnnotations",
+                "commonAnnotations:\n  ${1:key}: \"${2:value}\"",
+                "Annotations added to all resources",
+            ),
+            (
+                "images",
+                "images:\n  - name: ${1:nginx}\n    newName: ${2:nginx}\n    newTag: \"${3:1.27-alpine}\"",
+                "Container image overrides",
+            ),
+            (
+                "replicas",
+                "replicas:\n  - name: ${1:my-app}\n    count: ${2:3}",
+                "Workload replica count overrides",
+            ),
+            (
+                "configMapGenerator",
+                "configMapGenerator:\n  - name: ${1:app-config}\n    literals:\n      - ${2:KEY=value}",
+                "Generate versioned ConfigMaps",
+            ),
+            (
+                "secretGenerator",
+                "secretGenerator:\n  - name: ${1:app-secret}\n    literals:\n      - ${2:SECRET=value}",
+                "Generate versioned Secrets",
+            ),
+            (
+                "generatorOptions",
+                "generatorOptions:\n  disableNameSuffixHash: ${1:false}",
+                "Options for generated ConfigMaps and Secrets",
+            ),
+            (
+                "replacements",
+                "replacements:\n  - path: ${1:replacement.yaml}",
+                "Field-to-field value replacements",
+            ),
+            (
+                "helmCharts",
+                "helmCharts:\n  - name: ${1:my-chart}\n    repo: ${2:https://charts.example.com}\n    version: ${3:1.0.0}\n    releaseName: ${4:my-release}\n    valuesFile: ${5:values.yaml}",
+                "Inflate Helm charts in Kustomize",
+            ),
+            (
+                "configurations",
+                "configurations:\n  - ${1:kustomizeconfig.yaml}",
+                "Custom transformer configurations",
+            ),
+            (
+                "generators",
+                "generators:\n  - ${1:generator.yaml}",
+                "KRM generator plugins",
+            ),
+            (
+                "transformers",
+                "transformers:\n  - ${1:transformer.yaml}",
+                "KRM transformer plugins",
+            ),
+            (
+                "validators",
+                "validators:\n  - ${1:validator.yaml}",
+                "KRM validator plugins",
+            ),
+        ],
+        "patches" | "patchesJson6902" => &[
+            (
+                "path",
+                "path: ${1:patch.yaml}",
+                "Relative path to patch file",
+            ),
+            (
+                "patch",
+                "patch: |-\n  ${1:- op: replace\n    path: /spec/replicas\n    value: 3}",
+                "Inline strategic merge or JSON 6902 patch",
+            ),
+            (
+                "target",
+                "target:\n  kind: ${1:Deployment}\n  name: ${2:my-app}",
+                "Target resource selector for patch",
+            ),
+            (
+                "options",
+                "options:\n  allowNameChange: ${1:false}",
+                "Patch options",
+            ),
+        ],
+        "patches.target" | "patchesJson6902.target" => &[
+            ("group", "group: ${1:apps}", "Target API group"),
+            ("version", "version: ${1:v1}", "Target API version"),
+            ("kind", "kind: ${1:Deployment}", "Target resource kind"),
+            ("name", "name: ${1:my-app}", "Target resource name or regex"),
+            (
+                "namespace",
+                "namespace: ${1:default}",
+                "Target resource namespace",
+            ),
+            (
+                "labelSelector",
+                "labelSelector: \"${1:app=my-app}\"",
+                "Label selector filter",
+            ),
+            (
+                "annotationSelector",
+                "annotationSelector: \"${1:key=val}\"",
+                "Annotation selector filter",
+            ),
+        ],
+        "images" => &[
+            (
+                "name",
+                "name: ${1:nginx}",
+                "Original image repository to match",
+            ),
+            (
+                "newName",
+                "newName: ${1:ghcr.io/org/app}",
+                "Replacement image repository",
+            ),
+            ("newTag", "newTag: \"${1:1.0.0}\"", "Replacement image tag"),
+            (
+                "digest",
+                "digest: ${1:sha256:...}",
+                "Immutable image digest",
+            ),
+        ],
+        "replicas" => &[
+            ("name", "name: ${1:my-app}", "Target workload name"),
+            ("count", "count: ${1:3}", "Desired replica count"),
+        ],
+        "configMapGenerator" | "secretGenerator" => &[
+            ("name", "name: ${1:app-config}", "Generated resource name"),
+            (
+                "namespace",
+                "namespace: ${1:default}",
+                "Generated resource namespace",
+            ),
+            (
+                "behavior",
+                "behavior: ${1:create}",
+                "Merge behavior (create, merge, replace)",
+            ),
+            (
+                "literals",
+                "literals:\n  - ${1:KEY=value}",
+                "Inline KEY=VALUE entries",
+            ),
+            (
+                "files",
+                "files:\n  - ${1:config.properties}",
+                "Data files to embed",
+            ),
+            ("envs", "envs:\n  - ${1:.env}", "Dotenv files to load"),
+            ("type", "type: ${1:Opaque}", "Secret type"),
+            (
+                "options",
+                "options:\n  disableNameSuffixHash: ${1:false}",
+                "Per-generator options",
+            ),
+        ],
+        "generatorOptions" | "configMapGenerator.options" | "secretGenerator.options" => &[
+            (
+                "disableNameSuffixHash",
+                "disableNameSuffixHash: ${1:true}",
+                "Omit content hash suffix from name",
+            ),
+            (
+                "labels",
+                "labels:\n  ${1:key}: ${2:value}",
+                "Labels on generated resources",
+            ),
+            (
+                "annotations",
+                "annotations:\n  ${1:key}: \"${2:value}\"",
+                "Annotations on generated resources",
+            ),
+            (
+                "immutable",
+                "immutable: ${1:true}",
+                "Mark generated ConfigMap/Secret immutable",
+            ),
+        ],
+        "labels" => &[
+            (
+                "pairs",
+                "pairs:\n  ${1:app}: ${2:my-app}",
+                "Label key-value pairs",
+            ),
+            (
+                "includeSelectors",
+                "includeSelectors: ${1:false}",
+                "Also update selector.matchLabels",
+            ),
+            (
+                "includeTemplates",
+                "includeTemplates: ${1:true}",
+                "Also update spec.template.metadata.labels",
+            ),
+        ],
+        "helmCharts" => &[
+            ("name", "name: ${1:my-chart}", "Helm chart name"),
+            (
+                "repo",
+                "repo: ${1:https://charts.example.com}",
+                "Helm repository URL",
+            ),
+            ("version", "version: \"${1:1.0.0}\"", "Chart version"),
+            (
+                "releaseName",
+                "releaseName: ${1:my-release}",
+                "Helm release name",
+            ),
+            ("namespace", "namespace: ${1:default}", "Release namespace"),
+            (
+                "valuesFile",
+                "valuesFile: ${1:values.yaml}",
+                "Values override file",
+            ),
+            (
+                "additionalValuesFiles",
+                "additionalValuesFiles:\n  - ${1:values-prod.yaml}",
+                "Extra values files",
+            ),
+            (
+                "valuesInline",
+                "valuesInline:\n  ${1:replicaCount}: ${2:2}",
+                "Inline values overrides",
+            ),
+            (
+                "includeCRDs",
+                "includeCRDs: ${1:false}",
+                "Include chart CRDs",
+            ),
+        ],
+        _ => &[],
+    }
+}
+
+const POD_SPEC_KEYS: &[(&str, &str, &str)] = &[
+    (
+        "containers",
+        "containers:\n  - name: ${1:app}\n    image: ${2:nginx:1.27-alpine}",
+        "Application containers in the Pod",
+    ),
+    (
+        "initContainers",
+        "initContainers:\n  - name: ${1:init}\n    image: ${2:busybox:1.36}",
+        "Initialization containers run before app containers",
+    ),
+    (
+        "volumes",
+        "volumes:\n  - name: ${1:config-vol}\n    configMap:\n      name: ${2:my-config}",
+        "Pod storage volumes",
+    ),
+    (
+        "serviceAccountName",
+        "serviceAccountName: ${1:default}",
+        "Pod ServiceAccount identity",
+    ),
+    (
+        "automountServiceAccountToken",
+        "automountServiceAccountToken: ${1:false}",
+        "Mount ServiceAccount token into containers",
+    ),
+    (
+        "restartPolicy",
+        "restartPolicy: ${1:Always}",
+        "Container restart policy (Always, OnFailure, Never)",
+    ),
+    (
+        "imagePullSecrets",
+        "imagePullSecrets:\n  - name: ${1:regcred}",
+        "Registry pull Secrets",
+    ),
+    (
+        "securityContext",
+        "securityContext:\n  runAsNonRoot: true\n  seccompProfile:\n    type: RuntimeDefault",
+        "Pod-level security context",
+    ),
+    (
+        "nodeSelector",
+        "nodeSelector:\n  ${1:kubernetes.io/os}: ${2:linux}",
+        "Node label selector constraints",
+    ),
+    (
+        "nodeName",
+        "nodeName: ${1:worker-1}",
+        "Pin Pod to a specific node",
+    ),
+    (
+        "affinity",
+        "affinity:\n  podAntiAffinity:\n    preferredDuringSchedulingIgnoredDuringExecution: []",
+        "Node and Pod scheduling affinity rules",
+    ),
+    (
+        "tolerations",
+        "tolerations:\n  - key: \"${1:key}\"\n    operator: \"${2:Equal}\"\n    value: \"${3:value}\"\n    effect: \"${4:NoSchedule}\"",
+        "Node taint tolerations",
+    ),
+    (
+        "topologySpreadConstraints",
+        "topologySpreadConstraints:\n  - maxSkew: 1\n    topologyKey: topology.kubernetes.io/zone\n    whenUnsatisfiable: DoNotSchedule",
+        "Pod topology spread rules",
+    ),
+    (
+        "dnsPolicy",
+        "dnsPolicy: ${1:ClusterFirst}",
+        "Pod DNS resolution policy",
+    ),
+    (
+        "hostNetwork",
+        "hostNetwork: ${1:false}",
+        "Use host network namespace",
+    ),
+    (
+        "terminationGracePeriodSeconds",
+        "terminationGracePeriodSeconds: ${1:30}",
+        "Graceful shutdown timeout in seconds",
+    ),
+    (
+        "priorityClassName",
+        "priorityClassName: ${1:system-cluster-critical}",
+        "Pod scheduling priority class",
+    ),
+];
+
 fn schema_keys_for(
     parent_path: &str,
     kind: Option<&str>,
 ) -> &'static [(&'static str, &'static str, &'static str)] {
     match parent_path {
-        "" => &[
-            (
-                "apiVersion",
-                "apiVersion: ${1:apps/v1}",
-                "API group and version",
-            ),
-            ("kind", "kind: ${1:Deployment}", "Resource kind"),
-            (
-                "metadata",
-                "metadata:\n  name: ${1:my-app}",
-                "Standard object metadata",
-            ),
-            ("spec", "spec:\n  $0", "Desired state specification"),
-            (
-                "data",
-                "data:\n  ${1:KEY}: \"${2:value}\"",
-                "ConfigMap / Secret data entries",
-            ),
-            (
-                "stringData",
-                "stringData:\n  ${1:KEY}: \"${2:value}\"",
-                "Unencoded Secret string entries",
-            ),
-        ],
-        "metadata" => &[
+        "" => match kind {
+            Some("ConfigMap") => &[
+                ("apiVersion", "apiVersion: v1", "API group and version"),
+                ("kind", "kind: ConfigMap", "Resource kind"),
+                (
+                    "metadata",
+                    "metadata:\n  name: ${1:my-config}",
+                    "Standard object metadata",
+                ),
+                (
+                    "data",
+                    "data:\n  ${1:KEY}: \"${2:value}\"",
+                    "UTF-8 configuration data entries",
+                ),
+                (
+                    "binaryData",
+                    "binaryData:\n  ${1:KEY}: \"${2:base64}\"",
+                    "Base64 binary data entries",
+                ),
+                (
+                    "immutable",
+                    "immutable: ${1:true}",
+                    "Prevent updates to ConfigMap data",
+                ),
+            ],
+            Some("Secret") => &[
+                ("apiVersion", "apiVersion: v1", "API group and version"),
+                ("kind", "kind: Secret", "Resource kind"),
+                (
+                    "metadata",
+                    "metadata:\n  name: ${1:my-secret}",
+                    "Standard object metadata",
+                ),
+                (
+                    "type",
+                    "type: ${1:Opaque}",
+                    "Secret type (Opaque, kubernetes.io/tls, ...)",
+                ),
+                (
+                    "stringData",
+                    "stringData:\n  ${1:KEY}: \"${2:value}\"",
+                    "Plaintext secret entries",
+                ),
+                (
+                    "data",
+                    "data:\n  ${1:KEY}: \"${2:base64}\"",
+                    "Base64-encoded secret entries",
+                ),
+                (
+                    "immutable",
+                    "immutable: ${1:true}",
+                    "Prevent updates to Secret data",
+                ),
+            ],
+            Some("ServiceAccount") => &[
+                ("apiVersion", "apiVersion: v1", "API group and version"),
+                ("kind", "kind: ServiceAccount", "Resource kind"),
+                (
+                    "metadata",
+                    "metadata:\n  name: ${1:my-sa}",
+                    "Standard object metadata",
+                ),
+                (
+                    "automountServiceAccountToken",
+                    "automountServiceAccountToken: ${1:true}",
+                    "Auto-mount API credentials",
+                ),
+                (
+                    "imagePullSecrets",
+                    "imagePullSecrets:\n  - name: ${1:regcred}",
+                    "Default image pull Secrets",
+                ),
+                (
+                    "secrets",
+                    "secrets:\n  - name: ${1:my-secret}",
+                    "Referenced Secrets",
+                ),
+            ],
+            Some("Role" | "ClusterRole") => &[
+                (
+                    "apiVersion",
+                    "apiVersion: rbac.authorization.k8s.io/v1",
+                    "RBAC API version",
+                ),
+                ("kind", "kind: ${1:Role}", "Role or ClusterRole"),
+                (
+                    "metadata",
+                    "metadata:\n  name: ${1:my-role}",
+                    "Standard object metadata",
+                ),
+                (
+                    "rules",
+                    "rules:\n  - apiGroups: [\"${1:}\"]\n    resources: [\"${2:pods}\"]\n    verbs: [\"${3:get}\", \"${4:list}\"]",
+                    "RBAC policy rules",
+                ),
+                (
+                    "aggregationRule",
+                    "aggregationRule:\n  clusterRoleSelectors: []",
+                    "ClusterRole aggregation",
+                ),
+            ],
+            Some("RoleBinding" | "ClusterRoleBinding") => &[
+                (
+                    "apiVersion",
+                    "apiVersion: rbac.authorization.k8s.io/v1",
+                    "RBAC API version",
+                ),
+                (
+                    "kind",
+                    "kind: ${1:RoleBinding}",
+                    "RoleBinding or ClusterRoleBinding",
+                ),
+                (
+                    "metadata",
+                    "metadata:\n  name: ${1:my-binding}",
+                    "Standard object metadata",
+                ),
+                (
+                    "roleRef",
+                    "roleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ${1:Role}\n  name: ${2:my-role}",
+                    "Referenced Role or ClusterRole",
+                ),
+                (
+                    "subjects",
+                    "subjects:\n  - kind: ${1:ServiceAccount}\n    name: ${2:default}\n    namespace: ${3:default}",
+                    "Bound subjects",
+                ),
+            ],
+            _ => &[
+                (
+                    "apiVersion",
+                    "apiVersion: ${1:apps/v1}",
+                    "API group and version",
+                ),
+                ("kind", "kind: ${1:Deployment}", "Resource kind"),
+                (
+                    "metadata",
+                    "metadata:\n  name: ${1:my-app}",
+                    "Standard object metadata",
+                ),
+                ("spec", "spec:\n  $0", "Desired state specification"),
+                ("type", "type: ${1:Opaque}", "Secret / resource type"),
+                (
+                    "data",
+                    "data:\n  ${1:KEY}: \"${2:value}\"",
+                    "ConfigMap / Secret data entries",
+                ),
+                (
+                    "stringData",
+                    "stringData:\n  ${1:KEY}: \"${2:value}\"",
+                    "Unencoded Secret string entries",
+                ),
+                (
+                    "rules",
+                    "rules:\n  - apiGroups: [\"\"]\n    resources: [\"pods\"]\n    verbs: [\"get\"]",
+                    "RBAC policy rules",
+                ),
+                (
+                    "roleRef",
+                    "roleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: Role\n  name: ${1:role}",
+                    "RBAC role reference",
+                ),
+                (
+                    "subjects",
+                    "subjects:\n  - kind: ServiceAccount\n    name: ${1:default}",
+                    "RBAC bound subjects",
+                ),
+            ],
+        },
+        p if p == "metadata" || p.ends_with(".metadata") => &[
             ("name", "name: ${1:my-app}", "Resource name"),
             ("namespace", "namespace: ${1:default}", "Target namespace"),
             (
@@ -2405,8 +4251,20 @@ fn schema_keys_for(
                 "annotations:\n  ${1:key}: \"${2:value}\"",
                 "Resource annotations",
             ),
+            (
+                "finalizers",
+                "finalizers:\n  - ${1:finalizer.kubernetes.io}",
+                "Deletion finalizers",
+            ),
+            (
+                "generateName",
+                "generateName: ${1:my-app-}",
+                "Prefix for server-generated name",
+            ),
         ],
+        "spec.template.spec" | "spec.jobTemplate.spec.template.spec" => POD_SPEC_KEYS,
         "spec" => match kind {
+            Some("Pod") => POD_SPEC_KEYS,
             Some("Service") => &[
                 ("type", "type: ${1:ClusterIP}", "Service exposure type"),
                 (
@@ -2419,12 +4277,37 @@ fn schema_keys_for(
                     "ports:\n  - name: ${1:http}\n    port: ${2:80}\n    targetPort: ${3:http}",
                     "Service port mappings",
                 ),
+                (
+                    "clusterIP",
+                    "clusterIP: ${1:None}",
+                    "Cluster-internal IP or None (headless)",
+                ),
+                (
+                    "externalTrafficPolicy",
+                    "externalTrafficPolicy: ${1:Local}",
+                    "External traffic routing policy",
+                ),
+                (
+                    "sessionAffinity",
+                    "sessionAffinity: ${1:ClientIP}",
+                    "Client session stickiness",
+                ),
+                (
+                    "externalName",
+                    "externalName: ${1:db.example.com}",
+                    "CNAME target for ExternalName service",
+                ),
             ],
             Some("Ingress") => &[
                 (
                     "ingressClassName",
                     "ingressClassName: ${1:nginx}",
                     "Ingress controller class",
+                ),
+                (
+                    "defaultBackend",
+                    "defaultBackend:\n  service:\n    name: ${1:default-svc}\n    port:\n      number: ${2:80}",
+                    "Fallback backend when no rule matches",
                 ),
                 (
                     "rules",
@@ -2435,6 +4318,224 @@ fn schema_keys_for(
                     "tls",
                     "tls:\n  - hosts:\n      - ${1:example.com}\n    secretName: ${2:tls-secret}",
                     "TLS configuration",
+                ),
+            ],
+            Some("HorizontalPodAutoscaler") => &[
+                (
+                    "scaleTargetRef",
+                    "scaleTargetRef:\n  apiVersion: ${1:apps/v1}\n  kind: ${2:Deployment}\n  name: ${3:my-app}",
+                    "Target workload to scale",
+                ),
+                (
+                    "minReplicas",
+                    "minReplicas: ${1:2}",
+                    "Minimum replica count",
+                ),
+                (
+                    "maxReplicas",
+                    "maxReplicas: ${1:10}",
+                    "Maximum replica count",
+                ),
+                (
+                    "metrics",
+                    "metrics:\n  - type: Resource\n    resource:\n      name: ${1:cpu}\n      target:\n        type: Utilization\n        averageUtilization: ${2:75}",
+                    "Autoscaling metric specifications",
+                ),
+                (
+                    "behavior",
+                    "behavior:\n  scaleDown:\n    stabilizationWindowSeconds: ${1:300}",
+                    "Scale-up and scale-down velocity rules",
+                ),
+            ],
+            Some("StatefulSet") => &[
+                ("replicas", "replicas: ${1:3}", "Desired replica count"),
+                (
+                    "serviceName",
+                    "serviceName: ${1:my-headless}",
+                    "Governing headless Service name",
+                ),
+                (
+                    "selector",
+                    "selector:\n  matchLabels:\n    app.kubernetes.io/name: ${1:my-app}",
+                    "Label selector for Pods",
+                ),
+                (
+                    "template",
+                    "template:\n  metadata:\n    labels:\n      app.kubernetes.io/name: ${1:my-app}\n  spec:\n    containers:\n      - name: ${1:my-app}\n        image: ${2:nginx:1.27-alpine}",
+                    "Pod template specification",
+                ),
+                (
+                    "volumeClaimTemplates",
+                    "volumeClaimTemplates:\n  - metadata:\n      name: ${1:data}\n    spec:\n      accessModes: [\"ReadWriteOnce\"]\n      resources:\n        requests:\n          storage: ${2:10Gi}",
+                    "PersistentVolumeClaim templates per replica",
+                ),
+                (
+                    "podManagementPolicy",
+                    "podManagementPolicy: ${1:OrderedReady}",
+                    "OrderedReady or Parallel",
+                ),
+                (
+                    "updateStrategy",
+                    "updateStrategy:\n  type: ${1:RollingUpdate}",
+                    "StatefulSet rollout strategy",
+                ),
+            ],
+            Some("DaemonSet") => &[
+                (
+                    "selector",
+                    "selector:\n  matchLabels:\n    app.kubernetes.io/name: ${1:my-agent}",
+                    "Label selector for Pods",
+                ),
+                (
+                    "template",
+                    "template:\n  metadata:\n    labels:\n      app.kubernetes.io/name: ${1:my-agent}\n  spec:\n    containers:\n      - name: ${1:my-agent}\n        image: ${2:busybox:1.36}",
+                    "Pod template specification",
+                ),
+                (
+                    "updateStrategy",
+                    "updateStrategy:\n  type: ${1:RollingUpdate}",
+                    "DaemonSet rollout strategy",
+                ),
+                (
+                    "minReadySeconds",
+                    "minReadySeconds: ${1:10}",
+                    "Minimum seconds before Pod is ready",
+                ),
+            ],
+            Some("Job") => &[
+                (
+                    "template",
+                    "template:\n  spec:\n    restartPolicy: Never\n    containers:\n      - name: ${1:job}\n        image: ${2:busybox:1.36}",
+                    "Pod template specification",
+                ),
+                (
+                    "completions",
+                    "completions: ${1:1}",
+                    "Desired successful Pod completions",
+                ),
+                (
+                    "parallelism",
+                    "parallelism: ${1:1}",
+                    "Max concurrent running Pods",
+                ),
+                (
+                    "backoffLimit",
+                    "backoffLimit: ${1:4}",
+                    "Retries before marking Job failed",
+                ),
+                (
+                    "activeDeadlineSeconds",
+                    "activeDeadlineSeconds: ${1:600}",
+                    "Max Job duration in seconds",
+                ),
+                (
+                    "ttlSecondsAfterFinished",
+                    "ttlSecondsAfterFinished: ${1:3600}",
+                    "Auto-cleanup TTL after completion",
+                ),
+                ("suspend", "suspend: ${1:false}", "Suspend Job execution"),
+            ],
+            Some("CronJob") => &[
+                (
+                    "schedule",
+                    "schedule: \"${1:*/5 * * * *}\"",
+                    "Cron schedule expression",
+                ),
+                (
+                    "timeZone",
+                    "timeZone: \"${1:Etc/UTC}\"",
+                    "IANA time zone for schedule",
+                ),
+                (
+                    "concurrencyPolicy",
+                    "concurrencyPolicy: ${1:Forbid}",
+                    "Allow, Forbid, or Replace",
+                ),
+                (
+                    "suspend",
+                    "suspend: ${1:false}",
+                    "Suspend future scheduled runs",
+                ),
+                (
+                    "jobTemplate",
+                    "jobTemplate:\n  spec:\n    template:\n      spec:\n        restartPolicy: OnFailure\n        containers:\n          - name: ${1:job}\n            image: ${2:busybox:1.36}",
+                    "Template for created Jobs",
+                ),
+                (
+                    "successfulJobsHistoryLimit",
+                    "successfulJobsHistoryLimit: ${1:3}",
+                    "Retained successful Jobs",
+                ),
+                (
+                    "failedJobsHistoryLimit",
+                    "failedJobsHistoryLimit: ${1:1}",
+                    "Retained failed Jobs",
+                ),
+            ],
+            Some("PersistentVolumeClaim") => &[
+                (
+                    "accessModes",
+                    "accessModes:\n  - ${1:ReadWriteOnce}",
+                    "Volume access modes",
+                ),
+                (
+                    "resources",
+                    "resources:\n  requests:\n    storage: ${1:10Gi}",
+                    "Requested storage capacity",
+                ),
+                (
+                    "storageClassName",
+                    "storageClassName: ${1:standard}",
+                    "StorageClass name",
+                ),
+                (
+                    "volumeMode",
+                    "volumeMode: ${1:Filesystem}",
+                    "Filesystem or Block",
+                ),
+                (
+                    "volumeName",
+                    "volumeName: ${1:pv-name}",
+                    "Bind to specific PersistentVolume",
+                ),
+            ],
+            Some("NetworkPolicy") => &[
+                (
+                    "podSelector",
+                    "podSelector:\n  matchLabels:\n    ${1:app}: ${2:my-app}",
+                    "Target Pods in namespace",
+                ),
+                (
+                    "policyTypes",
+                    "policyTypes:\n  - ${1:Ingress}\n  - ${2:Egress}",
+                    "Ingress and/or Egress enforcement",
+                ),
+                (
+                    "ingress",
+                    "ingress:\n  - from: []",
+                    "Allowed inbound traffic rules",
+                ),
+                (
+                    "egress",
+                    "egress:\n  - to: []",
+                    "Allowed outbound traffic rules",
+                ),
+            ],
+            Some("PodDisruptionBudget") => &[
+                (
+                    "minAvailable",
+                    "minAvailable: ${1:1}",
+                    "Minimum available Pods or percentage",
+                ),
+                (
+                    "maxUnavailable",
+                    "maxUnavailable: ${1:1}",
+                    "Maximum unavailable Pods or percentage",
+                ),
+                (
+                    "selector",
+                    "selector:\n  matchLabels:\n    ${1:app}: ${2:my-app}",
+                    "Target Pod label selector",
                 ),
             ],
             _ => &[
@@ -2455,9 +4556,24 @@ fn schema_keys_for(
                     "Deployment update strategy",
                 ),
                 (
+                    "minReadySeconds",
+                    "minReadySeconds: ${1:10}",
+                    "Minimum seconds before Pod is ready",
+                ),
+                (
+                    "revisionHistoryLimit",
+                    "revisionHistoryLimit: ${1:10}",
+                    "Old ReplicaSets to retain",
+                ),
+                (
                     "serviceAccountName",
                     "serviceAccountName: ${1:default}",
                     "Pod ServiceAccount name",
+                ),
+                (
+                    "volumes",
+                    "volumes:\n  - name: ${1:config-vol}\n    configMap:\n      name: ${2:my-config}",
+                    "Pod storage volumes",
                 ),
                 (
                     "containers",
@@ -2466,53 +4582,473 @@ fn schema_keys_for(
                 ),
             ],
         },
-        p if p.ends_with("spec.containers") || p.ends_with("spec.initContainers") => &[
-            ("name", "name: ${1:app}", "Container name"),
-            ("image", "image: ${1:nginx:1.27-alpine}", "Container image"),
+        p if p.ends_with(".template") || p == "spec.jobTemplate" => &[
             (
-                "imagePullPolicy",
-                "imagePullPolicy: ${1:IfNotPresent}",
-                "Image pull policy",
+                "metadata",
+                "metadata:\n  labels:\n    ${1:app}: ${2:my-app}",
+                "Template metadata",
+            ),
+            ("spec", "spec:\n  $0", "Template specification"),
+        ],
+        "spec.scaleTargetRef" => &[
+            (
+                "apiVersion",
+                "apiVersion: ${1:apps/v1}",
+                "Target workload API version",
+            ),
+            ("kind", "kind: ${1:Deployment}", "Target workload kind"),
+            ("name", "name: ${1:my-app}", "Target workload name"),
+        ],
+        "spec.metrics" => &[
+            (
+                "type",
+                "type: ${1:Resource}",
+                "Metric source type (Resource, Pods, Object, External)",
             ),
             (
-                "ports",
-                "ports:\n  - name: ${1:http}\n    containerPort: ${2:8080}",
-                "Container ports",
+                "resource",
+                "resource:\n  name: ${1:cpu}\n  target:\n    type: Utilization\n    averageUtilization: ${2:75}",
+                "Container resource metric",
+            ),
+        ],
+        "spec.metrics.resource" => &[
+            ("name", "name: ${1:cpu}", "Resource name (cpu or memory)"),
+            (
+                "target",
+                "target:\n  type: ${1:Utilization}\n  averageUtilization: ${2:75}",
+                "Target metric threshold",
+            ),
+        ],
+        "spec.metrics.resource.target" => &[
+            (
+                "type",
+                "type: ${1:Utilization}",
+                "Utilization, AverageValue, or Value",
             ),
             (
-                "env",
-                "env:\n  - name: ${1:ENV_VAR}\n    value: \"${2:value}\"",
-                "Environment variables",
+                "averageUtilization",
+                "averageUtilization: ${1:75}",
+                "Target percentage of requested resource",
             ),
             (
-                "envFrom",
-                "envFrom:\n  - configMapRef:\n      name: ${1:my-config}",
-                "Populate env from ConfigMap or Secret",
+                "averageValue",
+                "averageValue: ${1:500m}",
+                "Target average value per Pod",
+            ),
+            ("value", "value: ${1:100}", "Target raw metric value"),
+        ],
+        "rules" if matches!(kind, Some("Role" | "ClusterRole")) => &[
+            (
+                "apiGroups",
+                "apiGroups: [\"${1:}\"]",
+                "API groups (\"\" for core API)",
             ),
             (
                 "resources",
-                "resources:\n  requests:\n    cpu: ${1:100m}\n    memory: ${2:128Mi}\n  limits:\n    cpu: ${3:500m}\n    memory: ${4:256Mi}",
-                "CPU and memory requests/limits",
+                "resources: [\"${1:pods}\"]",
+                "Target resource plurals",
             ),
             (
-                "livenessProbe",
-                "livenessProbe:\n  httpGet:\n    path: ${1:/healthz}\n    port: ${2:http}\n  initialDelaySeconds: ${3:15}\n  periodSeconds: ${4:20}",
-                "Container liveness probe",
+                "verbs",
+                "verbs: [\"${1:get}\", \"${2:list}\", \"${3:watch}\"]",
+                "Allowed API verbs",
             ),
             (
-                "readinessProbe",
-                "readinessProbe:\n  httpGet:\n    path: ${1:/readyz}\n    port: ${2:http}\n  initialDelaySeconds: ${3:5}\n  periodSeconds: ${4:10}",
-                "Container readiness probe",
+                "resourceNames",
+                "resourceNames: [\"${1:my-resource}\"]",
+                "Restrict to named instances",
+            ),
+        ],
+        "roleRef" => &[
+            (
+                "apiGroup",
+                "apiGroup: rbac.authorization.k8s.io",
+                "RBAC API group",
+            ),
+            ("kind", "kind: ${1:Role}", "Role or ClusterRole"),
+            ("name", "name: ${1:my-role}", "Target Role/ClusterRole name"),
+        ],
+        "subjects" => &[
+            (
+                "kind",
+                "kind: ${1:ServiceAccount}",
+                "ServiceAccount, User, or Group",
+            ),
+            ("name", "name: ${1:default}", "Subject name"),
+            (
+                "namespace",
+                "namespace: ${1:default}",
+                "ServiceAccount namespace",
             ),
             (
-                "volumeMounts",
-                "volumeMounts:\n  - name: ${1:config-vol}\n    mountPath: ${2:/etc/config}",
-                "Container volume mounts",
+                "apiGroup",
+                "apiGroup: rbac.authorization.k8s.io",
+                "Subject API group",
+            ),
+        ],
+        p if p.ends_with("spec.volumes") => &[
+            ("name", "name: ${1:config-vol}", "Volume name"),
+            (
+                "configMap",
+                "configMap:\n  name: ${1:my-config}",
+                "Populate volume from ConfigMap",
             ),
             (
-                "securityContext",
-                "securityContext:\n  runAsNonRoot: true\n  allowPrivilegeEscalation: false",
-                "Container security context",
+                "secret",
+                "secret:\n  secretName: ${1:my-secret}",
+                "Populate volume from Secret",
+            ),
+            ("emptyDir", "emptyDir: {}", "Ephemeral scratch directory"),
+            (
+                "persistentVolumeClaim",
+                "persistentVolumeClaim:\n  claimName: ${1:my-pvc}",
+                "Mount PersistentVolumeClaim",
+            ),
+            (
+                "hostPath",
+                "hostPath:\n  path: ${1:/var/lib/data}",
+                "Mount host node path",
+            ),
+            (
+                "projected",
+                "projected:\n  sources: []",
+                "Combine multiple volume sources",
+            ),
+            (
+                "downwardAPI",
+                "downwardAPI:\n  items: []",
+                "Expose Pod metadata as files",
+            ),
+            (
+                "csi",
+                "csi:\n  driver: ${1:csi.example.com}",
+                "CSI ephemeral volume",
+            ),
+        ],
+        p if p.ends_with("volumes.configMap") => &[
+            ("name", "name: ${1:my-config}", "ConfigMap name"),
+            (
+                "defaultMode",
+                "defaultMode: ${1:420}",
+                "File permission mode",
+            ),
+            (
+                "optional",
+                "optional: ${1:false}",
+                "Allow missing ConfigMap",
+            ),
+            (
+                "items",
+                "items:\n  - key: ${1:config.yaml}\n    path: ${2:config.yaml}",
+                "Project specific keys to paths",
+            ),
+        ],
+        p if p.ends_with("volumes.secret") => &[
+            ("secretName", "secretName: ${1:my-secret}", "Secret name"),
+            (
+                "defaultMode",
+                "defaultMode: ${1:420}",
+                "File permission mode",
+            ),
+            ("optional", "optional: ${1:false}", "Allow missing Secret"),
+            (
+                "items",
+                "items:\n  - key: ${1:tls.crt}\n    path: ${2:tls.crt}",
+                "Project specific keys to paths",
+            ),
+        ],
+        p if p.ends_with("volumes.persistentVolumeClaim") => &[
+            (
+                "claimName",
+                "claimName: ${1:my-pvc}",
+                "PersistentVolumeClaim name",
+            ),
+            ("readOnly", "readOnly: ${1:false}", "Mount read-only"),
+        ],
+        p if p.ends_with("spec.containers")
+            || p.ends_with("spec.initContainers")
+            || p.ends_with("spec.ephemeralContainers") =>
+        {
+            &[
+                ("name", "name: ${1:app}", "Container name"),
+                ("image", "image: ${1:nginx:1.27-alpine}", "Container image"),
+                (
+                    "imagePullPolicy",
+                    "imagePullPolicy: ${1:IfNotPresent}",
+                    "Image pull policy",
+                ),
+                (
+                    "command",
+                    "command: [\"${1:/bin/sh}\"]",
+                    "Container entrypoint array",
+                ),
+                (
+                    "args",
+                    "args: [\"${1:-c}\", \"${2:echo ok}\"]",
+                    "Container command arguments",
+                ),
+                (
+                    "workingDir",
+                    "workingDir: ${1:/app}",
+                    "Container working directory",
+                ),
+                (
+                    "ports",
+                    "ports:\n  - name: ${1:http}\n    containerPort: ${2:8080}",
+                    "Container ports",
+                ),
+                (
+                    "env",
+                    "env:\n  - name: ${1:ENV_VAR}\n    value: \"${2:value}\"",
+                    "Environment variables",
+                ),
+                (
+                    "envFrom",
+                    "envFrom:\n  - configMapRef:\n      name: ${1:my-config}",
+                    "Populate env from ConfigMap or Secret",
+                ),
+                (
+                    "resources",
+                    "resources:\n  requests:\n    cpu: ${1:100m}\n    memory: ${2:128Mi}\n  limits:\n    cpu: ${3:500m}\n    memory: ${4:256Mi}",
+                    "CPU and memory requests/limits",
+                ),
+                (
+                    "livenessProbe",
+                    "livenessProbe:\n  httpGet:\n    path: ${1:/healthz}\n    port: ${2:http}\n  initialDelaySeconds: ${3:15}\n  periodSeconds: ${4:20}",
+                    "Container liveness probe",
+                ),
+                (
+                    "readinessProbe",
+                    "readinessProbe:\n  httpGet:\n    path: ${1:/readyz}\n    port: ${2:http}\n  initialDelaySeconds: ${3:5}\n  periodSeconds: ${4:10}",
+                    "Container readiness probe",
+                ),
+                (
+                    "startupProbe",
+                    "startupProbe:\n  httpGet:\n    path: ${1:/healthz}\n    port: ${2:http}\n  failureThreshold: ${3:30}\n  periodSeconds: ${4:10}",
+                    "Container startup probe",
+                ),
+                (
+                    "volumeMounts",
+                    "volumeMounts:\n  - name: ${1:config-vol}\n    mountPath: ${2:/etc/config}",
+                    "Container volume mounts",
+                ),
+                (
+                    "lifecycle",
+                    "lifecycle:\n  preStop:\n    exec:\n      command: [\"/bin/sh\", \"-c\", \"sleep 5\"]",
+                    "Container lifecycle hooks",
+                ),
+                (
+                    "securityContext",
+                    "securityContext:\n  runAsNonRoot: true\n  allowPrivilegeEscalation: false",
+                    "Container security context",
+                ),
+            ]
+        }
+        "spec.ports" if kind == Some("Service") => &[
+            ("name", "name: ${1:http}", "Service port name"),
+            ("port", "port: ${1:80}", "Service port number"),
+            (
+                "targetPort",
+                "targetPort: ${1:http}",
+                "Target Pod port name or number",
+            ),
+            ("protocol", "protocol: ${1:TCP}", "TCP, UDP, or SCTP"),
+            (
+                "nodePort",
+                "nodePort: ${1:30080}",
+                "Static NodePort (30000-32767)",
+            ),
+        ],
+        p if p.ends_with(".ports") => &[
+            ("name", "name: ${1:http}", "Port name"),
+            (
+                "containerPort",
+                "containerPort: ${1:8080}",
+                "Port number exposed on Pod IP",
+            ),
+            ("protocol", "protocol: ${1:TCP}", "TCP, UDP, or SCTP"),
+            (
+                "hostPort",
+                "hostPort: ${1:8080}",
+                "Port exposed on host node",
+            ),
+        ],
+        p if p.ends_with(".env") => &[
+            ("name", "name: ${1:ENV_VAR}", "Environment variable name"),
+            ("value", "value: \"${1:value}\"", "Literal string value"),
+            (
+                "valueFrom",
+                "valueFrom:\n  secretKeyRef:\n    name: ${1:my-secret}\n    key: ${2:KEY}",
+                "Source from ConfigMap, Secret, or Pod field",
+            ),
+        ],
+        p if p.ends_with(".env.valueFrom") => &[
+            (
+                "configMapKeyRef",
+                "configMapKeyRef:\n  name: ${1:my-config}\n  key: ${2:KEY}",
+                "Select key from ConfigMap",
+            ),
+            (
+                "secretKeyRef",
+                "secretKeyRef:\n  name: ${1:my-secret}\n  key: ${2:KEY}",
+                "Select key from Secret",
+            ),
+            (
+                "fieldRef",
+                "fieldRef:\n  fieldPath: ${1:metadata.namespace}",
+                "Select Pod field",
+            ),
+            (
+                "resourceFieldRef",
+                "resourceFieldRef:\n  resource: ${1:limits.memory}",
+                "Select container resource limit/request",
+            ),
+        ],
+        p if p.ends_with(".envFrom") => &[
+            (
+                "configMapRef",
+                "configMapRef:\n  name: ${1:my-config}",
+                "Import all keys from ConfigMap",
+            ),
+            (
+                "secretRef",
+                "secretRef:\n  name: ${1:my-secret}",
+                "Import all keys from Secret",
+            ),
+            (
+                "prefix",
+                "prefix: ${1:APP_}",
+                "Prefix prepended to imported variable names",
+            ),
+        ],
+        p if p.ends_with(".volumeMounts") => &[
+            ("name", "name: ${1:config-vol}", "Pod volume name to mount"),
+            (
+                "mountPath",
+                "mountPath: ${1:/etc/config}",
+                "Path inside container filesystem",
+            ),
+            (
+                "subPath",
+                "subPath: ${1:config.yaml}",
+                "Sub-path within referenced volume",
+            ),
+            ("readOnly", "readOnly: ${1:true}", "Mount volume read-only"),
+        ],
+        p if p.ends_with(".resources") => &[
+            (
+                "requests",
+                "requests:\n  cpu: ${1:100m}\n  memory: ${2:128Mi}",
+                "Minimum guaranteed compute resources",
+            ),
+            (
+                "limits",
+                "limits:\n  cpu: ${1:500m}\n  memory: ${2:256Mi}",
+                "Maximum allowed compute resources",
+            ),
+        ],
+        p if p.ends_with(".resources.requests") || p.ends_with(".resources.limits") => &[
+            ("cpu", "cpu: ${1:100m}", "CPU cores or millicores"),
+            ("memory", "memory: ${1:128Mi}", "Memory bytes (Mi, Gi)"),
+            (
+                "ephemeral-storage",
+                "ephemeral-storage: ${1:1Gi}",
+                "Ephemeral local storage",
+            ),
+        ],
+        p if p.ends_with(".livenessProbe")
+            || p.ends_with(".readinessProbe")
+            || p.ends_with(".startupProbe") =>
+        {
+            &[
+                (
+                    "httpGet",
+                    "httpGet:\n  path: ${1:/healthz}\n  port: ${2:http}",
+                    "HTTP GET health check",
+                ),
+                (
+                    "tcpSocket",
+                    "tcpSocket:\n  port: ${1:8080}",
+                    "TCP socket health check",
+                ),
+                ("grpc", "grpc:\n  port: ${1:50051}", "gRPC health check"),
+                (
+                    "exec",
+                    "exec:\n  command: [\"${1:cat}\", \"${2:/tmp/healthy}\"]",
+                    "Command execution check",
+                ),
+                (
+                    "initialDelaySeconds",
+                    "initialDelaySeconds: ${1:5}",
+                    "Delay before first probe",
+                ),
+                (
+                    "periodSeconds",
+                    "periodSeconds: ${1:10}",
+                    "Probe interval in seconds",
+                ),
+                (
+                    "timeoutSeconds",
+                    "timeoutSeconds: ${1:1}",
+                    "Probe timeout in seconds",
+                ),
+                (
+                    "failureThreshold",
+                    "failureThreshold: ${1:3}",
+                    "Consecutive failures before action",
+                ),
+                (
+                    "successThreshold",
+                    "successThreshold: ${1:1}",
+                    "Consecutive successes required",
+                ),
+            ]
+        }
+        p if p.ends_with(".securityContext") => &[
+            (
+                "runAsNonRoot",
+                "runAsNonRoot: ${1:true}",
+                "Require non-root UID",
+            ),
+            (
+                "runAsUser",
+                "runAsUser: ${1:1000}",
+                "UID to run container entrypoint",
+            ),
+            (
+                "runAsGroup",
+                "runAsGroup: ${1:1000}",
+                "Primary GID for container",
+            ),
+            (
+                "fsGroup",
+                "fsGroup: ${1:2000}",
+                "Supplemental group for mounted volumes",
+            ),
+            (
+                "allowPrivilegeEscalation",
+                "allowPrivilegeEscalation: ${1:false}",
+                "Disallow gaining more privileges",
+            ),
+            (
+                "privileged",
+                "privileged: ${1:false}",
+                "Run container as privileged",
+            ),
+            (
+                "readOnlyRootFilesystem",
+                "readOnlyRootFilesystem: ${1:true}",
+                "Mount root filesystem read-only",
+            ),
+            (
+                "capabilities",
+                "capabilities:\n  drop: [\"ALL\"]",
+                "Linux capabilities add/drop",
+            ),
+            (
+                "seccompProfile",
+                "seccompProfile:\n  type: RuntimeDefault",
+                "Seccomp syscall filter",
             ),
         ],
         _ => &[],

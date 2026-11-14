@@ -14,6 +14,7 @@ activation = [
     "on-startup-finished",
     "on-view:kubernetes",
     "on-language:yaml",
+    "on-language:helm-template",
     "on-event:file-opened",
     "on-event:file-saved",
     "on-event:files-changed",
@@ -52,7 +53,7 @@ priority = 120
 
 [[contributes.providers]]
 kinds = ["completion", "code-actions", "definition", "line-markers"]
-languages = ["yaml"]
+languages = ["yaml", "helm-template"]
 
 [[contributes.commands]]
 id = "refresh"
@@ -97,7 +98,7 @@ when = "editorLang == yaml"
 id = "inspect"
 title = "Kubernetes: Inspect Current File"
 category = "Kubernetes"
-when = "editorLang == yaml"
+when = "editorLang == yaml || editorLang == helm-template || editorLangId == yaml || editorLangId == helm-template"
 
 [[contributes.commands]]
 id = "scan-project"
@@ -162,7 +163,12 @@ when = "editorLang == yaml"
 [[contributes.menus]]
 menu = "editor.context"
 command = "inspect"
-when = "editorLang == yaml"
+when = "editorLang == yaml || editorLang == helm-template || editorLangId == yaml || editorLangId == helm-template"
+
+[[contributes.menus]]
+menu = "editor.context"
+command = "helm-template"
+when = "editorLang == helm-template || editorLangId == helm-template"
 
 [[contributes.menus]]
 menu = "editorTab.context"

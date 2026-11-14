@@ -7038,8 +7038,8 @@ impl ActiveWatchStream {
 }
 
 /// Ephemeral per-search `kubectl proxy --port=0 --address=127.0.0.1` loopback tunnel for the active
-/// context, allowing `host::fetch` (`net:127.0.0.1`) to send custom `Accept: application/json;as=Table`
-/// + `Accept-Encoding: gzip` + `?resourceVersion=0&includeObject=None` queries to `kube-apiserver`'s
+/// context, allowing `host::fetch` (`net:127.0.0.1`) to send custom `Accept: application/json;as=Table` +
+/// `Accept-Encoding: gzip` + `?resourceVersion=0&includeObject=None` queries to `kube-apiserver`'s
 /// watch cache (~2.3s / 1.6 MiB for 88k pods instead of 880 MB across 177 `kubectl get` chunks),
 /// and torn down immediately when the search finishes (and on plugin teardown).
 pub struct KubeApiProxy {

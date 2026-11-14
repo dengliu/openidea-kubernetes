@@ -2774,7 +2774,9 @@ impl Providers for KubernetesPlugin {
         let mut items = completions_at(&self.index, doc, at, &parsed);
 
         // Enrich ConfigMap/Secret/Service/ServiceAccount/PVC/CRD completions from the cached live cluster snapshot!
-        if let Some(ref snap) = self.snapshot {
+        if manifest::helm_action_context_at(&doc.text, at).is_none()
+            && let Some(ref snap) = self.snapshot
+        {
             let (parent_path, current_line, _) = manifest::yaml_context_at(&doc.text, at);
             let trimmed = current_line.trim_start();
             if let Some(colon) = trimmed.find(':') {
@@ -5114,6 +5116,446 @@ aks-gpu-002   Ready,SchedulingDisabled   control-plane   31d   v1.31.2   10.10.1
                 .ends_with("/podinfo/flux/kustomization-sync.yaml")
                 .then_some(v.as_str())),
             Some("kubernetes")
+        );
+    }
+
+    #[test]
+    fn plain_manifest_completions_and_links() {
+        let host = MockHost::install();
+        let deploy_yaml = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simple-app
+  labels:
+    app: simple-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: simple-app
+  template:
+    metadata:
+      labels:
+        app: simple-app
+    spec:
+      serviceAccountName: simple-app
+      v
+      volumes:
+        - name: app-config
+          configMap:
+            name: simple-app-cfg
+      containers:
+        - name: simple-app
+          image: nginx:1.27-alpine
+          volumeMounts:
+            - name: app-config
+              mountPath: /etc/app
+          resources:
+            requests:
+              c
+";
+        let hpa_yaml = "\
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: simple-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: simple-app
+  m
+";
+        host.add_file("plain-manifest/deployment.yaml", deploy_yaml);
+        host.add_file("plain-manifest/hpa.yaml", hpa_yaml);
+        host.add_file(
+            "plain-manifest/secret.yaml",
+            "apiVersion: v1\nkind: Secret\nmetadata:\n  name: simple-app-secret\ntype: Opaque\n",
+        );
+
+        let mut plugin = KubernetesPlugin::default();
+        let deploy_doc = Document {
+            path: "/project/plain-manifest/deployment.yaml".into(),
+            language: "yaml".into(),
+            version: 1,
+            text: deploy_yaml.into(),
+        };
+
+        // 1. Typing `v` under `spec.template.spec` (line 17, col 7) suggests `volumes`
+        let podspec_items = plugin.completion(&deploy_doc, Position::new(17, 7), None);
+        let podspec_labels: Vec<&str> = podspec_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            podspec_labels.contains(&"volumes"),
+            "expected 'volumes' under spec.template.spec, got {podspec_labels:?}"
+        );
+
+        // 2. Typing `c` under `containers[].resources.requests` (line 30, col 15) suggests `cpu`
+        let res_items = plugin.completion(&deploy_doc, Position::new(30, 15), None);
+        let res_labels: Vec<&str> = res_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(res_labels.contains(&"cpu"), "got {res_labels:?}");
+
+        // 3. `volumeMounts[].name: app-config` (line 26, col 22) jumps to `volumes[].name: app-config` (line 19)
+        let vol_defs = plugin.definition(&deploy_doc, Position::new(26, 22));
+        assert_eq!(vol_defs.len(), 1);
+        assert_eq!(vol_defs[0].range.start.line, 19);
+
+        // 4. HPA `spec:` typing `m` (line 9, col 3) suggests `minReplicas`, `maxReplicas`, `metrics` (not Deployment `template`)
+        let hpa_doc = Document {
+            path: "/project/plain-manifest/hpa.yaml".into(),
+            language: "yaml".into(),
+            version: 1,
+            text: hpa_yaml.into(),
+        };
+        let hpa_spec_items = plugin.completion(&hpa_doc, Position::new(9, 3), None);
+        let hpa_labels: Vec<&str> = hpa_spec_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            hpa_labels.contains(&"minReplicas")
+                && hpa_labels.contains(&"maxReplicas")
+                && hpa_labels.contains(&"metrics"),
+            "got {hpa_labels:?}"
+        );
+
+        // 5. HPA `scaleTargetRef.name: simple-app` (line 8, col 12) jumps to `Deployment/simple-app` (line 3) and completes workload name
+        let hpa_defs = plugin.definition(&hpa_doc, Position::new(8, 12));
+        assert_eq!(hpa_defs.len(), 1);
+        assert!(hpa_defs[0].path.ends_with("plain-manifest/deployment.yaml"));
+        assert_eq!(hpa_defs[0].range.start.line, 3);
+
+        let hpa_name_edit = Document {
+            text: hpa_yaml.replace("name: simple-app\n  m", "name: sim\n"),
+            ..hpa_doc
+        };
+        let target_items = plugin.completion(&hpa_name_edit, Position::new(8, 13), None);
+        let target_labels: Vec<&str> = target_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            target_labels.contains(&"simple-app"),
+            "got {target_labels:?}"
+        );
+    }
+
+    #[test]
+    fn simple_app_chart_completions_and_links() {
+        let host = MockHost::install();
+        host.add_file(
+            "simple-app-chart/Chart.yaml",
+            "apiVersion: v2\nname: simple-app-chart\ntype: application\nversion: 0.1.0\nappVersion: \"1.0.0\"\nd\n",
+        );
+        host.add_file(
+            "simple-app-chart/values.yaml",
+            "replicaCount: 2\nimage:\n  repository: nginx\n  tag: \"1.27-alpine\"\napps:\n  - name: frontend\n    namespace: prod\nconfig:\n  spec:\n    server: https://kubernetes.default.svc\n",
+        );
+        // Unrelated second chart in workspace to verify chart-scoped isolation
+        host.add_file(
+            "other-chart/Chart.yaml",
+            "apiVersion: v2\nname: other\nversion: 0.1.0\n",
+        );
+        host.add_file("other-chart/values.yaml", "leakedOtherChartKey: true\n");
+
+        host.add_file(
+            "simple-app-chart/templates/_helpers.tpl",
+            "{{- define \"simple-app-chart.fullname\" -}}\n{{- .Chart.Name }}\n{{- end }}\n",
+        );
+        let tpl = "\
+{{- range .Values.apps }}
+{{- $cfg := $.Values.config -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include \"simple-app-chart.fullname\" . }}-{{ .name }}
+  namespace: {{ .namespace }}
+spec:
+  replicas: {{ $.Values.replicaCount }}
+  template:
+    spec:
+      v
+      containers:
+        - name: {{ $.Chart.Name }}
+          image: \"{{ $.Values.image.repository }}:{{ $cfg.spec.server }}\"
+{{- end }}
+";
+        host.add_file("simple-app-chart/templates/deployment.yaml", tpl);
+
+        let mut plugin = KubernetesPlugin::default();
+
+        // 1. `Chart.yaml` completes `description` / `dependencies` at `d`, without Kubernetes `data` or `kdep`
+        let chart_doc = Document {
+            path: "/project/simple-app-chart/Chart.yaml".into(),
+            language: "yaml".into(),
+            version: 1,
+            text: "apiVersion: v2\nname: simple-app-chart\nd\n".into(),
+        };
+        let chart_items = plugin.completion(&chart_doc, Position::new(2, 1), None);
+        let chart_labels: Vec<&str> = chart_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            chart_labels.contains(&"description") && chart_labels.contains(&"dependencies"),
+            "got {chart_labels:?}"
+        );
+        assert!(
+            !chart_labels.contains(&"data"),
+            "Chart.yaml must not suggest ConfigMap `data`"
+        );
+
+        // 2. `templates/deployment.yaml` completes `volumes` under `spec.template.spec` (line 11, col 7) even with `{{- $cfg := ... -}}`
+        let tpl_doc = Document {
+            path: "/project/simple-app-chart/templates/deployment.yaml".into(),
+            language: "helm-template".into(),
+            version: 1,
+            text: tpl.into(),
+        };
+        let podspec_items = plugin.completion(&tpl_doc, Position::new(11, 7), None);
+        let podspec_labels: Vec<&str> = podspec_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            podspec_labels.contains(&"volumes"),
+            "expected 'volumes' in Helm template PodSpec, got {podspec_labels:?}"
+        );
+
+        // 3. Scoped `.name` inside `{{- range .Values.apps }}` (line 5, col 58) jumps to `apps.name` in `simple-app-chart/values.yaml` (line 5)
+        let scoped_defs = plugin.definition(&tpl_doc, Position::new(5, 58));
+        assert_eq!(scoped_defs.len(), 1, "expected scoped .name definition");
+        assert!(
+            scoped_defs[0]
+                .path
+                .ends_with("simple-app-chart/values.yaml")
+        );
+        assert_eq!(scoped_defs[0].range.start.line, 5);
+
+        // 4. `$cfg` (line 14, col 55) jumps to `{{- $cfg := $.Values.config -}}` (line 1), and `.spec.server` (col 63) jumps to `values.yaml` (line 9)
+        let var_defs = plugin.definition(&tpl_doc, Position::new(14, 55));
+        assert_eq!(var_defs.len(), 1);
+        assert!(var_defs[0].path.ends_with("templates/deployment.yaml"));
+        assert_eq!(var_defs[0].range.start.line, 1);
+
+        let var_field_defs = plugin.definition(&tpl_doc, Position::new(14, 63));
+        assert_eq!(var_field_defs.len(), 1);
+        assert!(
+            var_field_defs[0]
+                .path
+                .ends_with("simple-app-chart/values.yaml")
+        );
+        assert_eq!(var_field_defs[0].range.start.line, 9);
+
+        // 5. Segment-aware `.Values.image.` completion returns `repository` & `tag`, and `.Values.` excludes `other-chart` keys
+        let dot_edit = Document {
+            text: "replicas: {{ .Values.image. }}\n".into(),
+            ..tpl_doc.clone()
+        };
+        let img_items = plugin.completion(&dot_edit, Position::new(0, 27), Some("."));
+        let img_labels: Vec<&str> = img_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            img_labels.contains(&"repository") && img_labels.contains(&"tag"),
+            "got {img_labels:?}"
+        );
+
+        let root_vals_edit = Document {
+            text: "replicas: {{ .Values. }}\n".into(),
+            ..tpl_doc.clone()
+        };
+        let root_val_items = plugin.completion(&root_vals_edit, Position::new(0, 21), Some("."));
+        let root_val_labels: Vec<&str> = root_val_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            root_val_labels.contains(&"replicaCount")
+                && !root_val_labels.contains(&"leakedOtherChartKey"),
+            "got {root_val_labels:?}"
+        );
+
+        // 6. `.Chart.` & `$cfg.spec.` completions inside `{{ ... }}`
+        let chart_obj_edit = Document {
+            text: "name: {{ .Chart. }}\n".into(),
+            ..tpl_doc.clone()
+        };
+        let chart_obj_items = plugin.completion(&chart_obj_edit, Position::new(0, 16), Some("."));
+        let chart_obj_labels: Vec<&str> =
+            chart_obj_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            chart_obj_labels.contains(&"Name") && chart_obj_labels.contains(&"AppVersion"),
+            "got {chart_obj_labels:?}"
+        );
+
+        // 7. Reverse navigation from `values.yaml` `replicaCount` (line 0) jumps to `templates/deployment.yaml` (line 8)
+        let _ = plugin.line_markers(&tpl_doc);
+        let values_doc = Document {
+            path: "/project/simple-app-chart/values.yaml".into(),
+            language: "yaml".into(),
+            version: 1,
+            text: "replicaCount: 2\nimage:\n  repository: nginx\n  tag: \"1.27-alpine\"\n".into(),
+        };
+        let rev_defs = plugin.definition(&values_doc, Position::new(0, 4));
+        assert!(
+            rev_defs
+                .iter()
+                .any(|d| d.path.ends_with("templates/deployment.yaml") && d.range.start.line == 8),
+            "expected reverse link from values.yaml to templates/deployment.yaml, got {rev_defs:?}"
+        );
+    }
+
+    #[test]
+    fn simple_app_kustomize_completions_links_and_patch_inspections() {
+        let host = MockHost::install();
+        host.add_file(
+            "simple-app-kustomize/base/kustomization.yaml",
+            "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - deployment.yaml\n",
+        );
+        host.add_file(
+            "simple-app-kustomize/base/deployment.yaml",
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: simple-app\nspec:\n  replicas: 2\n  selector:\n    matchLabels:\n      app: simple-app\n  template:\n    metadata:\n      labels:\n        app: simple-app\n    spec:\n      containers:\n        - name: simple-app\n          image: nginx:1.27-alpine\n          resources:\n            requests:\n              cpu: 100m\n              memory: 128Mi\n            limits:\n              cpu: 500m\n              memory: 256Mi\n",
+        );
+        let prod_kust = "\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: prod
+resources:
+  - ../../base
+patches:
+  - path: patch-deployment.yaml
+  - path: patch-json6902.yaml
+    target:
+      kind: Deployment
+      name: s
+images:
+  - name: n
+";
+        let patch_deploy = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simple-app
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: simple-app
+          env:
+            - name: LOG_LEVEL
+              value: debug
+";
+        let patch_json = "\
+- op: replace
+  path: /spec/replicas
+  value: 5
+- o
+";
+        host.add_file(
+            "simple-app-kustomize/overlays/prod/kustomization.yaml",
+            prod_kust,
+        );
+        host.add_file(
+            "simple-app-kustomize/overlays/prod/patch-deployment.yaml",
+            patch_deploy,
+        );
+        host.add_file(
+            "simple-app-kustomize/overlays/prod/patch-json6902.yaml",
+            patch_json,
+        );
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        // 1. `resources: - ../../base` (line 4, col 8) jumps directly to `base/kustomization.yaml`!
+        let kust_doc = Document {
+            path: "/project/simple-app-kustomize/overlays/prod/kustomization.yaml".into(),
+            language: "yaml".into(),
+            version: 1,
+            text: prod_kust.into(),
+        };
+        let base_defs = plugin.definition(&kust_doc, Position::new(4, 8));
+        assert_eq!(base_defs.len(), 1, "expected ../../base directory link");
+        assert!(
+            base_defs[0]
+                .path
+                .ends_with("simple-app-kustomize/base/kustomization.yaml"),
+            "got {:?}",
+            base_defs[0]
+        );
+
+        // 2. `kustomization.yaml` completes target workload `simple-app` (line 10, col 13) & image `nginx` (line 12, col 11)
+        let target_name_items = plugin.completion(&kust_doc, Position::new(10, 13), None);
+        assert!(
+            target_name_items.iter().any(|i| i.label == "simple-app"),
+            "got {target_name_items:?}"
+        );
+        let img_items = plugin.completion(&kust_doc, Position::new(12, 11), None);
+        assert!(
+            img_items.iter().any(|i| i.label == "nginx"),
+            "got {img_items:?}"
+        );
+
+        // 3. `kustomization.yaml` relative path completion suggests `../../base` under `resources:`
+        let path_edit_doc = Document {
+            text: "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - ../\n".into(),
+            ..kust_doc.clone()
+        };
+        let rel_items = plugin.completion(&path_edit_doc, Position::new(3, 7), None);
+        assert!(
+            rel_items.iter().any(|i| i.label == "../../base"),
+            "got {rel_items:?}"
+        );
+        // Restore full `kustomization.yaml` in index before validating patch-aware inspections
+        let _ = plugin.line_markers(&kust_doc);
+
+        // 4. Strategic merge `patch-deployment.yaml` completes `volumes` under `spec.template.spec` (line 8, col 7)
+        //    AND does NOT emit false `missing-resource-limits` warnings on partial container overrides!
+        let patch_edit_doc = Document {
+            path: "/project/simple-app-kustomize/overlays/prod/patch-deployment.yaml".into(),
+            language: "yaml".into(),
+            version: 1,
+            text: "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simple-app
+spec:
+  replicas: 3
+  template:
+    spec:
+      v
+      containers:
+        - name: simple-app
+          env:
+            - name: LOG_LEVEL
+              value: debug
+"
+            .into(),
+        };
+        let patch_podspec = plugin.completion(&patch_edit_doc, Position::new(8, 7), None);
+        assert!(
+            patch_podspec.iter().any(|i| i.label == "volumes"),
+            "got {patch_podspec:?}"
+        );
+        let diag_count = plugin
+            .check_and_publish(
+                "/project/simple-app-kustomize/overlays/prod/patch-deployment.yaml",
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            diag_count, 0,
+            "strategic merge patch inheriting resources from base should emit 0 false warnings"
+        );
+
+        // 5. JSON 6902 `patch-json6902.yaml` completes `op` on `- o` (line 3, col 3) and enum values on `op: `
+        let json_patch_doc = Document {
+            path: "/project/simple-app-kustomize/overlays/prod/patch-json6902.yaml".into(),
+            language: "yaml".into(),
+            version: 1,
+            text: patch_json.into(),
+        };
+        let op_key_items = plugin.completion(&json_patch_doc, Position::new(3, 3), None);
+        assert!(
+            op_key_items.iter().any(|i| i.label == "op"),
+            "got {op_key_items:?}"
+        );
+        let op_val_doc = Document {
+            text: "- op: rep\n".into(),
+            ..json_patch_doc
+        };
+        let op_val_items = plugin.completion(&op_val_doc, Position::new(0, 9), None);
+        assert!(
+            op_val_items.iter().any(|i| i.label == "replace"),
+            "got {op_val_items:?}"
         );
     }
 }
