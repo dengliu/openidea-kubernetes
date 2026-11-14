@@ -1,12 +1,12 @@
 id = "dengliu.kubernetes"
 name = "Kubernetes"
-version = "0.3.7"
+version = "0.3.8"
 icon = "icons/kubernetes-logo.svg"
 description = "Manage Kubernetes clusters, Helm releases and Kustomize overlays: cluster explorer with live Pod logs, shell and port-forward, YAML completion, cross-resource navigation, gutter markers and manifest inspections."
 authors = ["Deng Liu"]
 homepage = "https://github.com/dengliu/openidea-kubernetes"
 license = "Apache-2.0"
-change-notes = "0.3.7 — add IntelliJ-style Kubernetes, Helm (chart directories, Chart.yaml, values.yaml, templates), and Kustomize (overlay/component directories, kustomization.yaml, patches/plugins) file and folder icons with automatic project structure and YAML content detection."
+change-notes = "0.3.8 — add Helm Template (helm-template) provider support, comprehensive schema and resource completions, Go-to-Definition links across plain Kubernetes YAML, Helm charts (Chart.yaml, values.yaml, templates/* with range/with scopes and $var bindings), and Kustomize (directory base links, relative path/target completions, JSON 6902 patches, and patch-aware inspections)."
 categories = ["tools", "frameworks"]
 engines.openidea = "^1.8"
 wasm = "dist/plugin.wasm"

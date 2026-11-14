@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "openidea-plugin-dengliu-kubernetes"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "flate2",
  "openidea-plugin",
