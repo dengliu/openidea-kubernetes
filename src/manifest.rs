@@ -224,6 +224,58 @@ pub fn range_in_line(line_no: u32, line_str: &str, start: usize, end: usize) -> 
     )
 }
 
+/// If `raw_after_colon` is an unquoted YAML flow mapping (`{ ... }`, optionally followed by a `# ...` comment),
+/// returns `(flow_mapping_slice, byte_offset_of_open_brace_in_line)`.
+fn extract_flow_mapping_slice(raw_after_colon: &str, base_byte: usize) -> Option<(&str, usize)> {
+    let trimmed_start = raw_after_colon.trim_start();
+    if !trimmed_start.starts_with('{') {
+        return None;
+    }
+    let lead = raw_after_colon.len() - trimmed_start.len();
+    let bytes = trimmed_start.as_bytes();
+    let mut brace_depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if q == b'"' && b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if q == b'\'' && b == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => quote = Some(b),
+            b'{' => brace_depth += 1,
+            b'}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                if brace_depth == 0 {
+                    let rest = &trimmed_start[i + 1..];
+                    let rest_trimmed = rest.trim_start();
+                    if rest_trimmed.is_empty()
+                        || (rest.len() > rest_trimmed.len() && rest_trimmed.starts_with('#'))
+                    {
+                        return Some((&trimmed_start[..=i], base_byte + lead));
+                    }
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Extracts inline YAML flow-mapping entries (`outer: {name: OUTER, nested: {k: 1}}`) into `helm_values`.
 fn record_inline_flow_helm_values(
     line_no: u32,
@@ -258,6 +310,10 @@ fn record_inline_flow_helm_values(
             let b = bytes[i];
             if let Some(q) = quote {
                 if q == b'"' && b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if q == b'\'' && b == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
                     i += 2;
                     continue;
                 }
@@ -296,6 +352,10 @@ fn record_inline_flow_helm_values(
                 let c = sbytes[j];
                 if let Some(q) = sq {
                     if q == b'"' && c == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if q == b'\'' && c == b'\'' && sbytes.get(j + 1) == Some(&b'\'') {
                         j += 2;
                         continue;
                     }
@@ -406,13 +466,36 @@ fn parse_scalar_span(
         }
     }
 
-    // Unquoted value: stop at ` #` or `\t#`.
+    // Unquoted value (including flow collections): stop at ` #` or `\t#` outside quotes.
     let mut end_rel = trimmed_start.len();
-    for (idx, _) in trimmed_start.match_indices('#') {
-        if idx == 0 || trimmed_start.as_bytes()[idx - 1].is_ascii_whitespace() {
-            end_rel = idx;
-            break;
+    let mut quote: Option<u8> = None;
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if let Some(q) = quote {
+            if q == b'"' && b == b'\\' {
+                idx += 2;
+                continue;
+            }
+            if q == b'\'' && b == b'\'' && bytes.get(idx + 1) == Some(&b'\'') {
+                idx += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            idx += 1;
+            continue;
         }
+        match b {
+            b'"' | b'\'' => quote = Some(b),
+            b'#' if idx == 0 || bytes[idx - 1].is_ascii_whitespace() => {
+                end_rel = idx;
+                break;
+            }
+            _ => {}
+        }
+        idx += 1;
     }
     let clean = trimmed_start[..end_rel].trim_end();
     if clean.is_empty() || matches!(clean, "|" | ">" | "|-" | ">-" | "|+" | ">+") {
@@ -1485,33 +1568,42 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
 
         // Record Helm `values.yaml` flattened path (capped at 2048 entries per file).
         if result.helm_values.len() < 2048 {
-            if let Some(ref val) = scalar {
-                let is_nonempty_flow_map = val.value.starts_with('{')
-                    && val.value.ends_with('}')
-                    && val.value.trim().len() > 2;
+            if let Some((flow_slice, flow_byte_offset)) =
+                extract_flow_mapping_slice(after_colon, after_colon_byte)
+            {
+                let is_nonempty = !flow_slice[1..flow_slice.len() - 1].trim().is_empty();
                 result
                     .helm_values
                     .entry(full_path.clone())
                     .or_insert_with(|| Spanned {
-                        value: if is_nonempty_flow_map {
+                        value: if is_nonempty {
                             String::new()
                         } else {
-                            val.value.clone()
+                            "{}".into()
                         },
                         range: key_range,
                         line: line_no,
                     });
-                if is_nonempty_flow_map {
+                if is_nonempty {
                     record_inline_flow_helm_values(
                         line_no,
                         line,
-                        after_colon_byte,
-                        after_colon,
+                        flow_byte_offset,
+                        flow_slice,
                         &full_path,
                         0,
                         &mut result.helm_values,
                     );
                 }
+            } else if let Some(ref val) = scalar {
+                result
+                    .helm_values
+                    .entry(full_path.clone())
+                    .or_insert_with(|| Spanned {
+                        value: val.value.clone(),
+                        range: key_range,
+                        line: line_no,
+                    });
             } else {
                 result
                     .helm_values

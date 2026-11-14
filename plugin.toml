@@ -1,12 +1,12 @@
 id = "dengliu.kubernetes"
 name = "Kubernetes"
-version = "0.3.11"
+version = "0.3.12"
 icon = "icons/kubernetes-logo.svg"
 description = "Manage Kubernetes clusters, Helm releases and Kustomize overlays: cluster explorer with live Pod logs, shell and port-forward, YAML completion, cross-resource navigation, gutter markers and manifest inspections."
 authors = ["Deng Liu"]
 homepage = "https://github.com/dengliu/openidea-kubernetes"
 license = "Apache-2.0"
-change-notes = "0.3.11 — preserve Go/Helm range-header variable declarations through else branches until end (modeling zero-iteration values cleanly while clearing branch-local body bindings); includes lexical Helm variable scoping, registry-port Kustomize image completions, per-project manifest indices, Helm Template (helm-template) support, and dynamic Kubernetes/Helm/Kustomize icons."
+change-notes = "0.3.12 — parse inline YAML flow mappings in values.yaml cleanly when followed by trailing comments or containing quoted # characters; includes lexical Go/Helm variable scoping across range/else/end, registry-port Kustomize image completions, per-project manifest indices, Helm Template (helm-template) support, and dynamic Kubernetes/Helm/Kustomize icons."
 categories = ["tools", "frameworks"]
 engines.openidea = "^1.8"
 wasm = "dist/plugin.wasm"

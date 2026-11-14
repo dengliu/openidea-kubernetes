@@ -6175,4 +6175,113 @@ after: {{ $
             "range header vars leaked past end: {post_end_labels:?}"
         );
     }
+
+    #[test]
+    fn helm_flow_mapping_values_with_trailing_comments_complete_and_navigate() {
+        let host = MockHost::install();
+        host.add_file(
+            "flow-chart/Chart.yaml",
+            "apiVersion: v2\nname: flow-chart\nversion: 0.1.0\n",
+        );
+        let values_text = "\
+outer: {name: OUTER, nested: {key: VALUE}} # documented settings
+meta: {label: \"app #1\", env: 'it''s #prod'} # quoted hash inside flow map
+rawExpr: \"{literal: text}\" # quoted scalar, not a flow map
+";
+        host.add_file("flow-chart/values.yaml", values_text);
+        let tpl_text = "val: {{ .Values.outer.nested.key }}\n";
+        host.add_file("flow-chart/templates/configmap.yaml", tpl_text);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        let tpl_doc = Document {
+            path: "/project/flow-chart/templates/configmap.yaml".into(),
+            language: "helm-template".into(),
+            version: 1,
+            text: tpl_text.into(),
+        };
+
+        // 1. Go to Definition on `key` in `{{ .Values.outer.nested.key }}` (line 0, col 30)
+        //    jumps to `key` (line 0, cols 30..33) inside `outer: {name: OUTER, nested: {key: VALUE}} # documented settings`
+        let key_defs = plugin.definition(&tpl_doc, Position::new(0, 30));
+        assert_eq!(
+            key_defs.len(),
+            1,
+            "expected target in values.yaml, got {key_defs:?}"
+        );
+        assert!(key_defs[0].path.ends_with("flow-chart/values.yaml"));
+        assert_eq!(
+            key_defs[0].range,
+            Range::new(Position::new(0, 30), Position::new(0, 33))
+        );
+
+        // 2. Completion after `.Values.outer.` offers `name` and `nested` despite trailing `# documented settings`
+        let outer_comp_doc = Document {
+            text: "val: {{ .Values.outer.\n".into(),
+            ..tpl_doc.clone()
+        };
+        let mut outer_labels: Vec<String> = plugin
+            .completion(&outer_comp_doc, Position::new(0, 22), Some("."))
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        outer_labels.sort();
+        assert_eq!(outer_labels, vec!["name".to_owned(), "nested".to_owned()]);
+
+        // 3. Completion after `.Values.outer.nested.` offers `key`
+        let nested_comp_doc = Document {
+            text: "val: {{ .Values.outer.nested.\n".into(),
+            ..tpl_doc.clone()
+        };
+        let nested_labels: Vec<String> = plugin
+            .completion(&nested_comp_doc, Position::new(0, 29), Some("."))
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert_eq!(nested_labels, vec!["key".to_owned()]);
+
+        // 4. Quoted `#` inside flow values (`meta: {label: "app #1", env: 'it''s #prod'} # ...`) preserves all keys,
+        //    while quoted string scalar `rawExpr: "{literal: text}"` is NOT treated as a flow map.
+        let meta_comp_doc = Document {
+            text: "val: {{ .Values.meta.\n".into(),
+            ..tpl_doc.clone()
+        };
+        let mut meta_labels: Vec<String> = plugin
+            .completion(&meta_comp_doc, Position::new(0, 21), Some("."))
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        meta_labels.sort();
+        assert_eq!(meta_labels, vec!["env".to_owned(), "label".to_owned()]);
+
+        let raw_comp_doc = Document {
+            text: "val: {{ .Values.rawExpr.\n".into(),
+            ..tpl_doc.clone()
+        };
+        assert!(
+            plugin
+                .completion(&raw_comp_doc, Position::new(0, 24), Some("."))
+                .is_empty(),
+            "quoted scalar starting with '{{' must not be parsed as a YAML flow mapping"
+        );
+
+        // 5. Restore template in index and verify reverse navigation from `key` (col 31) in `values.yaml`
+        let _ = plugin.line_markers(&tpl_doc);
+        let values_doc = Document {
+            path: "/project/flow-chart/values.yaml".into(),
+            language: "yaml".into(),
+            version: 1,
+            text: values_text.into(),
+        };
+        let rev_defs = plugin.definition(&values_doc, Position::new(0, 31));
+        assert!(
+            rev_defs
+                .iter()
+                .any(|d| d.path == tpl_doc.path && d.range.start.line == 0),
+            "expected reverse link from nested flow key to template, got {rev_defs:?}"
+        );
+    }
 }
