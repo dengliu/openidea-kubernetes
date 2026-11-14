@@ -5980,4 +5980,199 @@ images:
             Some(Range::new(Position::new(5, 10), Position::new(5, 25)))
         );
     }
+
+    #[test]
+    fn helm_range_header_variables_stay_in_scope_through_else_and_restore_at_end() {
+        let host = MockHost::install();
+        host.add_file(
+            "range-else-chart/Chart.yaml",
+            "apiVersion: v2\nname: range-else-chart\nversion: 0.1.0\n",
+        );
+        host.add_file(
+            "range-else-chart/values.yaml",
+            "outer: {name: OUTER, outer_only: true}\nitems: []\n",
+        );
+
+        // 1. Shadowed `$cfg` in `range ... else ... end` (exact Go template variable scope rule)
+        let shadowed_tpl = "\
+{{- $cfg := .Values.outer -}}
+{{- range $cfg := .Values.items -}}
+loop: {{ $cfg }}
+{{- else -}}
+empty: {{ $cfg }}
+{{- end -}}
+after: {{ $cfg }}
+";
+        host.add_file("range-else-chart/templates/shadowed.yaml", shadowed_tpl);
+
+        // 2. Unshadowed `$idx, $entry` + branch-local `$loop_only` in `range ... else ... end`
+        let unshadowed_tpl = "\
+{{- range $idx, $entry := .Values.items -}}
+{{- $loop_only := .Values.outer -}}
+loop: {{ $idx }}={{ $entry }}
+{{- else -}}
+empty: {{ $idx }}={{ $entry }}
+{{- end -}}
+after: done
+";
+        host.add_file("range-else-chart/templates/unshadowed.yaml", unshadowed_tpl);
+
+        let mut plugin = KubernetesPlugin::default();
+        plugin
+            .activate(&host.context("dengliu.kubernetes"))
+            .unwrap();
+
+        let shadowed_doc = Document {
+            path: "/project/range-else-chart/templates/shadowed.yaml".into(),
+            language: "helm-template".into(),
+            version: 1,
+            text: shadowed_tpl.into(),
+        };
+
+        // Loop body `$cfg` (line 2, col 11) -> range declaration (line 1)
+        let loop_defs: Vec<u32> = plugin
+            .definition(&shadowed_doc, Position::new(2, 11))
+            .into_iter()
+            .filter(|d| d.path == shadowed_doc.path)
+            .map(|d| d.range.start.line)
+            .collect();
+        assert_eq!(loop_defs, vec![1]);
+
+        // `else` branch `$cfg` (line 4, col 12) -> range declaration (line 1), NOT outer line 0!
+        let else_defs: Vec<u32> = plugin
+            .definition(&shadowed_doc, Position::new(4, 12))
+            .into_iter()
+            .filter(|d| d.path == shadowed_doc.path)
+            .map(|d| d.range.start.line)
+            .collect();
+        assert_eq!(else_defs, vec![1]);
+
+        // Post-`end` `$cfg` (line 6, col 12) -> outer declaration (line 0)
+        let after_defs: Vec<u32> = plugin
+            .definition(&shadowed_doc, Position::new(6, 12))
+            .into_iter()
+            .filter(|d| d.path == shadowed_doc.path)
+            .map(|d| d.range.start.line)
+            .collect();
+        assert_eq!(after_defs, vec![0]);
+
+        // In `else`, `$cfg` holds the zero-iteration empty value, so `$cfg.` does NOT leak `outer_only`
+        let else_field_doc = Document {
+            text: "\
+{{- $cfg := .Values.outer -}}
+{{- range $cfg := .Values.items -}}
+loop: {{ $cfg }}
+{{- else -}}
+empty: {{ $cfg.
+{{- end -}}
+"
+            .into(),
+            ..shadowed_doc.clone()
+        };
+        let else_field_items = plugin.completion(&else_field_doc, Position::new(4, 15), Some("."));
+        assert!(
+            else_field_items.is_empty(),
+            "zero-iteration range $cfg in else must not leak outer fields, got {else_field_items:?}"
+        );
+
+        // After `end`, `$cfg.` restores outer `.Values.outer` (including inline flow mapping keys!)
+        let after_field_doc = Document {
+            text: "\
+{{- $cfg := .Values.outer -}}
+{{- range $cfg := .Values.items -}}
+loop: {{ $cfg }}
+{{- else -}}
+empty: {{ $cfg }}
+{{- end -}}
+after: {{ $cfg.
+"
+            .into(),
+            ..shadowed_doc
+        };
+        let after_field_labels: Vec<String> = plugin
+            .completion(&after_field_doc, Position::new(6, 15), Some("."))
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(
+            after_field_labels.contains(&"name".to_owned())
+                && after_field_labels.contains(&"outer_only".to_owned()),
+            "expected outer flow-map keys after end, got {after_field_labels:?}"
+        );
+
+        // Unshadowed `$idx` and `$entry` in `else`: definition jumps to line 0, completion offers both
+        // while omitting branch-local `$loop_only`!
+        let unshadowed_doc = Document {
+            path: "/project/range-else-chart/templates/unshadowed.yaml".into(),
+            language: "helm-template".into(),
+            version: 1,
+            text: unshadowed_tpl.into(),
+        };
+        let else_idx_defs: Vec<u32> = plugin
+            .definition(&unshadowed_doc, Position::new(4, 12))
+            .into_iter()
+            .filter(|d| d.path == unshadowed_doc.path)
+            .map(|d| d.range.start.line)
+            .collect();
+        assert_eq!(else_idx_defs, vec![0]);
+
+        let else_entry_defs: Vec<u32> = plugin
+            .definition(&unshadowed_doc, Position::new(4, 24))
+            .into_iter()
+            .filter(|d| d.path == unshadowed_doc.path)
+            .map(|d| d.range.start.line)
+            .collect();
+        assert_eq!(else_entry_defs, vec![0]);
+
+        let else_vars_doc = Document {
+            text: "\
+{{- range $idx, $entry := .Values.items -}}
+{{- $loop_only := .Values.outer -}}
+loop: {{ $idx }}={{ $entry }}
+{{- else -}}
+empty: {{ $
+{{- end -}}
+"
+            .into(),
+            ..unshadowed_doc.clone()
+        };
+        let else_var_labels: Vec<String> = plugin
+            .completion(&else_vars_doc, Position::new(4, 11), Some("$"))
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(
+            else_var_labels.contains(&"$idx".to_owned())
+                && else_var_labels.contains(&"$entry".to_owned()),
+            "expected range header vars in else completion, got {else_var_labels:?}"
+        );
+        assert!(
+            !else_var_labels.contains(&"$loop_only".to_owned()),
+            "loop-body var must not leak into else: {else_var_labels:?}"
+        );
+
+        // After `end`, neither `$idx` nor `$entry` remains in scope
+        let post_end_vars_doc = Document {
+            text: "\
+{{- range $idx, $entry := .Values.items -}}
+loop: {{ $entry }}
+{{- else -}}
+empty: {{ $entry }}
+{{- end -}}
+after: {{ $
+"
+            .into(),
+            ..unshadowed_doc
+        };
+        let post_end_labels: Vec<String> = plugin
+            .completion(&post_end_vars_doc, Position::new(5, 11), Some("$"))
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(
+            !post_end_labels.contains(&"$idx".to_owned())
+                && !post_end_labels.contains(&"$entry".to_owned()),
+            "range header vars leaked past end: {post_end_labels:?}"
+        );
+    }
 }

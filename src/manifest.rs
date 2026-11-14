@@ -224,6 +224,151 @@ pub fn range_in_line(line_no: u32, line_str: &str, start: usize, end: usize) -> 
     )
 }
 
+/// Extracts inline YAML flow-mapping entries (`outer: {name: OUTER, nested: {k: 1}}`) into `helm_values`.
+fn record_inline_flow_helm_values(
+    line_no: u32,
+    full_line: &str,
+    flow_byte_offset: usize,
+    flow_str: &str,
+    prefix: &str,
+    depth: usize,
+    helm_values: &mut BTreeMap<String, Spanned>,
+) {
+    if depth > 8 || helm_values.len() >= 2048 {
+        return;
+    }
+    let trimmed = flow_str.trim();
+    if !(trimmed.starts_with('{') && trimmed.ends_with('}') && trimmed.len() > 2) {
+        return;
+    }
+    let lead = flow_str.len() - flow_str.trim_start().len();
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let inner_base = flow_byte_offset + lead + 1;
+
+    let bytes = inner.as_bytes();
+    let mut seg_start = 0usize;
+    let mut brace_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+
+    while i <= bytes.len() {
+        let at_end = i == bytes.len();
+        if !at_end {
+            let b = bytes[i];
+            if let Some(q) = quote {
+                if q == b'"' && b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'"' | b'\'' => {
+                    quote = Some(b);
+                    i += 1;
+                    continue;
+                }
+                b'{' => brace_depth += 1,
+                b'}' => brace_depth = brace_depth.saturating_sub(1),
+                b'[' => bracket_depth += 1,
+                b']' => bracket_depth = bracket_depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+
+        if at_end || (bytes[i] == b',' && brace_depth == 0 && bracket_depth == 0) {
+            let seg = &inner[seg_start..i];
+            let seg_lead = seg.len() - seg.trim_start().len();
+            let seg_trimmed = &seg[seg_lead..];
+            // Find top-level `:` inside `seg_trimmed`
+            let sbytes = seg_trimmed.as_bytes();
+            let mut colon_pos = None;
+            let mut sq: Option<u8> = None;
+            let mut sb = 0usize;
+            let mut sk = 0usize;
+            let mut j = 0usize;
+            while j < sbytes.len() {
+                let c = sbytes[j];
+                if let Some(q) = sq {
+                    if q == b'"' && c == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if c == q {
+                        sq = None;
+                    }
+                    j += 1;
+                    continue;
+                }
+                match c {
+                    b'"' | b'\'' => sq = Some(c),
+                    b'{' => sb += 1,
+                    b'}' => sb = sb.saturating_sub(1),
+                    b'[' => sk += 1,
+                    b']' => sk = sk.saturating_sub(1),
+                    b':' if sb == 0 && sk == 0 => {
+                        colon_pos = Some(j);
+                        break;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+
+            if let Some(cidx) = colon_pos {
+                let k_raw = seg_trimmed[..cidx].trim();
+                let k_clean = k_raw.trim_matches(['"', '\'']);
+                if !k_clean.is_empty() && helm_values.len() < 2048 {
+                    let k_abs_start = inner_base + seg_start + seg_lead;
+                    let k_abs_end = k_abs_start + k_raw.len();
+                    let k_range = range_in_line(line_no, full_line, k_abs_start, k_abs_end);
+                    let val_after = &seg_trimmed[cidx + 1..];
+                    let val_lead = val_after.len() - val_after.trim_start().len();
+                    let val_trimmed = val_after.trim();
+                    let child_path = format!("{prefix}.{k_clean}");
+                    if val_trimmed.starts_with('{')
+                        && val_trimmed.ends_with('}')
+                        && val_trimmed.len() > 2
+                    {
+                        helm_values
+                            .entry(child_path.clone())
+                            .or_insert_with(|| Spanned {
+                                value: String::new(),
+                                range: k_range,
+                                line: line_no,
+                            });
+                        let child_flow_offset =
+                            inner_base + seg_start + seg_lead + cidx + 1 + val_lead;
+                        record_inline_flow_helm_values(
+                            line_no,
+                            full_line,
+                            child_flow_offset,
+                            val_trimmed,
+                            &child_path,
+                            depth + 1,
+                            helm_values,
+                        );
+                    } else {
+                        let v_clean = val_trimmed.trim_matches(['"', '\'']).to_owned();
+                        helm_values.entry(child_path).or_insert_with(|| Spanned {
+                            value: v_clean,
+                            range: k_range,
+                            line: line_no,
+                        });
+                    }
+                }
+            }
+            seg_start = i + 1;
+        }
+        i += 1;
+    }
+}
+
 /// Strips inline YAML comments (`# ...` outside quotes) and trims surrounding quotes.
 fn parse_scalar_span(
     raw_after_colon: &str,
@@ -551,11 +696,15 @@ fn scan_helm_action(
     if first_word == "else" && scopes.frames.len() > 1 {
         let parent_dot = scopes.parent_dot();
         if let Some(top) = scopes.frames.last_mut() {
+            // Only branch-local body declarations exit scope at `else`.
+            // Control-header declarations (`range $v := ...`, `with $v := ...`, `if $v := ...`)
+            // remain lexically in scope through `else` until `end`; in `else` their runtime
+            // value is the zero-iteration / empty value (`None`).
             top.body_vars.clear();
-            if top.is_range {
-                top.header_vars.clear();
-                top.is_range = false;
+            for (_, bound) in top.header_vars.values_mut() {
+                *bound = None;
             }
+            top.is_range = false;
             top.dot = parent_dot;
         }
     }
@@ -757,12 +906,16 @@ fn scan_helm_action(
                         .next()
                         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
                     && let Some(ref scope_base) = current_dot
-                    && !scope_base.is_empty()
                 {
                     let abs_s = body_start + i;
                     let abs_e = body_start + i + 1 + rel_clean.len();
+                    let full = if scope_base.is_empty() {
+                        rel_clean.to_owned()
+                    } else {
+                        format!("{scope_base}.{rel_clean}")
+                    };
                     value_refs.push(Spanned::new(
-                        format!("{scope_base}.{rel_clean}"),
+                        full,
                         range_in_line(line_no, line, abs_s, abs_e),
                     ));
                 }
@@ -1333,14 +1486,32 @@ pub fn parse_yaml(text: &str) -> ParsedFile {
         // Record Helm `values.yaml` flattened path (capped at 2048 entries per file).
         if result.helm_values.len() < 2048 {
             if let Some(ref val) = scalar {
+                let is_nonempty_flow_map = val.value.starts_with('{')
+                    && val.value.ends_with('}')
+                    && val.value.trim().len() > 2;
                 result
                     .helm_values
                     .entry(full_path.clone())
                     .or_insert_with(|| Spanned {
-                        value: val.value.clone(),
+                        value: if is_nonempty_flow_map {
+                            String::new()
+                        } else {
+                            val.value.clone()
+                        },
                         range: key_range,
                         line: line_no,
                     });
+                if is_nonempty_flow_map {
+                    record_inline_flow_helm_values(
+                        line_no,
+                        line,
+                        after_colon_byte,
+                        after_colon,
+                        &full_path,
+                        0,
+                        &mut result.helm_values,
+                    );
+                }
             } else {
                 result
                     .helm_values
@@ -1860,8 +2031,25 @@ pub fn helm_action_context_at(text: &str, pos: Position) -> Option<HelmActionCon
             );
             from = close + 2;
         } else {
+            let action_prefix = prefix[body_start..].to_owned();
+            let open_kw = action_prefix
+                .trim_start()
+                .split(|c: char| c.is_ascii_whitespace() || c == '(')
+                .next()
+                .unwrap_or("");
+            if open_kw == "else" && helm_scopes.frames.len() > 1 {
+                let parent_dot = helm_scopes.parent_dot();
+                if let Some(top) = helm_scopes.frames.last_mut() {
+                    top.body_vars.clear();
+                    for (_, bound) in top.header_vars.values_mut() {
+                        *bound = None;
+                    }
+                    top.is_range = false;
+                    top.dot = parent_dot;
+                }
+            }
             return Some(HelmActionContext {
-                action_prefix: prefix[body_start..].to_owned(),
+                action_prefix,
                 dot_scope: helm_scopes.current_dot(),
                 vars: helm_scopes.visible_vars(),
             });

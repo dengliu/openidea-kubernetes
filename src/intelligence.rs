@@ -2570,9 +2570,7 @@ fn helm_action_completions(
                 }
             }
         }
-        if let Some(ref scope_base) = ctx.dot_scope
-            && !scope_base.is_empty()
-        {
+        if let Some(ref scope_base) = ctx.dot_scope {
             push_helm_values_completions(
                 index, doc_path, at, scope_base, after_dot, false, &mut items,
             );
