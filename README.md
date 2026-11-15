@@ -2,6 +2,8 @@
 
 An [OpenIDEA](https://github.com/l0ng-ai/openidea) plugin (`dengliu.kubernetes`) that combines a [Freelens](https://github.com/freelensapp/freelens)-style Kubernetes cluster explorer with [JetBrains Kubernetes](https://plugins.jetbrains.com/plugin/10485-kubernetes)-style YAML, Helm, and Kustomize editor intelligence.
 
+https://github.com/user-attachments/assets/b869f61b-4ccd-4d67-bee8-0b051e02c650
+
 ![Demo](./demo.excalidraw.svg)
 
 ## Features

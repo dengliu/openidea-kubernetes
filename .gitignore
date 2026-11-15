@@ -1,3 +1,5 @@
+.idea/
+.openidea/
 /target/
 dist/plugin.wasm.sources
 web-src/node_modules/
@@ -5,4 +7,8 @@ web/
 web.sources
 *.oiplugin
 *.key
+*.mp4
+__pycache__/
+scripts/demo/.cache/
+scripts/demo/.work/
 .DS_Store

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: simple-app-chart
+description: A demo Helm chart for simple-app with Deployment, ServiceAccount, HPA, Secret, and Service
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
