@@ -1,12 +1,12 @@
 id = "dengliu.kubernetes"
 name = "Kubernetes"
-version = "0.3.13"
+version = "0.3.14"
 icon = "icons/kubernetes-logo.svg"
 description = "Manage Kubernetes clusters, Helm releases and Kustomize overlays: cluster explorer with live Pod logs, shell and port-forward, YAML completion, cross-resource navigation, gutter markers and manifest inspections."
 authors = ["Deng Liu"]
 homepage = "https://github.com/dengliu/openidea-kubernetes"
 license = "Apache-2.0"
-change-notes = "0.3.13 — align the Kubernetes explorer with OpenIDEA Services: compact resource tables and toolbars, theme-aware selection and status colors, and a labeled Pod Logs action beside the resource scope."
+change-notes = "0.3.14 — make Pod Logs an icon-only inspector action, retaining its tooltip and container picker."
 categories = ["tools", "frameworks"]
 engines.openidea = "^1.8"
 wasm = "dist/plugin.wasm"

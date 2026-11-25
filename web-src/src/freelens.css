@@ -1249,13 +1249,6 @@ body,
   height: 16px;
 }
 
-.fl-logs-btn {
-  width: auto;
-  padding: 2px 6px;
-  gap: 4px;
-  font: inherit;
-}
-
 .fl-drawer-act-wrap {
   position: relative;
   display: inline-flex;

@@ -5584,7 +5584,8 @@ export function App() {
                     </div>
                     <div className="fl-drawer-act-wrap" onClick={(e) => e.stopPropagation()}>
                       <button
-                        className={`fl-drawer-act-btn fl-logs-btn ${logContainerMenuOpen ? "active" : ""}`}
+                        className={`fl-drawer-act-btn ${logContainerMenuOpen ? "active" : ""}`}
+                        aria-label="Pod Logs"
                         title="Pod Logs"
                         onClick={() => {
                           setShellContainerMenuOpen(false);
@@ -5602,7 +5603,6 @@ export function App() {
                           <rect x="2.5" y="11.6" width="15" height="2.2" rx="0.8" fill="currentColor" />
                           <rect x="2.5" y="15.4" width="10" height="2.2" rx="0.8" fill="currentColor" />
                         </svg>
-                        Logs
                       </button>
                       {logContainerMenuOpen && (
                         <div className="fl-container-menu">
