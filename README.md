@@ -19,6 +19,7 @@ https://github.com/user-attachments/assets/b869f61b-4ccd-4d67-bee8-0b051e02c650
   - **Custom Resources (CRD & CRs)**: Groups discovered CRDs by API Group in the sidebar (`CR:<crd_name>`) to browse Custom Resource instances directly, and lists Custom Objects inside the CRD details drawer.
   - **Helm Releases**: Lists installed Helm releases and revision metadata across namespaces.
 - **Interactive Details Drawer**: Comprehensive Freelens-parity inspection drawer for all 32+ resource kinds, including Node `Capacity` & `Allocatable` (`GiB` conversion), collapsible YAML `Affinities` viewer (`<YamlCodeViewer>`), sortable `Pods` table with CPU/Memory progress bars, and resource `Events`.
+- **Pods → Logs**: In **Workloads → Pods**, select a Pod, check the context and namespace in its inspector, then choose **Logs**. Single-container Pods open a streaming editor tab directly; for multi-container Pods, choose the container first. The explorer uses the same selection, focus, and status colors as OpenIDEA Services.
 - **Live Pod & Node Terminal (`xterm.js`), Log Tabs, and Resource YAML Tabs**:
   - Interactive `xterm.js` PTY shell for Pod containers (`kubectl exec -it`) and Nodes (`kubectl debug node/... -it --image=busybox`).
   - Streaming Pod log Editor Tabs (`kubectl logs --follow`) with container selector and toolbar toggles (`Timestamps`, `Previous`, `Wrap`, `Follow`).

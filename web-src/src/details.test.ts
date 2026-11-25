@@ -34,7 +34,7 @@ describe("ResourceDetails helpers", () => {
       topPadPx: 0,
       bottomPadPx: 0,
     });
-    const win = computeVirtualWindow(10000, VIRTUAL_ROW_HEIGHT * 500, 740, VIRTUAL_ROW_HEIGHT, 20);
+    const win = computeVirtualWindow(10000, VIRTUAL_ROW_HEIGHT * 500, VIRTUAL_ROW_HEIGHT * 20, VIRTUAL_ROW_HEIGHT, 20);
     expect(win.start).toBe(480);
     expect(win.end).toBe(540);
     expect(win.topPadPx).toBe(480 * VIRTUAL_ROW_HEIGHT);

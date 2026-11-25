@@ -1,10 +1,10 @@
 :root {
-  --fl-teal: #326ce5;
-  --fl-teal-hover: #2859c5;
-  --fl-teal-tint: rgba(50, 108, 229, 0.12);
-  --fl-green: #2e9e5b;
-  --fl-orange: #e67e22;
-  --fl-red: #d9534f;
+  --fl-teal: var(--openidea-accent, #326ce5);
+  --fl-teal-hover: color-mix(in srgb, var(--fl-teal) 85%, var(--fl-fg));
+  --fl-teal-tint: var(--openidea-bg-selected, color-mix(in srgb, var(--fl-teal) 16%, var(--fl-bg)));
+  --fl-green: var(--openidea-success, #2e9e5b);
+  --fl-orange: var(--openidea-warning, #b76617);
+  --fl-red: var(--openidea-danger, #d9534f);
   --fl-bg: var(--openidea-bg, #ffffff);
   --fl-bg-sidebar: color-mix(in srgb, var(--openidea-bg, #f4f5f7) 94%, #888888 6%);
   --fl-bg-elevated: var(--openidea-bg-elevated, #f8f9fa);
@@ -13,7 +13,8 @@
   --fl-fg-muted: var(--openidea-fg-muted, #6c757d);
   --fl-text: var(--fl-fg);
   --fl-text-muted: var(--fl-fg-muted);
-  --fl-teal-text: color-mix(in srgb, var(--fl-teal) 72%, var(--fl-fg));
+  --fl-teal-text: var(--openidea-link, color-mix(in srgb, var(--fl-teal) 72%, var(--fl-fg)));
+  --fl-row-hover: var(--fl-bg-hover);
   --fl-border: var(--openidea-border, #e1e4e8);
   --fl-chip-bg: color-mix(in srgb, var(--fl-fg) 10%, transparent);
   --fl-font: var(--openidea-font-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
@@ -22,6 +23,11 @@
 
 * {
   box-sizing: border-box;
+}
+
+:focus-visible {
+  outline: 2px solid var(--openidea-focus-ring, var(--fl-teal));
+  outline-offset: -2px;
 }
 
 html,
@@ -124,9 +130,8 @@ body,
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #00b8a9;
-  border: 1.5px solid #ffffff;
-  box-shadow: 0 0 5px rgba(255, 255, 255, 0.95);
+  background: var(--fl-green);
+  border: 1px solid var(--fl-hotbar-bg);
   pointer-events: none;
 }
 
@@ -302,7 +307,7 @@ body,
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 8px 14px;
+  padding: 4px 10px;
   cursor: pointer;
   color: var(--fl-fg);
   font-size: 13px;
@@ -317,12 +322,12 @@ body,
 }
 
 .fl-tree-group-header.active-group {
-  background: var(--fl-teal);
-  color: #ffffff;
+  color: var(--fl-fg);
+  font-weight: 600;
 }
 
 .fl-tree-group-header.active-leaf {
-  color: var(--fl-teal-text);
+  background: var(--fl-teal-tint);
   font-weight: 600;
 }
 
@@ -350,8 +355,8 @@ body,
 }
 
 .fl-tree-children {
-  margin-left: 3px;
-  border-left: 3px solid var(--fl-teal);
+  margin-left: 12px;
+  border-left: 1px solid var(--fl-border);
   padding: 2px 0;
 }
 
@@ -359,7 +364,7 @@ body,
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 14px 6px 24px;
+  padding: 4px 10px 4px 16px;
   cursor: pointer;
   color: var(--fl-fg);
   font-size: 12.5px;
@@ -371,7 +376,8 @@ body,
 }
 
 .fl-tree-child.active {
-  color: var(--fl-teal-text);
+  background: var(--fl-teal-tint);
+  color: var(--fl-fg);
   font-weight: 600;
 }
 
@@ -411,9 +417,9 @@ body,
 .fl-top-tabs {
   display: flex;
   align-items: center;
-  gap: 20px;
-  padding: 0 calc(var(--openidea-corner-inset-width, 64px) + 12px) 0 20px;
-  height: 40px;
+  gap: 12px;
+  padding: 0 calc(var(--openidea-corner-inset-width, 64px) + 6px) 0 10px;
+  height: max(32px, var(--openidea-corner-inset-height, 34px));
   flex-shrink: 0;
   border-bottom: 1px solid var(--fl-border);
   background: var(--fl-bg-elevated);
@@ -465,9 +471,9 @@ body,
 }
 
 .fl-banner.error {
-  background: color-mix(in srgb, #d32f2f 14%, var(--fl-bg));
-  color: color-mix(in srgb, #b71c1c 60%, var(--fl-fg));
-  border-left-color: #d32f2f;
+  background: color-mix(in srgb, var(--fl-red) 14%, var(--fl-bg));
+  color: var(--fl-fg);
+  border-left-color: var(--fl-red);
 }
 
 .fl-banner-text {
@@ -509,37 +515,38 @@ body,
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 12px 20px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-height: 32px;
+  padding: 3px 8px;
   border-bottom: 1px solid var(--fl-border);
   flex-shrink: 0;
 }
 
 .fl-subheader-title {
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 600;
-  min-width: 120px;
 }
 
 .fl-subheader-count {
   font-size: 12.5px;
   color: var(--fl-fg-muted);
   flex: 1;
-  text-align: center;
 }
 
 .fl-subheader-controls {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 
 .fl-ns-select,
 .fl-search-box {
-  height: 32px;
+  height: 26px;
   border: 1px solid var(--fl-border);
   border-radius: 4px;
-  background: var(--fl-bg);
+  background: var(--openidea-bg-input, var(--fl-bg));
   color: var(--fl-fg);
   font-family: inherit;
   font-size: 12.5px;
@@ -558,7 +565,7 @@ body,
 }
 
 .fl-search-box {
-  width: 230px;
+  width: 175px;
   padding-right: 48px;
 }
 
@@ -605,8 +612,8 @@ body,
 }
 
 .fl-icon-btn {
-  height: 32px;
-  padding: 0 10px;
+  height: 26px;
+  padding: 0 6px;
   border: 1px solid var(--fl-border);
   border-radius: 4px;
   background: var(--fl-bg);
@@ -645,7 +652,7 @@ body,
   color: var(--fl-fg-muted);
   font-weight: 500;
   text-align: left;
-  padding: 8px 10px;
+  padding: 4px 8px;
   border-bottom: 1px solid var(--fl-border);
   white-space: nowrap;
   overflow: hidden;
@@ -687,16 +694,30 @@ body,
 
 .fl-table tbody tr.selected {
   background: var(--fl-teal-tint);
-  box-shadow: inset 3px 0 0 var(--fl-teal);
 }
 
 .fl-table tbody td {
-  padding: 9px 10px;
+  padding: 1px 8px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   vertical-align: middle;
   user-select: text;
+}
+
+.fl-resource-name {
+  display: block;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
 }
 
 .fl-link-teal {
@@ -750,7 +771,7 @@ body,
 
 /* Status text coloring matching Freelens */
 .fl-status-text.ok {
-  color: color-mix(in srgb, #2e7d32 76%, var(--fl-fg));
+  color: var(--fl-green);
   font-weight: 500;
 }
 
@@ -765,12 +786,12 @@ body,
 }
 
 .fl-status-text.warn {
-  color: color-mix(in srgb, #d97706 78%, var(--fl-fg));
+  color: var(--fl-orange);
   font-weight: 500;
 }
 
 .fl-status-text.err {
-  color: color-mix(in srgb, #c62828 78%, var(--fl-fg));
+  color: var(--fl-red);
   font-weight: 500;
 }
 
@@ -795,7 +816,7 @@ body,
 }
 
 .fl-csq-tooltip-state.running {
-  color: color-mix(in srgb, #2e7d32 76%, var(--fl-fg));
+  color: var(--fl-green);
 }
 
 .fl-csq-tooltip-state.sidecar {
@@ -807,11 +828,11 @@ body,
 }
 
 .fl-csq-tooltip-state.waiting {
-  color: color-mix(in srgb, #d97706 78%, var(--fl-fg));
+  color: var(--fl-orange);
 }
 
 .fl-csq-tooltip-state.failed {
-  color: color-mix(in srgb, #c62828 78%, var(--fl-fg));
+  color: var(--fl-red);
 }
 
 .fl-csq-tooltip-state.completed {
@@ -955,8 +976,8 @@ body,
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 26px;
-  height: 26px;
+  width: 22px;
+  height: 22px;
   border: none;
   border-radius: 4px;
   background: transparent;
@@ -1134,6 +1155,7 @@ body,
   top: 0;
   right: 0;
   bottom: 0;
+  max-width: 100%;
   background: var(--fl-bg);
   border-left: 1px solid var(--fl-border);
   border-top: 1px solid var(--fl-border);
@@ -1159,14 +1181,29 @@ body,
 }
 
 .fl-drawer-header {
-  height: 44px;
-  background: var(--fl-teal);
-  color: #ffffff;
+  background: var(--fl-bg-elevated);
+  color: var(--fl-fg);
+  border-bottom: 1px solid var(--fl-border);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 14px;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  padding: 4px 8px;
   flex-shrink: 0;
+}
+
+.fl-drawer-identity {
+  flex: 1 1 150px;
+  min-width: 0;
+}
+
+.fl-drawer-scope {
+  font-size: 11px;
+  color: var(--fl-fg-muted);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .fl-drawer-title {
@@ -1180,28 +1217,43 @@ body,
 .fl-drawer-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 2px;
+  margin-left: auto;
 }
 
 .fl-drawer-act-btn {
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
+  padding: 2px;
   border: none;
   border-radius: 4px;
   background: transparent;
-  color: #ffffff;
+  color: var(--fl-fg);
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   font-size: 14px;
-  opacity: 0.92;
 }
 
-.fl-drawer-act-btn:hover,
+.fl-drawer-act-btn:hover {
+  background: var(--fl-bg-hover);
+}
+
 .fl-drawer-act-btn.active {
-  background: rgba(255, 255, 255, 0.2);
-  opacity: 1;
+  background: var(--fl-teal-tint);
+}
+
+.fl-drawer-act-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.fl-logs-btn {
+  width: auto;
+  padding: 2px 6px;
+  gap: 4px;
+  font: inherit;
 }
 
 .fl-drawer-act-wrap {
@@ -1232,6 +1284,14 @@ body,
   color: var(--fl-fg);
   cursor: pointer;
   white-space: nowrap;
+}
+
+button.fl-container-menu-item {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  font-family: inherit;
+  text-align: left;
 }
 
 .fl-container-menu-item:hover {
@@ -1776,8 +1836,8 @@ body,
 }
 
 .fl-ns-picker-btn {
-  height: 32px;
-  min-width: 200px;
+  height: 26px;
+  min-width: 135px;
   max-width: 310px;
   padding: 0 10px;
   border: 1px solid var(--fl-border);

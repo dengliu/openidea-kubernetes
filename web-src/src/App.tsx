@@ -640,7 +640,7 @@ function statusClass(status: string): "ok" | "warn" | "err" {
   return "ok";
 }
 
-export const VIRTUAL_ROW_HEIGHT = 37;
+export const VIRTUAL_ROW_HEIGHT = 28;
 export const VIRTUAL_OVERSCAN = 20;
 export const VIRTUAL_THRESHOLD = 100;
 export const NS_OPTION_ROW_HEIGHT = 30;
@@ -2710,6 +2710,7 @@ export function App() {
       (selectedResourceFallback && matchFn(selectedResourceFallback) ? selectedResourceFallback : null)
     );
   }, [filteredResources, snapshot.resources, drawerExtraPods, drawerExtraResources, selectedResourceFallback, selectedRowKey]);
+  const drawerScope = [snapshot.current_context, selectedResource?.namespace].filter(Boolean).join(" / ");
 
   const selectedCheckedResources = useMemo(
     () => filteredResources.filter((r) => Boolean(checkedRows[`${r.kind}:${r.namespace}/${r.name}`])),
@@ -3495,7 +3496,7 @@ export function App() {
   function renderPodCell(res: ClusterResource, colId: string) {
     switch (colId) {
       case "name":
-        return <span style={{ fontWeight: 500 }}>{res.name}</span>;
+        return <button className="fl-resource-name" type="button">{res.name}</button>;
       case "warning": {
         const hasWarn = (res.restarts ?? 0) > 0 || statusClass(res.status) !== "ok";
         return hasWarn ? (
@@ -4527,7 +4528,7 @@ export function App() {
                       </tr>
                     )}
                     {visibleEvents.map((ev, i) => (
-                      <tr key={`${ev.namespace}/${ev.object}/${ev.reason}/${virtualWin.start + i}`}>
+                      <tr key={`${ev.namespace}/${ev.object}/${ev.reason}/${virtualWin.start + i}`} style={{ height: VIRTUAL_ROW_HEIGHT }}>
                         <td>
                           <span className={`fl-status-text ${ev.event_type === "Warning" ? "warn" : "ok"}`}>
                             {ev.event_type}
@@ -4599,6 +4600,7 @@ export function App() {
                     {visibleWorkspace.map((w, i) => (
                       <tr
                         key={`${w.fullPath}:${w.line}:${virtualWin.start + i}`}
+                        style={{ height: VIRTUAL_ROW_HEIGHT }}
                         onClick={() => sendToBackend({ op: "open-location", path: w.fullPath, line: w.line })}
                       >
                         <td>{w.kind}</td>
@@ -4733,6 +4735,7 @@ export function App() {
                     return (
                       <tr
                         key={rowKey}
+                        style={{ height: VIRTUAL_ROW_HEIGHT }}
                         className={isSel ? "selected" : ""}
                         onClick={(e) => {
                           e.stopPropagation();
@@ -5335,11 +5338,16 @@ export function App() {
           >
             <div className="fl-drawer-resizer" onMouseDown={startDrawerResize} />
             <div className="fl-drawer-header">
-              <div className="fl-drawer-title">
-                {selectedResource.kind.startsWith("CR:")
-                  ? selectedResource.controlled_by_kind || selectedResource.kind.slice(3)
-                  : selectedResource.kind}
-                : {selectedResource.name}
+              <div className="fl-drawer-identity">
+                <div className="fl-drawer-title" title={selectedResource.name}>
+                  {selectedResource.kind.startsWith("CR:")
+                    ? selectedResource.controlled_by_kind || selectedResource.kind.slice(3)
+                    : selectedResource.kind}
+                  : {selectedResource.name}
+                </div>
+                <div className="fl-drawer-scope" title={drawerScope}>
+                  {drawerScope}
+                </div>
               </div>
               <div className="fl-drawer-actions">
                 {selectedResource.kind !== "Node" && (
@@ -5349,14 +5357,14 @@ export function App() {
                     onClick={() => openResourceDrawer(selectedResource, "overview")}
                   >
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                      <rect x="2" y="3.5" width="16" height="13" rx="2.5" fill="#ffffff" />
-                      <circle cx="9.2" cy="9.5" r="2.7" stroke="var(--fl-teal)" strokeWidth="1.8" />
+                      <rect x="2" y="3.5" width="16" height="13" rx="2.5" fill="currentColor" />
+                      <circle cx="9.2" cy="9.5" r="2.7" stroke="var(--fl-bg-elevated)" strokeWidth="1.8" />
                       <line
                         x1="11.3"
                         y1="11.6"
                         x2="13.8"
                         y2="14.1"
-                        stroke="var(--fl-teal)"
+                        stroke="var(--fl-bg-elevated)"
                         strokeWidth="1.8"
                         strokeLinecap="round"
                       />
@@ -5375,10 +5383,10 @@ export function App() {
                         }}
                       >
                         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                          <rect x="2.5" y="2.5" width="15" height="15" rx="2.5" fill="#ffffff" />
+                          <rect x="2.5" y="2.5" width="15" height="15" rx="2.5" fill="currentColor" />
                           <path
                             d="M6 7.4L9.2 10L6 12.6"
-                            stroke="var(--fl-teal)"
+                            stroke="var(--fl-bg-elevated)"
                             strokeWidth="1.8"
                             strokeLinecap="round"
                             strokeLinejoin="round"
@@ -5388,7 +5396,7 @@ export function App() {
                             y1="12.8"
                             x2="14"
                             y2="12.8"
-                            stroke="var(--fl-teal)"
+                            stroke="var(--fl-bg-elevated)"
                             strokeWidth="1.8"
                             strokeLinecap="round"
                           />
@@ -5455,14 +5463,14 @@ export function App() {
                         >
                           {isCordoned ? (
                             <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                              <circle cx="10" cy="10" r="7.5" fill="#ffffff" />
-                              <path d="M8.2 6.8L13.5 10L8.2 13.2V6.8Z" fill="var(--fl-teal)" />
+                              <circle cx="10" cy="10" r="7.5" fill="currentColor" />
+                              <path d="M8.2 6.8L13.5 10L8.2 13.2V6.8Z" fill="var(--fl-bg-elevated)" />
                             </svg>
                           ) : (
                             <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                              <circle cx="10" cy="10" r="7.5" fill="#ffffff" />
-                              <rect x="7.5" y="6.8" width="1.8" height="6.4" rx="0.5" fill="var(--fl-teal)" />
-                              <rect x="10.7" y="6.8" width="1.8" height="6.4" rx="0.5" fill="var(--fl-teal)" />
+                              <circle cx="10" cy="10" r="7.5" fill="currentColor" />
+                              <rect x="7.5" y="6.8" width="1.8" height="6.4" rx="0.5" fill="var(--fl-bg-elevated)" />
+                              <rect x="10.7" y="6.8" width="1.8" height="6.4" rx="0.5" fill="var(--fl-bg-elevated)" />
                             </svg>
                           )}
                         </button>
@@ -5485,7 +5493,7 @@ export function App() {
                       <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                         <path
                           d="M12.5 13h3.2v1.6h-3.2V13zm0-6.4h5v1.6h-5V6.6zm0 3.2h4.2v1.6h-4.2V9.8zM3.2 14.6c0 .88.72 1.6 1.6 1.6h4.8c.88 0 1.6-.72 1.6-1.6V6.6H3.2v8zm8.8-10.4H9.6l-.8-.8H5.6l-.8.8H2.4v1.6H12V4.2z"
-                          fill="#ffffff"
+                          fill="currentColor"
                         />
                       </svg>
                     </button>
@@ -5503,10 +5511,10 @@ export function App() {
                         }}
                       >
                         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                          <rect x="2.5" y="2.5" width="15" height="15" rx="2.5" fill="#ffffff" />
+                          <rect x="2.5" y="2.5" width="15" height="15" rx="2.5" fill="currentColor" />
                           <path
                             d="M6 7.4L9.2 10L6 12.6"
-                            stroke="var(--fl-teal)"
+                            stroke="var(--fl-bg-elevated)"
                             strokeWidth="1.8"
                             strokeLinecap="round"
                             strokeLinejoin="round"
@@ -5516,7 +5524,7 @@ export function App() {
                             y1="12.8"
                             x2="14"
                             y2="12.8"
-                            stroke="var(--fl-teal)"
+                            stroke="var(--fl-bg-elevated)"
                             strokeWidth="1.8"
                             strokeLinecap="round"
                           />
@@ -5576,7 +5584,7 @@ export function App() {
                     </div>
                     <div className="fl-drawer-act-wrap" onClick={(e) => e.stopPropagation()}>
                       <button
-                        className={`fl-drawer-act-btn ${logContainerMenuOpen ? "active" : ""}`}
+                        className={`fl-drawer-act-btn fl-logs-btn ${logContainerMenuOpen ? "active" : ""}`}
                         title="Pod Logs"
                         onClick={() => {
                           setShellContainerMenuOpen(false);
@@ -5589,17 +5597,19 @@ export function App() {
                         }}
                       >
                         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                          <rect x="2.5" y="4" width="15" height="2.2" rx="0.8" fill="#ffffff" />
-                          <rect x="2.5" y="7.8" width="15" height="2.2" rx="0.8" fill="#ffffff" />
-                          <rect x="2.5" y="11.6" width="15" height="2.2" rx="0.8" fill="#ffffff" />
-                          <rect x="2.5" y="15.4" width="10" height="2.2" rx="0.8" fill="#ffffff" />
+                          <rect x="2.5" y="4" width="15" height="2.2" rx="0.8" fill="currentColor" />
+                          <rect x="2.5" y="7.8" width="15" height="2.2" rx="0.8" fill="currentColor" />
+                          <rect x="2.5" y="11.6" width="15" height="2.2" rx="0.8" fill="currentColor" />
+                          <rect x="2.5" y="15.4" width="10" height="2.2" rx="0.8" fill="currentColor" />
                         </svg>
+                        Logs
                       </button>
                       {logContainerMenuOpen && (
                         <div className="fl-container-menu">
                           {getPodContainerItems(selectedResource, drawerJson, true).map((c) => (
-                            <div
+                            <button
                               key={c.name}
+                              type="button"
                               className="fl-container-menu-item"
                               onClick={() => {
                                 setLogContainerMenuOpen(false);
@@ -5613,7 +5623,7 @@ export function App() {
                                   {c.tag}
                                 </span>
                               )}
-                            </div>
+                            </button>
                           ))}
                         </div>
                       )}
@@ -5636,7 +5646,7 @@ export function App() {
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                       <path
                         d="M15.5 10a5.5 5.5 0 1 1-1.6-3.9L15.5 7.7M15.5 4.2v3.5H12"
-                        stroke="#ffffff"
+                        stroke="currentColor"
                         strokeWidth="1.9"
                         strokeLinecap="round"
                         strokeLinejoin="round"
@@ -5662,7 +5672,7 @@ export function App() {
                       }}
                     >
                       <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                        <path d="M6.5 5.2L15 10L6.5 14.8V5.2Z" fill="#ffffff" />
+                        <path d="M6.5 5.2L15 10L6.5 14.8V5.2Z" fill="currentColor" />
                       </svg>
                     </button>
                     {(() => {
@@ -5681,13 +5691,13 @@ export function App() {
                           }}
                         >
                           <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                            <circle cx="10" cy="10" r="7.5" fill="#ffffff" />
+                            <circle cx="10" cy="10" r="7.5" fill="currentColor" />
                             {isSuspended ? (
-                              <path d="M8.2 6.8L13.5 10L8.2 13.2V6.8Z" fill="var(--fl-teal)" />
+                              <path d="M8.2 6.8L13.5 10L8.2 13.2V6.8Z" fill="var(--fl-bg-elevated)" />
                             ) : (
                               <>
-                                <rect x="7.5" y="6.8" width="1.8" height="6.4" rx="0.5" fill="var(--fl-teal)" />
-                                <rect x="10.7" y="6.8" width="1.8" height="6.4" rx="0.5" fill="var(--fl-teal)" />
+                                <rect x="7.5" y="6.8" width="1.8" height="6.4" rx="0.5" fill="var(--fl-bg-elevated)" />
+                                <rect x="10.7" y="6.8" width="1.8" height="6.4" rx="0.5" fill="var(--fl-bg-elevated)" />
                               </>
                             )}
                           </svg>
@@ -5704,7 +5714,7 @@ export function App() {
                   <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                     <path
                       d="M3 14.25V17h2.75L13.86 8.89l-2.75-2.75L3 14.25zM16.71 6.04a.75.75 0 0 0 0-1.06l-1.69-1.69a.75.75 0 0 0-1.06 0l-1.32 1.32 2.75 2.75 1.32-1.32z"
-                      fill="#ffffff"
+                      fill="currentColor"
                     />
                   </svg>
                 </button>
@@ -5733,7 +5743,7 @@ export function App() {
                   <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                     <path
                       d="M5.5 16.5c0 .83.67 1.5 1.5 1.5h6c.83 0 1.5-.67 1.5-1.5v-9h-9v9zM15.25 4.5h-2.62l-.75-.75h-3.76l-.75.75H4.75V6h10.5V4.5z"
-                      fill="#ffffff"
+                      fill="currentColor"
                     />
                   </svg>
                 </button>
@@ -5765,14 +5775,14 @@ export function App() {
                         fillRule="evenodd"
                         clipRule="evenodd"
                         d="M15.25 4.5h-2.62l-.75-.75h-3.76l-.75.75H4.75V6h10.5V4.5zM5.5 7.5v9c0 .83.67 1.5 1.5 1.5h6c.83 0 1.5-.67 1.5-1.5v-9h-9zm2.56 2.94a.65.65 0 0 1 .92 0L10 11.48l1.02-1.04a.65.65 0 1 1 .92.92L10.92 12.4l1.02 1.04a.65.65 0 1 1-.92.92L10 13.32l-1.02 1.04a.65.65 0 0 1-.92-.92l1.02-1.04-1.02-1.04a.65.65 0 0 1 0-.92z"
-                        fill="#ffffff"
+                        fill="currentColor"
                       />
                     </svg>
                   </button>
                 )}
                 <button className="fl-drawer-act-btn" title="Close" onClick={() => setDrawerOpen(false)}>
                   <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                    <path d="M5 5l10 10M15 5L5 15" stroke="#ffffff" strokeWidth="2.2" strokeLinecap="round" />
+                    <path d="M5 5l10 10M15 5L5 15" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" />
                   </svg>
                 </button>
               </div>
