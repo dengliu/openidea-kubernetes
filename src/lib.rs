@@ -56,6 +56,22 @@ const MAX_SAFE_VIEW_BYTES: usize = 6 * 1024 * 1024;
 /// Maximum cached resources embedded in initial `Body::Html` so `PAGE_HTML` never exceeds `MAX_HTML` (4 MiB).
 const MAX_INITIAL_HTML_RESOURCES: usize = 500;
 
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ColumnLayout {
+    order: Vec<String>,
+    visible: std::collections::BTreeMap<String, bool>,
+    widths: std::collections::BTreeMap<String, u32>,
+}
+
+fn stored_column_layouts() -> Result<std::collections::BTreeMap<String, ColumnLayout>, Error> {
+    match storage::get("columnLayouts")? {
+        Some(raw) => serde_json::from_str(&raw)
+            .map_err(|e| Error::Invalid(format!("Cannot read saved column layouts: {e}"))),
+        None => Ok(Default::default()),
+    }
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -955,11 +971,30 @@ impl KubernetesPlugin {
         let v: Value = serde_json::from_str(raw).map_err(|e| Error::Invalid(e.to_string()))?;
         let op = v.get("op").and_then(Value::as_str).unwrap_or("");
         let _task = match op {
-            "poll-category" | "poll-watch" | "stop-drawer-watch" => None,
+            "poll-category" | "poll-watch" | "stop-drawer-watch" | "get-column-layouts"
+            | "save-column-layout" => None,
             "search-category" => Some(host::begin_task("Kubernetes: Searching cluster…", true)),
             _ => Some(host::begin_task("Kubernetes", false)),
         };
         match op {
+            "get-column-layouts" => {
+                Self::send_view_payload(
+                    json!({"op": "column-layouts", "layouts": stored_column_layouts()?}),
+                );
+            }
+            "save-column-layout" => {
+                let kind = v["kind"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        Error::Invalid("Missing resource kind for column layout".into())
+                    })?;
+                let layout = serde_json::from_value(v["layout"].clone())
+                    .map_err(|e| Error::Invalid(format!("Invalid column layout: {e}")))?;
+                let mut layouts = stored_column_layouts()?;
+                layouts.insert(kind.to_owned(), layout);
+                storage::set("columnLayouts", &json!(layouts).to_string())?;
+            }
             "init" => {
                 let project = resolve_project(ctx).ok();
                 let root = project

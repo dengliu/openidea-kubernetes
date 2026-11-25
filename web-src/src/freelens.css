@@ -512,6 +512,7 @@ body,
 
 /* Subheader bar: Title | N items | Namespace dropdown | Search input */
 .fl-subheader {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -631,10 +632,41 @@ body,
 }
 
 /* Table wrapper & Freelens Data Table */
-.fl-table-container {
+.fl-table-frame {
   flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.fl-more-right::after {
+  content: "";
+  position: absolute;
+  inset: 0 0 10px auto;
+  width: 10px;
+  background: linear-gradient(to left, color-mix(in srgb, var(--fl-fg) 22%, transparent), transparent);
+  z-index: 7;
+  pointer-events: none;
+}
+
+.fl-table-container {
+  height: 100%;
   overflow: auto;
   position: relative;
+}
+
+.fl-table-container::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.fl-table-container::-webkit-scrollbar-thumb {
+  background: var(--fl-fg-muted);
+  border: 2px solid var(--fl-bg);
+  border-radius: 5px;
+}
+
+.fl-table-container::-webkit-scrollbar-track {
+  background: var(--fl-bg);
 }
 
 .fl-table {
@@ -694,6 +726,28 @@ body,
 
 .fl-table tbody tr.selected {
   background: var(--fl-teal-tint);
+}
+
+.fl-table .fl-pinned {
+  position: sticky;
+  left: 0;
+}
+
+.fl-table thead .fl-pinned {
+  z-index: 6;
+}
+
+.fl-table td.fl-pinned {
+  z-index: 1;
+  background: var(--fl-bg);
+}
+
+.fl-table tr:hover td.fl-pinned {
+  background: linear-gradient(var(--fl-bg-hover), var(--fl-bg-hover)), var(--fl-bg);
+}
+
+.fl-table tr.selected td.fl-pinned {
+  background: linear-gradient(var(--fl-teal-tint), var(--fl-teal-tint)), var(--fl-bg);
 }
 
 .fl-table tbody td {
@@ -1063,30 +1117,11 @@ body,
 }
 
 /* Column visibility & order popover menu */
-.fl-col-menu-btn {
-  width: 26px;
-  height: 26px;
-  border-radius: 50%;
-  border: none;
-  background: var(--fl-chip-bg);
-  color: var(--fl-fg);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 14px;
-}
-
-.fl-col-menu-btn:hover {
-  background: var(--fl-teal);
-  color: #fff;
-}
-
 .fl-col-popover {
-  position: fixed;
-  top: 96px;
-  right: 18px;
-  width: 215px;
+  position: absolute;
+  top: 100%;
+  right: 8px;
+  width: min(215px, calc(100% - 16px));
   max-height: calc(100vh - 120px);
   overflow-y: auto;
   background: var(--fl-bg);
