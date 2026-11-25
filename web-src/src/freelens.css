@@ -684,7 +684,7 @@ body,
   color: var(--fl-fg-muted);
   font-weight: 500;
   text-align: left;
-  padding: 4px 8px;
+  padding: 4px 6px;
   border-bottom: 1px solid var(--fl-border);
   white-space: nowrap;
   overflow: hidden;
@@ -751,12 +751,19 @@ body,
 }
 
 .fl-table tbody td {
-  padding: 1px 8px;
+  padding: 1px 6px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   vertical-align: middle;
   user-select: text;
+}
+
+.fl-table th.fl-icon-col,
+.fl-table td.fl-icon-col {
+  padding-left: 2px;
+  padding-right: 2px;
+  text-overflow: clip;
 }
 
 .fl-resource-name {
@@ -1178,6 +1185,28 @@ body,
 .fl-col-move-btn:hover {
   background: var(--fl-chip-bg);
   color: var(--fl-fg);
+}
+
+.fl-col-popover-footer {
+  border-top: 1px solid var(--fl-border);
+  margin-top: 4px;
+  padding: 6px 12px 2px;
+}
+
+.fl-col-reset-btn {
+  width: 100%;
+  border: 1px solid var(--fl-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fl-fg);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.fl-col-reset-btn:hover {
+  background: var(--fl-bg-hover);
 }
 
 /* Slide-over Right Detail Drawer (Screenshot 2) */

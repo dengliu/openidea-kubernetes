@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { tableColumns } from "./columns";
+import { autoFitColumnWidths, tableColumns } from "./columns";
 import {
   applyWatchDeltaToSnapshot,
   classifyIncomingNamespaceSnapshot,
@@ -41,6 +41,41 @@ describe("ResourceDetails helpers", () => {
     expect(narrow.width(narrow.pinned)).toBe(100);
     expect(narrow.total).toBe(380);
     expect(tableColumns(defs, saved, 1200).width(narrow.pinned)).toBe(320);
+  });
+
+  it("auto-fits column widths to header and sampled content while keeping manual overrides", () => {
+    const defs = [
+      { id: "name", label: "Name", defaultWidth: 230, defaultVisible: true },
+      { id: "warning", label: "⚠", defaultWidth: 38, defaultVisible: true },
+      { id: "namespace", label: "Namespace", defaultWidth: 120, defaultVisible: true },
+      { id: "age", label: "Age", defaultWidth: 80, defaultVisible: true },
+    ];
+    const rows = [
+      { name: "podinfo-79b8c767b8-4cgzz", namespace: "default", age: "17d" },
+      { name: "a-very-long-pod-name-that-exceeds-the-auto-fit-maximum-cap-0123456789", namespace: "default", age: "2h" },
+    ];
+    const measure = (s: string) => s.length * 7;
+    const auto = autoFitColumnWidths(
+      defs,
+      rows.length,
+      (colId, idx, m) => {
+        if (colId === "warning") return 28;
+        const val = rows[idx][colId as keyof (typeof rows)[number]] || "";
+        return m(val) + 18;
+      },
+      measure,
+    );
+    expect(auto.warning).toBe(28);
+    expect(auto.namespace).toBeLessThan(120);
+    expect(auto.age).toBeLessThan(80);
+    expect(auto.name).toBe(275); // capped at max auto-fit width
+
+    // Manual widths take precedence over auto-fit widths
+    const cols = tableColumns(defs, { widths: { age: 110 } }, 1200, auto);
+    expect(cols.width(defs[3])).toBe(110);
+    expect(cols.width(defs[2])).toBe(auto.namespace);
+    // Empty datasets leave auto-fit empty so defaultWidth is preserved
+    expect(autoFitColumnWidths(defs, 0, () => 0, measure)).toEqual({});
   });
 
   it("computes virtualized table window with top and bottom spacers on large row sets", () => {
