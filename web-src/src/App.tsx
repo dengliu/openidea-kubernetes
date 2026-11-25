@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { PodTerminal, dispatchPtyEvent } from "./PodTerminal";
+import { tableColumns, type ColumnLayout } from "./columns";
 import { ResourceDetails, cpuUnitsToNumber, unitsToBytes } from "./ResourceDetails";
 import type {
   CategoryPageInfo,
@@ -570,6 +571,22 @@ const GENERIC_RESOURCE_COLUMNS: ColumnDef[] = [
   { id: "status", label: "Status", defaultWidth: 115, defaultVisible: true },
 ];
 
+const EVENT_COLUMNS: ColumnDef[] = [
+  { id: "object", label: "Involved Object", defaultWidth: 200, defaultVisible: true },
+  { id: "type", label: "Type", defaultWidth: 90, defaultVisible: true },
+  { id: "message", label: "Message", defaultWidth: 360, defaultVisible: true },
+  { id: "namespace", label: "Namespace", defaultWidth: 130, defaultVisible: true },
+  { id: "count", label: "Count", defaultWidth: 80, defaultVisible: true },
+  { id: "age", label: "Age", defaultWidth: 90, defaultVisible: true },
+];
+
+const WORKSPACE_COLUMNS: ColumnDef[] = [
+  { id: "name", label: "Name", defaultWidth: 220, defaultVisible: true },
+  { id: "kind", label: "Kind", defaultWidth: 140, defaultVisible: true },
+  { id: "namespace", label: "Namespace", defaultWidth: 130, defaultVisible: true },
+  { id: "path", label: "File", defaultWidth: 260, defaultVisible: true },
+];
+
 function columnsForKind(kind: string): ColumnDef[] {
   if (kind.startsWith("CR:")) return CR_INSTANCE_COLUMNS;
   switch (kind) {
@@ -610,6 +627,10 @@ function columnsForKind(kind: string): ColumnDef[] {
       return HELM_RELEASE_COLUMNS;
     case "ClusterCatalog":
       return CLUSTER_CATALOG_COLUMNS;
+    case "Event":
+      return EVENT_COLUMNS;
+    case "Workspace":
+      return WORKSPACE_COLUMNS;
     default:
       return GENERIC_RESOURCE_COLUMNS;
   }
@@ -1535,10 +1556,9 @@ export function App() {
   const [sortAsc, setSortAsc] = useState<boolean>(true);
   const [colMenuOpen, setColMenuOpen] = useState<boolean>(false);
 
-  // Column visibility, order, and widths per kind
-  const [colOrderByKind, setColOrderByKind] = useState<Record<string, string[]>>({});
-  const [colVisByKind, setColVisByKind] = useState<Record<string, Record<string, boolean>>>({});
-  const [colWidthsByKind, setColWidthsByKind] = useState<Record<string, Record<string, number>>>({});
+  const [layouts, setLayouts] = useState<Record<string, ColumnLayout>>({});
+  const [resizePreview, setResizePreview] = useState<{ kind: string; id: string; width: number } | null>(null);
+  const columnsButton = useRef<HTMLButtonElement>(null);
 
   // Slide-over Right Detail Drawer state
   const [drawerOpen, setDrawerOpen] = useState<boolean>(false);
@@ -1645,6 +1665,12 @@ export function App() {
   const tableContainerRef = useRef<HTMLDivElement>(null);
   const [tableScrollTop, setTableScrollTop] = useState<number>(0);
   const [tableViewportHeight, setTableViewportHeight] = useState<number>(640);
+  const [viewportWidth, setViewportWidth] = useState(0);
+  const [moreOnRight, setMoreOnRight] = useState(false);
+
+  function measureOverflow(el: HTMLElement) {
+    setMoreOnRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 1);
+  }
 
   // Throttled 15-second Age ticker so large clusters avoid re-reconciling every second
   useEffect(() => {
@@ -1669,14 +1695,18 @@ export function App() {
   useEffect(() => {
     const el = tableContainerRef.current;
     if (!el) return;
-    setTableViewportHeight(el.clientHeight || 640);
-    if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(() => {
+    const measure = () => {
       setTableViewportHeight(el.clientHeight || 640);
-    });
+      setViewportWidth(el.clientWidth);
+      measureOverflow(el);
+    };
+    el.scrollLeft = 0;
+    measure();
+    const ro = new ResizeObserver(measure);
     ro.observe(el);
+    if (el.firstElementChild) ro.observe(el.firstElementChild);
     return () => ro.disconnect();
-  }, []);
+  }, [activeKind]);
 
   useEffect(() => {
     setTableScrollTop(0);
@@ -1844,6 +1874,10 @@ export function App() {
     window.openidea.onMessage((raw: string) => {
       try {
         const m = JSON.parse(raw);
+        if (m.op === "column-layouts") {
+          setLayouts(prev => ({ ...m.layouts, ...prev }));
+          return;
+        }
         if (m.op === "pty-data" || m.op === "pty-exit" || m.op === "pty-error") {
           dispatchPtyEvent(m);
           return;
@@ -2023,6 +2057,7 @@ export function App() {
         // ignore malformed message
       }
     });
+    sendToBackend({ op: "get-column-layouts" });
     sendToBackend({ op: "init", limit: pageSizeRef.current });
   }, []);
 
@@ -2367,69 +2402,47 @@ export function App() {
 
   // Active columns configuration for the current kind
   const baseCols = useMemo(() => columnsForKind(activeKind), [activeKind]);
-  const orderedCols = useMemo(() => {
-    const customOrder = colOrderByKind[activeKind];
-    if (!customOrder) return baseCols;
-    const map = new Map(baseCols.map((c) => [c.id, c]));
-    const result: ColumnDef[] = [];
-    for (const id of customOrder) {
-      const c = map.get(id);
-      if (c) {
-        result.push(c);
-        map.delete(id);
-      }
-    }
-    for (const c of map.values()) result.push(c);
-    return result;
-  }, [baseCols, colOrderByKind, activeKind]);
+  const layout = layouts[activeKind] ?? {};
+  const columns = tableColumns(baseCols, resizePreview?.kind === activeKind
+    ? { ...layout, widths: { ...layout.widths, [resizePreview.id]: resizePreview.width } } : layout, viewportWidth);
+  const { ordered: orderedCols, visible: visibleCols, pinned } = columns;
+  const isOverview = activeKind === "ClusterOverview" || activeKind === "WorkloadsOverview";
+  const resourceActions = !["ClusterCatalog", "Event", "Workspace"].includes(activeKind);
+  const checkboxWidth = resourceActions && activeKind !== "Node" ? 38 : 0;
+  const actionsWidth = resourceActions ? 44 : 0;
+  const tableStyle = { minWidth: columns.total + checkboxWidth + actionsWidth };
 
-  const visibleCols = useMemo(() => {
-    const visMap = colVisByKind[activeKind] || {};
-    return orderedCols.filter((c) => (visMap[c.id] !== undefined ? visMap[c.id] : c.defaultVisible));
-  }, [orderedCols, colVisByKind, activeKind]);
-
-  function getColWidth(col: ColumnDef): number {
-    return colWidthsByKind[activeKind]?.[col.id] ?? col.defaultWidth;
-  }
-
-  function toggleColVisible(colId: string) {
-    setColVisByKind((prev) => {
-      const cur = prev[activeKind] || {};
-      const def = baseCols.find((c) => c.id === colId)?.defaultVisible ?? true;
-      const isVis = cur[colId] !== undefined ? cur[colId] : def;
-      return {
-        ...prev,
-        [activeKind]: { ...cur, [colId]: !isVis },
-      };
-    });
+  function saveLayout(next: ColumnLayout) {
+    setLayouts(prev => ({ ...prev, [activeKind]: next }));
+    sendToBackend({ op: "save-column-layout", kind: activeKind, layout: next });
   }
 
   function moveColumn(colId: string, dir: -1 | 1) {
     const ids = orderedCols.map((c) => c.id);
     const idx = ids.indexOf(colId);
     const target = idx + dir;
-    if (idx < 0 || target < 0 || target >= ids.length) return;
+    if (idx <= 0 || target <= 0 || target >= ids.length) return;
     const next = ids.slice();
     const [removed] = next.splice(idx, 1);
     next.splice(target, 0, removed);
-    setColOrderByKind((prev) => ({ ...prev, [activeKind]: next }));
+    saveLayout({ ...layout, order: next });
   }
 
   function startColResize(e: React.MouseEvent, col: ColumnDef) {
     e.stopPropagation();
     e.preventDefault();
     const startX = e.clientX;
-    const startW = getColWidth(col);
+    const startW = columns.width(col);
+    let nextW = startW;
     const onMove = (ev: MouseEvent) => {
-      const nextW = Math.max(36, startW + (ev.clientX - startX));
-      setColWidthsByKind((prev) => ({
-        ...prev,
-        [activeKind]: { ...(prev[activeKind] || {}), [col.id]: nextW },
-      }));
+      nextW = Math.max(36, Math.round(startW + (ev.clientX - startX)));
+      setResizePreview({ kind: activeKind, id: col.id, width: nextW });
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      setResizePreview(null);
+      if (nextW !== startW) saveLayout({ ...layout, widths: { ...layout.widths, [col.id]: nextW } });
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -2449,6 +2462,21 @@ export function App() {
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   }
+
+  const columnHeaders = visibleCols.map(col => (
+    <th
+      key={col.id}
+      className={col === pinned ? "sortable fl-pinned" : "sortable"}
+      style={{ width: columns.width(col), textAlign: col.align || "left" }}
+      onClick={() => {
+        if (sortCol === col.id) setSortAsc(v => !v);
+        else { setSortCol(col.id); setSortAsc(true); }
+      }}
+    >
+      {col.label}{sortCol === col.id && <span style={{ marginLeft: 4 }}>{sortAsc ? "▲" : "▼"}</span>}
+      <div className="fl-col-resizer" onMouseDown={e => startColResize(e, col)} onClick={e => e.stopPropagation()} />
+    </th>
+  ));
 
   function startDrawerResize(e: React.MouseEvent) {
     e.preventDefault();
@@ -4269,16 +4297,68 @@ export function App() {
                 <path d="M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
               </svg>
             </button>
+            {!isOverview && (
+              <div className="fl-columns-control" onClick={e => e.stopPropagation()}
+                onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget)) setColMenuOpen(false); }}
+                onKeyDown={e => {
+                  if (e.key === "Escape") {
+                    e.stopPropagation();
+                    setColMenuOpen(false);
+                    columnsButton.current?.focus();
+                  }
+                }}>
+                <button ref={columnsButton} type="button" className="fl-icon-btn" title="Customize table columns"
+                  aria-label="Customize table columns" aria-expanded={colMenuOpen}
+                  onClick={() => { setRowActionMenu(null); setColMenuOpen(v => !v); }}>
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true">
+                    <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" /><path d="M6 3v10m4-10v10" />
+                  </svg>
+                </button>
+                {colMenuOpen && (
+                  <div className="fl-col-popover" role="group" aria-label="Table columns">
+                    {orderedCols.map((col, idx) => {
+                      const checked = visibleCols.includes(col);
+                      return (
+                        <div key={col.id} className="fl-col-popover-row">
+                          <label title={col === pinned ? "Pinned column" : undefined}>
+                            <input type="checkbox" checked={checked} disabled={col === pinned}
+                              onChange={() => saveLayout({ ...layout, visible: { ...layout.visible, [col.id]: !checked } })} />
+                            {col.label}
+                          </label>
+                          <span className="fl-col-move-btns">
+                            <button className="fl-col-move-btn" aria-label={`Move ${col.label} left`}
+                              title="Move column left" disabled={idx <= 1} onClick={() => moveColumn(col.id, -1)}>↑</button>
+                            <button className="fl-col-move-btn" aria-label={`Move ${col.label} right`}
+                              title="Move column right" disabled={idx === 0 || idx === orderedCols.length - 1}
+                              onClick={() => moveColumn(col.id, 1)}>↓</button>
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
         {/* Content Body */}
+        <div className={`fl-table-frame${moreOnRight && !isOverview ? " fl-more-right" : ""}`}>
         <div
           ref={tableContainerRef}
           className="fl-table-container"
+          tabIndex={isOverview ? undefined : 0}
+          role="region"
+          aria-label={currentViewLabel}
+          onKeyDown={e => {
+            if (e.target !== e.currentTarget || (e.key !== "ArrowLeft" && e.key !== "ArrowRight")) return;
+            e.preventDefault();
+            e.currentTarget.scrollLeft += e.key === "ArrowRight" ? 80 : -80;
+          }}
           onScroll={(e) => {
             const el = e.currentTarget;
             setTableScrollTop(el.scrollTop);
+            measureOverflow(el);
             maybeAutoLoadMore(el);
           }}
         >
@@ -4307,43 +4387,9 @@ export function App() {
               })}
             </div>
           ) : activeKind === "ClusterCatalog" ? (
-            <table className="fl-table">
+            <table className="fl-table" style={tableStyle}>
               <thead>
-                <tr>
-                  {visibleCols.map((col) => (
-                    <th
-                      key={col.id}
-                      className="sortable"
-                      style={{ width: getColWidth(col), textAlign: col.align || "left" }}
-                      onClick={() => {
-                        if (sortCol === col.id) setSortAsc((v) => !v);
-                        else {
-                          setSortCol(col.id);
-                          setSortAsc(true);
-                        }
-                      }}
-                    >
-                      <span>{col.label}</span>
-                      {sortCol === col.id && <span style={{ marginLeft: 4 }}>{sortAsc ? "▲" : "▼"}</span>}
-                      <div className="fl-col-resizer" onMouseDown={(e) => startColResize(e, col)} />
-                    </th>
-                  ))}
-                  <th style={{ width: 44, textAlign: "right", paddingRight: 12 }}>
-                    <button
-                      type="button"
-                      className="fl-col-menu-btn"
-                      title="Customize table columns"
-                      aria-label="Customize table columns"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setRowActionMenu(null);
-                        setColMenuOpen((v) => !v);
-                      }}
-                    >
-                      ⋮
-                    </button>
-                  </th>
-                </tr>
+                <tr>{columnHeaders}</tr>
               </thead>
               <tbody>
                 {catalogList
@@ -4394,7 +4440,7 @@ export function App() {
                         {visibleCols.map((col) => {
                           if (col.id === "name") {
                             return (
-                              <td key={col.id}>
+                              <td key={col.id} className="fl-pinned">
                                 <div className="fl-catalog-name-cell">
                                   <span
                                     className="fl-cluster-badge"
@@ -4455,12 +4501,11 @@ export function App() {
                           }
                           return <td key={col.id} />;
                         })}
-                        <td />
                       </tr>
                     );
                   })}
                 {renderTableSentinelRow(
-                  visibleCols.length + 1,
+                  visibleCols.length,
                   "Clusters",
                   catalogList.length,
                   catalogList.filter((c) => {
@@ -4478,44 +4523,15 @@ export function App() {
               </tbody>
             </table>
           ) : activeKind === "Event" ? (
-            <table className="fl-table">
-              <thead>
-                <tr>
-                  {(
-                    [
-                      ["type", "Type", 90],
-                      ["message", "Message", 360],
-                      ["namespace", "Namespace", 130],
-                      ["object", "Involved Object", 200],
-                      ["count", "Count", 80],
-                      ["age", "Age", 90],
-                    ] as const
-                  ).map(([id, label, width]) => (
-                    <th
-                      key={id}
-                      className="sortable"
-                      style={{ width }}
-                      onClick={() => {
-                        if (sortCol === id) setSortAsc((v) => !v);
-                        else {
-                          setSortCol(id);
-                          setSortAsc(true);
-                        }
-                      }}
-                    >
-                      <span>{label}</span>
-                      {sortCol === id && <span style={{ marginLeft: 4 }}>{sortAsc ? "▲" : "▼"}</span>}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
+            <table className="fl-table" style={tableStyle}>
+              <thead><tr>{columnHeaders}</tr></thead>
               <tbody>
                 {filteredEvents.length === 0 ? (
                   hasSearchQuery && paginationStatus.hasMore ? (
-                    renderTableSentinelRow(6, "Events", rawActiveCategoryCount, 0, true)
+                    renderTableSentinelRow(visibleCols.length, "Events", rawActiveCategoryCount, 0, true)
                   ) : (
                     <tr>
-                      <td colSpan={6} style={{ textAlign: "center", padding: "32px 16px", color: "var(--fl-fg-muted)" }}>
+                      <td colSpan={visibleCols.length} style={{ textAlign: "center", padding: "32px 16px", color: "var(--fl-fg-muted)" }}>
                         {banner && !banner.isError ? banner.text : "No events found."}
                       </td>
                     </tr>
@@ -4524,69 +4540,43 @@ export function App() {
                   <>
                     {virtualWin.topPadPx > 0 && (
                       <tr aria-hidden="true" style={{ height: virtualWin.topPadPx, border: "none" }}>
-                        <td colSpan={6} style={{ padding: 0, border: "none" }} />
+                        <td colSpan={visibleCols.length} style={{ padding: 0, border: "none" }} />
                       </tr>
                     )}
-                    {visibleEvents.map((ev, i) => (
-                      <tr key={`${ev.namespace}/${ev.object}/${ev.reason}/${virtualWin.start + i}`} style={{ height: VIRTUAL_ROW_HEIGHT }}>
-                        <td>
-                          <span className={`fl-status-text ${ev.event_type === "Warning" ? "warn" : "ok"}`}>
-                            {ev.event_type}
-                          </span>
-                        </td>
-                        <td title={ev.message}>{ev.message}</td>
-                        <td>{ev.namespace}</td>
-                        <td className="fl-link-teal">
-                          {ev.kind}: {ev.object}
-                        </td>
-                        <td>{ev.count}</td>
-                        <td>{formatCompactAge(ev.last_seen)}</td>
-                      </tr>
-                    ))}
+                    {visibleEvents.map((ev, i) => {
+                      const cells: Record<string, React.ReactNode> = {
+                        object: `${ev.kind}: ${ev.object}`,
+                        type: <span className={`fl-status-text ${ev.event_type === "Warning" ? "warn" : "ok"}`}>{ev.event_type}</span>,
+                        message: ev.message, namespace: ev.namespace, count: ev.count, age: formatCompactAge(ev.last_seen),
+                      };
+                      return (
+                        <tr key={`${ev.namespace}/${ev.object}/${ev.reason}/${virtualWin.start + i}`} style={{ height: VIRTUAL_ROW_HEIGHT }}>
+                          {visibleCols.map(col => (
+                            <td key={col.id} className={col === pinned ? "fl-pinned fl-link-teal" : undefined}
+                              title={col.id === "message" ? ev.message : undefined}>
+                              {cells[col.id]}
+                            </td>
+                          ))}
+                        </tr>
+                      );
+                    })}
                     {virtualWin.bottomPadPx > 0 && (
                       <tr aria-hidden="true" style={{ height: virtualWin.bottomPadPx, border: "none" }}>
-                        <td colSpan={6} style={{ padding: 0, border: "none" }} />
+                        <td colSpan={visibleCols.length} style={{ padding: 0, border: "none" }} />
                       </tr>
                     )}
-                    {renderTableSentinelRow(6, "Events", rawActiveCategoryCount, filteredEvents.length, true)}
+                    {renderTableSentinelRow(visibleCols.length, "Events", rawActiveCategoryCount, filteredEvents.length, true)}
                   </>
                 )}
               </tbody>
             </table>
           ) : activeKind === "Workspace" ? (
-            <table className="fl-table">
-              <thead>
-                <tr>
-                  {(
-                    [
-                      ["kind", "Kind", 140],
-                      ["name", "Name", 220],
-                      ["namespace", "Namespace", 130],
-                      ["path", "File", undefined],
-                    ] as const
-                  ).map(([id, label, width]) => (
-                    <th
-                      key={id}
-                      className="sortable"
-                      style={width ? { width } : undefined}
-                      onClick={() => {
-                        if (sortCol === id) setSortAsc((v) => !v);
-                        else {
-                          setSortCol(id);
-                          setSortAsc(true);
-                        }
-                      }}
-                    >
-                      <span>{label}</span>
-                      {sortCol === id && <span style={{ marginLeft: 4 }}>{sortAsc ? "▲" : "▼"}</span>}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
+            <table className="fl-table" style={tableStyle}>
+              <thead><tr>{columnHeaders}</tr></thead>
               <tbody>
                 {filteredWorkspace.length === 0 ? (
                   <tr>
-                    <td colSpan={4} style={{ textAlign: "center", padding: "32px 16px", color: "var(--fl-fg-muted)" }}>
+                    <td colSpan={visibleCols.length} style={{ textAlign: "center", padding: "32px 16px", color: "var(--fl-fg-muted)" }}>
                       No workspace manifests found.
                     </td>
                   </tr>
@@ -4594,7 +4584,7 @@ export function App() {
                   <>
                     {virtualWin.topPadPx > 0 && (
                       <tr aria-hidden="true" style={{ height: virtualWin.topPadPx, border: "none" }}>
-                        <td colSpan={4} style={{ padding: 0, border: "none" }} />
+                        <td colSpan={visibleCols.length} style={{ padding: 0, border: "none" }} />
                       </tr>
                     )}
                     {visibleWorkspace.map((w, i) => (
@@ -4603,35 +4593,33 @@ export function App() {
                         style={{ height: VIRTUAL_ROW_HEIGHT }}
                         onClick={() => sendToBackend({ op: "open-location", path: w.fullPath, line: w.line })}
                       >
-                        <td>{w.kind}</td>
-                        <td>{w.name}</td>
-                        <td>{w.namespace}</td>
-                        <td className="fl-link-teal">
-                          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                        {visibleCols.map(col => <td key={col.id}
+                          className={col === pinned ? "fl-pinned" : col.id === "path" ? "fl-link-teal" : undefined}>
+                          {col.id === "path" ? <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
                             <WorkspaceFileIcon icon={w.icon} />
                             <span>
                               {w.path}:{w.line + 1}
                             </span>
-                          </span>
-                        </td>
+                          </span> : col.id === "kind" ? w.kind : col.id === "namespace" ? w.namespace : w.name}
+                        </td>)}
                       </tr>
                     ))}
                     {virtualWin.bottomPadPx > 0 && (
                       <tr aria-hidden="true" style={{ height: virtualWin.bottomPadPx, border: "none" }}>
-                        <td colSpan={4} style={{ padding: 0, border: "none" }} />
+                        <td colSpan={visibleCols.length} style={{ padding: 0, border: "none" }} />
                       </tr>
                     )}
-                    {renderTableSentinelRow(4, "Manifests", workspace.length, filteredWorkspace.length, false)}
+                    {renderTableSentinelRow(visibleCols.length, "Manifests", workspace.length, filteredWorkspace.length, false)}
                   </>
                 )}
               </tbody>
             </table>
           ) : (
-            <table className="fl-table">
+            <table className="fl-table" style={tableStyle}>
               <thead>
                 <tr>
                   {activeKind !== "Node" && (
-                    <th style={{ width: 38, textAlign: "center" }}>
+                    <th style={{ width: checkboxWidth, textAlign: "center" }}>
                       <input
                         type="checkbox"
                         className="fl-row-checkbox"
@@ -4656,39 +4644,8 @@ export function App() {
                       />
                     </th>
                   )}
-                  {visibleCols.map((col) => (
-                    <th
-                      key={col.id}
-                      className="sortable"
-                      style={{ width: getColWidth(col), textAlign: col.align || "left" }}
-                      onClick={() => {
-                        if (sortCol === col.id) setSortAsc((v) => !v);
-                        else {
-                          setSortCol(col.id);
-                          setSortAsc(true);
-                        }
-                      }}
-                    >
-                      <span>{col.label}</span>
-                      {sortCol === col.id && <span style={{ marginLeft: 4 }}>{sortAsc ? "▲" : "▼"}</span>}
-                      <div className="fl-col-resizer" onMouseDown={(e) => startColResize(e, col)} />
-                    </th>
-                  ))}
-                  <th style={{ width: 44, textAlign: "right", paddingRight: 12 }}>
-                    <button
-                      type="button"
-                      className="fl-col-menu-btn"
-                      title="Customize table columns"
-                      aria-label="Customize table columns"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setRowActionMenu(null);
-                        setColMenuOpen((v) => !v);
-                      }}
-                    >
-                      ⋮
-                    </button>
-                  </th>
+                  {columnHeaders}
+                  <th style={{ width: actionsWidth }} aria-label="Resource actions" />
                 </tr>
               </thead>
               <tbody>
@@ -4775,7 +4732,7 @@ export function App() {
                           </td>
                         )}
                         {visibleCols.map((col) => (
-                          <td key={col.id} style={{ textAlign: col.align || "left" }}>
+                          <td key={col.id} className={col === pinned ? "fl-pinned" : undefined} style={{ textAlign: col.align || "left" }}>
                             {renderPodCell(res, col.id)}
                           </td>
                         ))}
@@ -4837,7 +4794,7 @@ export function App() {
             </table>
           )}
         </div>
-
+        </div>
         {/* Floating Scroll-to-Top pill after scrolling deep into virtualized lists */}
         {tableScrollTop > 600 &&
           activeKind !== "ClusterOverview" &&
@@ -5281,47 +5238,6 @@ export function App() {
                 <span className="fl-row-action-label">Force Delete</span>
               </div>
             )}
-          </div>
-        )}
-
-        {/* Floating Column Visibility & Order Popover (Screenshot 1 right side) */}
-        {colMenuOpen && (
-          <div className="fl-col-popover" onClick={(e) => e.stopPropagation()}>
-            {orderedCols.map((col, idx) => {
-              const visMap = colVisByKind[activeKind] || {};
-              const checked = visMap[col.id] !== undefined ? visMap[col.id] : col.defaultVisible;
-              return (
-                <div key={col.id} className="fl-col-popover-row">
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={col.id === "name"}
-                      onChange={() => toggleColVisible(col.id)}
-                    />
-                    <span>{col.label}</span>
-                  </label>
-                  <span className="fl-col-move-btns">
-                    <button
-                      className="fl-col-move-btn"
-                      title="Move column left"
-                      disabled={idx === 0}
-                      onClick={() => moveColumn(col.id, -1)}
-                    >
-                      ↑
-                    </button>
-                    <button
-                      className="fl-col-move-btn"
-                      title="Move column right"
-                      disabled={idx === orderedCols.length - 1}
-                      onClick={() => moveColumn(col.id, 1)}
-                    >
-                      ↓
-                    </button>
-                  </span>
-                </div>
-              );
-            })}
           </div>
         )}
 

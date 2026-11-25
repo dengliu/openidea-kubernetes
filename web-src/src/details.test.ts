@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { tableColumns } from "./columns";
 import {
   applyWatchDeltaToSnapshot,
   classifyIncomingNamespaceSnapshot,
@@ -27,6 +28,21 @@ import {
 import { bytesToUnits, cpuUnitsToNumber, formatKubeMemory, toYamlLines, unitsToBytes } from "./ResourceDetails";
 
 describe("ResourceDetails helpers", () => {
+  it("keeps identity visible and capped without shrinking the other enabled columns", () => {
+    const defs = ["name", "ready", "age", "conditions"].map(id => ({
+      id, label: id, defaultWidth: 100, defaultVisible: id !== "conditions",
+    }));
+    const saved = {
+      order: ["conditions", "retired", "name", "conditions", "age"], visible: { name: false, conditions: true, age: false },
+      widths: { name: 320, conditions: 180 },
+    };
+    const narrow = tableColumns(defs, saved, 300);
+    expect(narrow.visible.map(c => c.id)).toEqual(["name", "conditions", "ready"]);
+    expect(narrow.width(narrow.pinned)).toBe(100);
+    expect(narrow.total).toBe(380);
+    expect(tableColumns(defs, saved, 1200).width(narrow.pinned)).toBe(320);
+  });
+
   it("computes virtualized table window with top and bottom spacers on large row sets", () => {
     expect(computeVirtualWindow(40, 0, 600)).toEqual({
       start: 0,
