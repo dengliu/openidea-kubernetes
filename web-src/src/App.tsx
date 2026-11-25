@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { PodTerminal, dispatchPtyEvent } from "./PodTerminal";
-import { tableColumns, type ColumnLayout } from "./columns";
+import { autoFitColumnWidths, tableColumns, type ColumnLayout, type TextMeasurer } from "./columns";
 import { ResourceDetails, cpuUnitsToNumber, unitsToBytes } from "./ResourceDetails";
 import type {
   CategoryPageInfo,
@@ -2400,54 +2400,6 @@ export function App() {
     });
   }
 
-  // Active columns configuration for the current kind
-  const baseCols = useMemo(() => columnsForKind(activeKind), [activeKind]);
-  const layout = layouts[activeKind] ?? {};
-  const columns = tableColumns(baseCols, resizePreview?.kind === activeKind
-    ? { ...layout, widths: { ...layout.widths, [resizePreview.id]: resizePreview.width } } : layout, viewportWidth);
-  const { ordered: orderedCols, visible: visibleCols, pinned } = columns;
-  const isOverview = activeKind === "ClusterOverview" || activeKind === "WorkloadsOverview";
-  const resourceActions = !["ClusterCatalog", "Event", "Workspace"].includes(activeKind);
-  const checkboxWidth = resourceActions && activeKind !== "Node" ? 38 : 0;
-  const actionsWidth = resourceActions ? 44 : 0;
-  const tableStyle = { minWidth: columns.total + checkboxWidth + actionsWidth };
-
-  function saveLayout(next: ColumnLayout) {
-    setLayouts(prev => ({ ...prev, [activeKind]: next }));
-    sendToBackend({ op: "save-column-layout", kind: activeKind, layout: next });
-  }
-
-  function moveColumn(colId: string, dir: -1 | 1) {
-    const ids = orderedCols.map((c) => c.id);
-    const idx = ids.indexOf(colId);
-    const target = idx + dir;
-    if (idx <= 0 || target <= 0 || target >= ids.length) return;
-    const next = ids.slice();
-    const [removed] = next.splice(idx, 1);
-    next.splice(target, 0, removed);
-    saveLayout({ ...layout, order: next });
-  }
-
-  function startColResize(e: React.MouseEvent, col: ColumnDef) {
-    e.stopPropagation();
-    e.preventDefault();
-    const startX = e.clientX;
-    const startW = columns.width(col);
-    let nextW = startW;
-    const onMove = (ev: MouseEvent) => {
-      nextW = Math.max(36, Math.round(startW + (ev.clientX - startX)));
-      setResizePreview({ kind: activeKind, id: col.id, width: nextW });
-    };
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      setResizePreview(null);
-      if (nextW !== startW) saveLayout({ ...layout, widths: { ...layout.widths, [col.id]: nextW } });
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  }
-
   function startSidebarResize(e: React.MouseEvent) {
     e.preventDefault();
     const startX = e.clientX;
@@ -2462,21 +2414,6 @@ export function App() {
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   }
-
-  const columnHeaders = visibleCols.map(col => (
-    <th
-      key={col.id}
-      className={col === pinned ? "sortable fl-pinned" : "sortable"}
-      style={{ width: columns.width(col), textAlign: col.align || "left" }}
-      onClick={() => {
-        if (sortCol === col.id) setSortAsc(v => !v);
-        else { setSortCol(col.id); setSortAsc(true); }
-      }}
-    >
-      {col.label}{sortCol === col.id && <span style={{ marginLeft: 4 }}>{sortAsc ? "▲" : "▼"}</span>}
-      <div className="fl-col-resizer" onMouseDown={e => startColResize(e, col)} onClick={e => e.stopPropagation()} />
-    </th>
-  ));
 
   function startDrawerResize(e: React.MouseEvent) {
     e.preventDefault();
@@ -2906,6 +2843,304 @@ export function App() {
       : activeKind === "Workspace"
         ? filteredWorkspace.length
         : filteredResources.length;
+
+  // Active columns configuration and content-based auto-fit for the current kind
+  const baseCols = useMemo(() => columnsForKind(activeKind), [activeKind]);
+  const autoWidths = useMemo(() => {
+    const pad = 14;
+    const chipPad = 12;
+    const textW = (measure: TextMeasurer, s: string, medium = false) => Math.ceil(measure(s, medium)) + pad;
+    if (activeKind === "ClusterCatalog") {
+      return autoFitColumnWidths(
+        baseCols,
+        catalogList.length,
+        (colId, idx, measure) => {
+          const c = catalogList[idx];
+          switch (colId) {
+            case "name":
+              return 24 + 8 + Math.ceil(measure(c.name, true)) + 8 + 24 + pad;
+            case "source":
+              return textW(measure, "local");
+            case "labels":
+              return textW(measure, `file=${c.source || "~/.kube/config"}`) + chipPad;
+            case "distro":
+              return textW(measure, c.distro || "-");
+            case "version":
+              return textW(measure, c.version || "-");
+            case "nodes":
+              return textW(measure, String(c.nodes ?? "-"));
+            case "status":
+              return textW(measure, c.name === snapshot.current_context ? "connected" : "disconnected", true);
+            default:
+              return 0;
+          }
+        },
+        undefined,
+        sortCol,
+      );
+    }
+    if (activeKind === "Event") {
+      return autoFitColumnWidths(
+        baseCols,
+        filteredEvents.length,
+        (colId, idx, measure) => {
+          const ev = filteredEvents[idx];
+          switch (colId) {
+            case "object":
+              return textW(measure, `${ev.kind}: ${ev.object}`);
+            case "type":
+              return textW(measure, ev.event_type, true);
+            case "message":
+              return textW(measure, ev.message);
+            case "namespace":
+              return textW(measure, ev.namespace);
+            case "count":
+              return textW(measure, String(ev.count));
+            case "age":
+              return textW(measure, formatCompactAge(ev.last_seen));
+            default:
+              return 0;
+          }
+        },
+        undefined,
+        sortCol,
+      );
+    }
+    if (activeKind === "Workspace") {
+      return autoFitColumnWidths(
+        baseCols,
+        filteredWorkspace.length,
+        (colId, idx, measure) => {
+          const w = filteredWorkspace[idx];
+          switch (colId) {
+            case "name":
+              return textW(measure, w.name);
+            case "kind":
+              return textW(measure, w.kind);
+            case "namespace":
+              return textW(measure, w.namespace);
+            case "path":
+              return 16 + 6 + textW(measure, `${w.path}:${w.line + 1}`);
+            default:
+              return 0;
+          }
+        },
+        undefined,
+        sortCol,
+      );
+    }
+    return autoFitColumnWidths(
+      baseCols,
+      filteredResources.length,
+      (colId, idx, measure) => {
+        const res = filteredResources[idx];
+        switch (colId) {
+          case "name":
+            return textW(measure, res.name, true);
+          case "warning":
+            return 28;
+          case "namespace":
+            return textW(measure, res.namespace || "default");
+          case "containers": {
+            const count = res.container_states?.length || res.containers?.length || 0;
+            return count > 0 ? count * 9 + (count - 1) * 5 + pad : pad;
+          }
+          case "cpu":
+            return textW(measure, res.cpu || "N/A");
+          case "memory":
+            return textW(measure, res.memory || "N/A");
+          case "restarts":
+            return textW(measure, String(res.restarts ?? 0));
+          case "controlled_by":
+            return textW(measure, res.controlled_by_kind || "-");
+          case "ip":
+            return textW(measure, res.pod_ip || "-");
+          case "node":
+            return textW(measure, res.node_name || "-");
+          case "qos":
+            return textW(measure, res.qos || "-");
+          case "age":
+            return textW(measure, formatCompactAge(res.age));
+          case "status":
+            return textW(measure, res.status === "Completed" ? "Succeeded" : res.status, true);
+          case "node_cpu":
+            return res.cpu?.includes("/") ? Math.max(96, textW(measure, res.cpu.replace("/", " / "))) : textW(measure, "N/A");
+          case "node_memory":
+            return res.memory?.includes("/")
+              ? Math.max(106, textW(measure, res.memory.replace("/", " / ")))
+              : textW(measure, "N/A");
+          case "node_disk":
+            return textW(measure, "N/A");
+          case "node_roles":
+            return textW(measure, res.host_ip || "");
+          case "node_taints":
+            return textW(measure, String(res.restarts ?? (res.containers ? res.containers.length : 0)));
+          case "node_version":
+            return textW(measure, res.ready || "-");
+          case "node_ip":
+            return textW(measure, res.pod_ip || res.detail || "-");
+          case "node_schedulable":
+            return textW(measure, res.qos || (res.status.includes("SchedulingDisabled") ? "False" : "True")) + chipPad;
+          case "node_conditions":
+            return textW(measure, res.status, true);
+          case "node_instance":
+            return textW(measure, res.controlled_by_kind || "-");
+          case "node_group":
+            return textW(measure, res.controlled_by_name || "-");
+          case "node_kernel":
+            return textW(measure, res.node_name || "-");
+          case "wl_ready":
+          case "wl_ready_cnt":
+          case "wl_updated":
+          case "wl_available":
+            return textW(measure, (res.ready || "0/0").split("/")[0] || "0");
+          case "wl_desired": {
+            const parts = (res.ready || "0/0").split("/");
+            return textW(measure, parts[1] ?? parts[0] ?? "0");
+          }
+          case "wl_conditions":
+            return res.status === "Ready"
+              ? Math.ceil(measure("Available", true)) + 8 + Math.ceil(measure("Progressing", true)) + pad
+              : textW(measure, res.status, true);
+          case "cj_suspend":
+            return textW(measure, res.status === "Suspended" ? "True" : "False") + chipPad;
+          case "svc_type":
+            return textW(measure, res.status);
+          case "svc_status":
+            return textW(measure, "Active", true);
+          case "cm_keys":
+            return textW(measure, (res.data_keys?.length ? res.data_keys.join(", ") : res.detail) || "-");
+          case "ns_labels": {
+            const chips = (res.labels || []).slice(0, 3);
+            return chips.reduce((sum, l) => sum + Math.ceil(measure(l)) + chipPad + 4, pad);
+          }
+          case "ready":
+            return textW(measure, res.ready);
+          case "detail":
+            return textW(measure, res.detail);
+          case "crd_resource":
+            return textW(measure, res.controlled_by_kind || res.name);
+          default:
+            return 0;
+        }
+      },
+      undefined,
+      sortCol,
+    );
+  }, [activeKind, baseCols, filteredResources, filteredEvents, filteredWorkspace, catalogList, snapshot.current_context, sortCol]);
+
+  const layout = layouts[activeKind] ?? {};
+  const isOverview = activeKind === "ClusterOverview" || activeKind === "WorkloadsOverview";
+  const resourceActions = !["ClusterCatalog", "Event", "Workspace"].includes(activeKind);
+  const checkboxWidth = resourceActions && activeKind !== "Node" ? 34 : 0;
+  const actionsWidth = resourceActions ? 32 : 0;
+  const availableColsWidth = viewportWidth > 0 ? Math.max(0, viewportWidth - checkboxWidth - actionsWidth) : 0;
+  const columns = tableColumns(
+    baseCols,
+    resizePreview?.kind === activeKind
+      ? { ...layout, widths: { ...layout.widths, [resizePreview.id]: resizePreview.width } }
+      : layout,
+    availableColsWidth,
+    autoWidths,
+  );
+  const { ordered: orderedCols, visible: visibleCols, pinned } = columns;
+  const totalTableWidth = columns.total + checkboxWidth + actionsWidth;
+  const tableOverflows = viewportWidth > 0 && totalTableWidth > viewportWidth;
+  const tableStyle = tableOverflows ? { width: totalTableWidth, minWidth: "100%" } : { width: "100%" };
+  const hasManualWidths = Object.keys(layout.widths || {}).length > 0;
+  const flexColId =
+    !resourceActions && !tableOverflows
+      ? activeKind === "Event"
+        ? "message"
+        : activeKind === "Workspace"
+          ? "path"
+          : visibleCols[visibleCols.length - 1]?.id
+      : null;
+
+  useEffect(() => {
+    if (tableContainerRef.current) measureOverflow(tableContainerRef.current);
+  }, [totalTableWidth, viewportWidth, activeKind]);
+
+  function saveLayout(next: ColumnLayout) {
+    setLayouts((prev) => ({ ...prev, [activeKind]: next }));
+    sendToBackend({ op: "save-column-layout", kind: activeKind, layout: next });
+  }
+
+  function resetColWidth(colId: string) {
+    if (!layout.widths || layout.widths[colId] === undefined) return;
+    const nextWidths = { ...layout.widths };
+    delete nextWidths[colId];
+    saveLayout({ ...layout, widths: nextWidths });
+  }
+
+  function moveColumn(colId: string, dir: -1 | 1) {
+    const ids = orderedCols.map((c) => c.id);
+    const idx = ids.indexOf(colId);
+    const target = idx + dir;
+    if (idx <= 0 || target <= 0 || target >= ids.length) return;
+    const next = ids.slice();
+    const [removed] = next.splice(idx, 1);
+    next.splice(target, 0, removed);
+    saveLayout({ ...layout, order: next });
+  }
+
+  function startColResize(e: React.MouseEvent, col: ColumnDef) {
+    e.stopPropagation();
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = columns.width(col);
+    const minW = col.id === "warning" ? 28 : 36;
+    let nextW = startW;
+    const onMove = (ev: MouseEvent) => {
+      nextW = Math.max(minW, Math.round(startW + (ev.clientX - startX)));
+      setResizePreview({ kind: activeKind, id: col.id, width: nextW });
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      setResizePreview(null);
+      if (nextW !== startW) saveLayout({ ...layout, widths: { ...layout.widths, [col.id]: nextW } });
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  const columnHeaders = visibleCols.map((col) => (
+    <th
+      key={col.id}
+      className={[
+        "sortable",
+        col === pinned ? "fl-pinned" : "",
+        col.id === "warning" ? "fl-icon-col" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+      style={{
+        width: col.id === flexColId && !layout.widths?.[col.id] ? undefined : columns.width(col),
+        textAlign: col.align || "left",
+      }}
+      onClick={() => {
+        if (sortCol === col.id) setSortAsc((v) => !v);
+        else {
+          setSortCol(col.id);
+          setSortAsc(true);
+        }
+      }}
+    >
+      {col.label}
+      {sortCol === col.id && <span style={{ marginLeft: 4 }}>{sortAsc ? "▲" : "▼"}</span>}
+      <div
+        className="fl-col-resizer"
+        title="Drag to resize, double-click to auto-fit"
+        onMouseDown={(e) => startColResize(e, col)}
+        onDoubleClick={(e) => {
+          e.stopPropagation();
+          resetColWidth(col.id);
+        }}
+        onClick={(e) => e.stopPropagation()}
+      />
+    </th>
+  ));
 
   const virtualWin = useMemo(
     () => computeVirtualWindow(activeTotalFilteredRows, tableScrollTop, tableViewportHeight),
@@ -4335,6 +4570,17 @@ export function App() {
                         </div>
                       );
                     })}
+                    {hasManualWidths && (
+                      <div className="fl-col-popover-footer">
+                        <button
+                          type="button"
+                          className="fl-col-reset-btn"
+                          onClick={() => saveLayout({ ...layout, widths: {} })}
+                        >
+                          Auto-fit widths
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -4619,7 +4865,7 @@ export function App() {
               <thead>
                 <tr>
                   {activeKind !== "Node" && (
-                    <th style={{ width: checkboxWidth, textAlign: "center" }}>
+                    <th className="fl-icon-col" style={{ width: checkboxWidth, textAlign: "center" }}>
                       <input
                         type="checkbox"
                         className="fl-row-checkbox"
@@ -4645,7 +4891,7 @@ export function App() {
                     </th>
                   )}
                   {columnHeaders}
-                  <th style={{ width: actionsWidth }} aria-label="Resource actions" />
+                  <th style={tableOverflows ? { width: actionsWidth } : undefined} aria-label="Resource actions" />
                 </tr>
               </thead>
               <tbody>
@@ -4722,7 +4968,7 @@ export function App() {
                         }}
                       >
                         {activeKind !== "Node" && (
-                          <td style={{ textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
+                          <td className="fl-icon-col" style={{ textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
                             <input
                               type="checkbox"
                               className="fl-row-checkbox"
@@ -4732,7 +4978,11 @@ export function App() {
                           </td>
                         )}
                         {visibleCols.map((col) => (
-                          <td key={col.id} className={col === pinned ? "fl-pinned" : undefined} style={{ textAlign: col.align || "left" }}>
+                          <td
+                            key={col.id}
+                            className={col === pinned ? "fl-pinned" : col.id === "warning" ? "fl-icon-col" : undefined}
+                            style={{ textAlign: col.align || "left" }}
+                          >
                             {renderPodCell(res, col.id)}
                           </td>
                         ))}
